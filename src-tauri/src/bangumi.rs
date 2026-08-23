@@ -1,0 +1,816 @@
+use std::{
+    error::Error as StdError,
+    fs::{self, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
+};
+
+use reqwest::{
+    blocking::Client,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    Url,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::{cache, db::AppResult, models::BangumiSubject};
+
+const SEARCH_URL: &str = "https://api.bgm.tv/v0/search/subjects";
+const SUBJECT_DETAIL_URL: &str = "https://api.bgm.tv/v0/subjects";
+const USER_AGENT: &str = concat!(
+    "Undermori/M2Shelf/",
+    env!("CARGO_PKG_VERSION"),
+    " (Windows; https://space.bilibili.com/2903441)"
+);
+const MAX_COVER_DOWNLOAD_BYTES: u64 = 15 * 1024 * 1024;
+const MAX_SEARCH_KEYWORD_CHARS: usize = 200;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_MATCH_ALIASES: usize = 32;
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    data: Vec<ApiSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSubject {
+    id: i64,
+    #[serde(rename = "type")]
+    subject_type: i64,
+    name: String,
+    name_cn: Option<String>,
+    date: Option<String>,
+    summary: Option<String>,
+    images: Option<ApiImages>,
+    #[serde(default)]
+    infobox: Vec<ApiInfoboxItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiSubjectDetail {
+    id: i64,
+    #[serde(rename = "type")]
+    subject_type: i64,
+    name: String,
+    name_cn: Option<String>,
+    date: Option<String>,
+    summary: Option<String>,
+    images: Option<ApiImages>,
+    #[serde(default)]
+    infobox: Vec<ApiInfoboxItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiInfoboxItem {
+    key: String,
+    value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiImages {
+    large: Option<String>,
+    common: Option<String>,
+    medium: Option<String>,
+    small: Option<String>,
+    grid: Option<String>,
+}
+
+fn client() -> AppResult<Client> {
+    if let Some(client) = HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|error| format!("无法初始化 Bangumi 网络客户端：{}", error_chain(&error)))?;
+    // A cloned reqwest Client shares its connection pool. Reusing it across the bounded search,
+    // detail and cover requests avoids a fresh TLS connection for every candidate. A benign race
+    // can build two Clients during first use; subsequent requests use the one stored here.
+    let _ = HTTP_CLIENT.set(built.clone());
+    Ok(HTTP_CLIENT.get().cloned().unwrap_or(built))
+}
+
+pub fn search(keyword: &str, limit: usize) -> AppResult<Vec<BangumiSubject>> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Err("请输入 Bangumi 搜索词。".into());
+    }
+    if keyword.chars().count() > MAX_SEARCH_KEYWORD_CHARS {
+        return Err(format!(
+            "Bangumi 搜索词不能超过 {MAX_SEARCH_KEYWORD_CHARS} 个字符。"
+        ));
+    }
+    let client = client()?;
+    let response = search_with_retry(&client, keyword, limit)?;
+
+    Ok(response
+        .data
+        .into_iter()
+        // Subject type 2 is anime. Keep a defensive filter even when the API honors it.
+        .filter(|subject| subject.subject_type == 2)
+        .map(api_subject_to_model)
+        .collect())
+}
+
+fn api_subject_to_model(subject: ApiSubject) -> BangumiSubject {
+    let match_aliases = extract_match_aliases(&subject.infobox);
+    let title = subject.name;
+    let title_cn = subject
+        .name_cn
+        .and_then(non_empty)
+        .or_else(|| extract_infobox_title(&subject.infobox, CHINESE_TITLE_LABELS));
+    let title_en = extract_infobox_title(&subject.infobox, ENGLISH_TITLE_LABELS);
+    let title_ja = extract_infobox_title(&subject.infobox, JAPANESE_TITLE_LABELS)
+        .or_else(|| non_empty(title.clone()));
+    let title_ko = extract_infobox_title(&subject.infobox, KOREAN_TITLE_LABELS);
+    BangumiSubject {
+        subject_id: subject.id,
+        title,
+        title_cn,
+        title_en,
+        title_ja,
+        title_ko,
+        match_aliases,
+        date: subject.date.and_then(non_empty),
+        image_url: subject.images.and_then(preferred_image),
+        summary: subject.summary.and_then(non_empty),
+        subject_type: subject.subject_type,
+    }
+}
+
+pub fn enrich_subject(subject: &BangumiSubject) -> AppResult<BangumiSubject> {
+    if subject.subject_id <= 0 || subject.subject_type != 2 {
+        return Err("只能读取有效的 Bangumi 动画条目。".into());
+    }
+    let client = client()?;
+    let detail = detail_with_retry(&client, subject.subject_id)?;
+    merge_subject_detail(subject, detail)
+}
+
+fn merge_subject_detail(
+    subject: &BangumiSubject,
+    detail: ApiSubjectDetail,
+) -> AppResult<BangumiSubject> {
+    if detail.id != subject.subject_id || detail.subject_type != 2 {
+        return Err("Bangumi 条目详情与所选动画不匹配。".into());
+    }
+
+    let mut match_aliases = subject.match_aliases.clone();
+    for alias in extract_match_aliases(&detail.infobox) {
+        push_match_alias(&mut match_aliases, alias);
+    }
+    let title = non_empty(detail.name).unwrap_or_else(|| subject.title.clone());
+    let title_cn = detail
+        .name_cn
+        .and_then(non_empty)
+        .or_else(|| extract_infobox_title(&detail.infobox, CHINESE_TITLE_LABELS))
+        .or_else(|| subject.title_cn.clone());
+    let title_en = extract_infobox_title(&detail.infobox, ENGLISH_TITLE_LABELS)
+        .or_else(|| subject.title_en.clone());
+    let title_ja = extract_infobox_title(&detail.infobox, JAPANESE_TITLE_LABELS)
+        .or_else(|| non_empty(title.clone()))
+        .or_else(|| subject.title_ja.clone());
+    let title_ko = extract_infobox_title(&detail.infobox, KOREAN_TITLE_LABELS)
+        .or_else(|| subject.title_ko.clone());
+    let image_url = detail
+        .images
+        .and_then(preferred_image)
+        .or_else(|| subject.image_url.clone());
+
+    Ok(BangumiSubject {
+        subject_id: detail.id,
+        title,
+        title_cn,
+        title_en,
+        title_ja,
+        title_ko,
+        match_aliases,
+        date: detail
+            .date
+            .and_then(non_empty)
+            .or_else(|| subject.date.clone()),
+        image_url,
+        summary: detail
+            .summary
+            .and_then(non_empty)
+            .or_else(|| subject.summary.clone()),
+        subject_type: detail.subject_type,
+    })
+}
+
+const CHINESE_TITLE_LABELS: &[&str] = &["简体中文名", "中文名", "中文"];
+const ENGLISH_TITLE_LABELS: &[&str] = &["英文名", "英语名", "English"];
+const JAPANESE_TITLE_LABELS: &[&str] = &["日文名", "日本語名"];
+const KOREAN_TITLE_LABELS: &[&str] = &["韩文名", "韓文名", "韩语名", "韓語名", "한국어명"];
+const GENERIC_ALIAS_LABELS: &[&str] = &["别名", "別名", "别称", "別稱", "alias", "aliases"];
+const ROMANIZED_TITLE_LABELS: &[&str] = &[
+    "罗马字",
+    "羅馬字",
+    "罗马音",
+    "羅馬音",
+    "romaji",
+    "romanized",
+    "原名",
+    "原作名",
+];
+
+/// Keeps every bounded official title alias needed by the confidence scorer. The presentation
+/// layer still uses the four explicit locale fields; these aliases are never written to source
+/// names and do not require a database column.
+fn extract_match_aliases(items: &[ApiInfoboxItem]) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for item in items {
+        if is_match_alias_label(&item.key) {
+            collect_alias_values(&item.value, &mut aliases);
+        }
+        if let Some(values) = item.value.as_array() {
+            for value in values {
+                let Some(object) = value.as_object() else {
+                    continue;
+                };
+                let Some(label) = object.get("k").and_then(Value::as_str) else {
+                    continue;
+                };
+                if is_match_alias_label(label) {
+                    if let Some(value) = object.get("v") {
+                        collect_alias_values(value, &mut aliases);
+                    }
+                }
+            }
+        }
+        if aliases.len() >= MAX_MATCH_ALIASES {
+            break;
+        }
+    }
+    aliases.truncate(MAX_MATCH_ALIASES);
+    aliases
+}
+
+fn is_match_alias_label(value: &str) -> bool {
+    label_matches(value, GENERIC_ALIAS_LABELS)
+        || label_matches(value, CHINESE_TITLE_LABELS)
+        || label_matches(value, ENGLISH_TITLE_LABELS)
+        || label_matches(value, JAPANESE_TITLE_LABELS)
+        || label_matches(value, KOREAN_TITLE_LABELS)
+        || label_matches(value, ROMANIZED_TITLE_LABELS)
+}
+
+fn collect_alias_values(value: &Value, aliases: &mut Vec<String>) {
+    if aliases.len() >= MAX_MATCH_ALIASES {
+        return;
+    }
+    if let Some(value) = value.as_str() {
+        push_match_alias(aliases, value.to_string());
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for value in values {
+            collect_alias_values(value, aliases);
+            if aliases.len() >= MAX_MATCH_ALIASES {
+                return;
+            }
+        }
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if let Some(value) = object.get("v").or_else(|| object.get("value")) {
+        collect_alias_values(value, aliases);
+    }
+}
+
+fn push_match_alias(aliases: &mut Vec<String>, value: String) {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > 200
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(value))
+    {
+        return;
+    }
+    aliases.push(value.to_string());
+}
+
+fn detail_with_retry(client: &Client, subject_id: i64) -> AppResult<ApiSubjectDetail> {
+    let endpoint = format!("{SUBJECT_DETAIL_URL}/{subject_id}");
+    let mut failures = Vec::new();
+    for attempt in 0..2 {
+        match client
+            .get(&endpoint)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.json::<ApiSubjectDetail>())
+        {
+            Ok(detail) => return Ok(detail),
+            Err(error) => {
+                failures.push(endpoint_failure_label(&endpoint, &error));
+                if attempt == 0 && should_retry(&error) {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(format!(
+        "读取 Bangumi 条目详情失败：{}。将保留搜索结果中的条目信息。",
+        failures.join("；")
+    ))
+}
+
+fn preferred_image(images: ApiImages) -> Option<String> {
+    images
+        .large
+        .or(images.common)
+        .or(images.medium)
+        .or(images.small)
+        .or(images.grid)
+        .and_then(non_empty)
+}
+
+fn extract_infobox_title(items: &[ApiInfoboxItem], labels: &[&str]) -> Option<String> {
+    for item in items {
+        if label_matches(&item.key, labels) {
+            if let Some(value) = first_infobox_value(&item.value) {
+                return Some(value);
+            }
+        }
+    }
+    for item in items {
+        let Some(values) = item.value.as_array() else {
+            continue;
+        };
+        for value in values {
+            let Some(alias) = value.as_object() else {
+                continue;
+            };
+            let Some(key) = alias.get("k").and_then(Value::as_str) else {
+                continue;
+            };
+            if label_matches(key, labels) {
+                if let Some(value) = alias
+                    .get("v")
+                    .and_then(Value::as_str)
+                    .and_then(|value| non_empty(value.to_string()))
+                {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn first_infobox_value(value: &Value) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        return non_empty(value.to_string());
+    }
+    value.as_array()?.iter().find_map(|item| {
+        item.as_str()
+            .and_then(|value| non_empty(value.to_string()))
+            .or_else(|| {
+                item.as_object()?
+                    .get("v")?
+                    .as_str()
+                    .and_then(|value| non_empty(value.to_string()))
+            })
+    })
+}
+
+fn label_matches(value: &str, labels: &[&str]) -> bool {
+    let value = value.trim();
+    labels.iter().any(|label| value.eq_ignore_ascii_case(label))
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn search_with_retry(client: &Client, keyword: &str, limit: usize) -> AppResult<SearchResponse> {
+    let mut failures = Vec::new();
+    for attempt in 0..2 {
+        match search_endpoint(client, SEARCH_URL, keyword, limit) {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                failures.push(endpoint_failure_label(SEARCH_URL, &error));
+                if attempt == 0 && should_retry(&error) {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    Err(format!(
+        "搜索 Bangumi 失败：{}。请检查网络、系统代理或 DNS 后重试。",
+        failures.join("；")
+    ))
+}
+
+fn search_endpoint(
+    client: &Client,
+    endpoint: &str,
+    keyword: &str,
+    limit: usize,
+) -> Result<SearchResponse, reqwest::Error> {
+    client
+        .post(endpoint)
+        .query(&[("limit", limit.clamp(1, 50)), ("offset", 0_usize)])
+        .json(&json!({
+            "keyword": keyword,
+            "sort": "match",
+            "filter": { "type": [2], "nsfw": false }
+        }))
+        .send()?
+        .error_for_status()?
+        .json::<SearchResponse>()
+}
+
+fn should_retry(error: &reqwest::Error) -> bool {
+    error.is_connect()
+        || error.is_timeout()
+        || error
+            .status()
+            .is_some_and(|status| status.is_server_error())
+}
+
+fn endpoint_failure_label(endpoint: &str, error: &reqwest::Error) -> String {
+    let host = Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "未知地址".into());
+    let kind = if error.is_timeout() {
+        "连接超时"
+    } else if error.is_connect() {
+        "无法连接"
+    } else if error.is_decode() {
+        "响应格式无效"
+    } else if let Some(status) = error.status() {
+        return format!("{host} 返回 HTTP {}", status.as_u16());
+    } else {
+        "请求失败"
+    };
+    format!("{host} {kind}（{}）", error_chain(error))
+}
+
+fn error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        source = cause.source();
+    }
+    messages.join(": ")
+}
+
+pub fn download_cover(cache_root: &Path, subject: &BangumiSubject) -> AppResult<Option<PathBuf>> {
+    let Some(image_url) = subject.image_url.as_deref() else {
+        return Ok(None);
+    };
+    let parsed_url = Url::parse(image_url).map_err(|_| "Bangumi 返回了无效的封面地址。")?;
+    if parsed_url.scheme() != "https" || !is_allowed_cover_host(parsed_url.host_str()) {
+        return Err("拒绝下载非 Bangumi 官方域名的封面。".into());
+    }
+    cache::ensure_directories(cache_root)?;
+    let destination = cache::bangumi_cover_path(cache_root, subject.subject_id, image_url);
+    let client = client()?;
+    let mut response = download_response_with_retry(&client, image_url)?;
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        content_type.as_str(),
+        "image/jpeg" | "image/png" | "image/webp"
+    ) {
+        return Err("Bangumi 封面响应不是支持的图片格式。".into());
+    }
+    if response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_COVER_DOWNLOAD_BYTES)
+    {
+        return Err("Bangumi 封面超过 15 MiB 安全限制。".into());
+    }
+
+    let temporary = destination.with_extension("download");
+    // File::create opens a write-only handle. The old implementation then attempted to read that
+    // same handle for signature validation, which fails on Windows and removed every downloaded
+    // cover before it could be committed. Open the temporary file for both reading and writing.
+    let mut temporary_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)
+        .map_err(|error| format!("创建封面缓存失败：{error}"))?;
+    let mut limited = response.by_ref().take(MAX_COVER_DOWNLOAD_BYTES + 1);
+    let copied = match std::io::copy(&mut limited, &mut temporary_file) {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(temporary_file);
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("读取 Bangumi 封面失败：{error}"));
+        }
+    };
+    if let Err(error) = temporary_file.flush() {
+        drop(temporary_file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("写入封面缓存失败：{error}"));
+    }
+    if copied > MAX_COVER_DOWNLOAD_BYTES {
+        drop(temporary_file);
+        let _ = fs::remove_file(&temporary);
+        return Err("Bangumi 封面超过 15 MiB 安全限制。".into());
+    }
+    if copied == 0 {
+        drop(temporary_file);
+        let _ = fs::remove_file(&temporary);
+        return Err("Bangumi 返回了空封面文件。".into());
+    }
+    if let Err(error) = temporary_file.seek(SeekFrom::Start(0)) {
+        drop(temporary_file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("校验封面缓存失败：{error}"));
+    }
+    let mut signature = [0_u8; 12];
+    let signature_length = match temporary_file.read(&mut signature) {
+        Ok(length) => length,
+        Err(error) => {
+            drop(temporary_file);
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("校验封面缓存失败：{error}"));
+        }
+    };
+    if !valid_image_signature(&content_type, &signature[..signature_length]) {
+        drop(temporary_file);
+        let _ = fs::remove_file(&temporary);
+        return Err("Bangumi 封面内容与图片格式不匹配。".into());
+    }
+    drop(temporary_file);
+    if destination.exists() {
+        cache::remove_cached_file(&destination, cache_root)?;
+    }
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("保存封面缓存失败：{error}")
+    })?;
+    Ok(Some(destination))
+}
+
+fn download_response_with_retry(
+    client: &Client,
+    image_url: &str,
+) -> AppResult<reqwest::blocking::Response> {
+    let mut failures = Vec::new();
+    for attempt in 0..2 {
+        match client
+            .get(image_url)
+            .send()
+            .and_then(|response| response.error_for_status())
+        {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                failures.push(endpoint_failure_label(image_url, &error));
+                if attempt == 0 && should_retry(&error) {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(format!(
+        "下载 Bangumi 封面失败：{}。绑定已保留，可以稍后重新获取。",
+        failures.join("；")
+    ))
+}
+
+fn is_allowed_cover_host(host: Option<&str>) -> bool {
+    host == Some("lain.bgm.tv")
+}
+
+fn valid_image_signature(content_type: &str, bytes: &[u8]) -> bool {
+    match content_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_rejects_oversized_keywords_before_network_access() {
+        let error = search(&"x".repeat(MAX_SEARCH_KEYWORD_CHARS + 1), 20).unwrap_err();
+        assert!(error.contains("不能超过"));
+    }
+
+    #[test]
+    fn cover_host_allowlist_rejects_lookalikes() {
+        assert!(is_allowed_cover_host(Some("lain.bgm.tv")));
+        assert!(!is_allowed_cover_host(Some("lain.bgm.tv.example.com")));
+        assert!(!is_allowed_cover_host(Some("example.com")));
+        assert!(!is_allowed_cover_host(None));
+    }
+
+    #[test]
+    fn user_agent_identifies_local_user_app_and_version() {
+        assert!(USER_AGENT.starts_with("Undermori/M2Shelf/"));
+        assert!(USER_AGENT.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!USER_AGENT.contains("unpublished"));
+    }
+
+    #[test]
+    fn search_result_preserves_multilingual_infobox_titles_for_binding_metadata() {
+        let api_subject: ApiSubject = serde_json::from_str(
+            r#"{
+                "id": 123,
+                "type": 2,
+                "name": "作品の原題",
+                "name_cn": "中文标题",
+                "date": "2026-01-01",
+                "summary": "summary",
+                "images": null,
+                "infobox": [
+                    {"key": "English", "value": "English Title"},
+                    {"key": "日本語名", "value": [{"v": "日本語タイトル"}]},
+                    {"key": "한국어명", "value": [{"k": "", "v": "한국어 제목"}]},
+                    {"key": "别名", "value": [
+                        {"k": "罗马字", "v": "Romanized Title"},
+                        {"k": "简称", "v": "Short Title"}
+                    ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let subject = api_subject_to_model(api_subject);
+        assert_eq!(subject.title_cn.as_deref(), Some("中文标题"));
+        assert_eq!(subject.title_en.as_deref(), Some("English Title"));
+        assert_eq!(subject.title_ja.as_deref(), Some("日本語タイトル"));
+        assert_eq!(subject.title_ko.as_deref(), Some("한국어 제목"));
+        for alias in [
+            "English Title",
+            "日本語タイトル",
+            "한국어 제목",
+            "Romanized Title",
+            "Short Title",
+        ] {
+            assert!(subject.match_aliases.iter().any(|value| value == alias));
+        }
+    }
+
+    #[test]
+    fn subject_detail_extracts_multilingual_titles_from_official_infobox_shapes() {
+        let detail: ApiSubjectDetail = serde_json::from_str(
+            r#"{
+                "id": 123,
+                "type": 2,
+                "name": "作品の原題",
+                "name_cn": "作品中文名",
+                "date": "2025-01-01",
+                "summary": "summary",
+                "images": null,
+                "infobox": [
+                    {"key":"English", "value":"English Title"},
+                    {"key":"别名", "value":[
+                        {"k":"日文名", "v":"明示された日本語名"},
+                        {"k":"韓語名", "v":"한국어 제목"}
+                    ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_infobox_title(&detail.infobox, ENGLISH_TITLE_LABELS).as_deref(),
+            Some("English Title")
+        );
+        assert_eq!(
+            extract_infobox_title(&detail.infobox, JAPANESE_TITLE_LABELS).as_deref(),
+            Some("明示された日本語名")
+        );
+        assert_eq!(
+            extract_infobox_title(&detail.infobox, KOREAN_TITLE_LABELS).as_deref(),
+            Some("한국어 제목")
+        );
+        let fallback = BangumiSubject {
+            subject_id: 123,
+            title: "Search title".into(),
+            title_cn: None,
+            title_en: None,
+            title_ja: None,
+            title_ko: None,
+            match_aliases: Vec::new(),
+            date: None,
+            image_url: None,
+            summary: None,
+            subject_type: 2,
+        };
+        let merged = merge_subject_detail(&fallback, detail).unwrap();
+        assert_eq!(merged.title, "作品の原題");
+        assert_eq!(merged.title_cn.as_deref(), Some("作品中文名"));
+        assert_eq!(merged.title_en.as_deref(), Some("English Title"));
+        assert_eq!(merged.title_ja.as_deref(), Some("明示された日本語名"));
+        assert_eq!(merged.title_ko.as_deref(), Some("한국어 제목"));
+        assert!(merged
+            .match_aliases
+            .iter()
+            .any(|value| value == "明示された日本語名"));
+    }
+
+    #[test]
+    fn subject_detail_uses_main_name_as_japanese_fallback() {
+        let detail: ApiSubjectDetail = serde_json::from_str(
+            r#"{
+                "id": 9,
+                "type": 2,
+                "name": "メインタイトル",
+                "name_cn": "中文标题",
+                "date": null,
+                "summary": null,
+                "images": null,
+                "infobox": []
+            }"#,
+        )
+        .unwrap();
+        let fallback = BangumiSubject {
+            subject_id: 9,
+            title: "search".into(),
+            title_cn: None,
+            title_en: None,
+            title_ja: None,
+            title_ko: None,
+            match_aliases: Vec::new(),
+            date: None,
+            image_url: None,
+            summary: None,
+            subject_type: 2,
+        };
+        assert_eq!(
+            merge_subject_detail(&fallback, detail)
+                .unwrap()
+                .title_ja
+                .as_deref(),
+            Some("メインタイトル")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires external network access"]
+    fn live_search_returns_anime_results() {
+        let results = search("葬送的芙莉莲", 3).expect("Bangumi live search should succeed");
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|subject| subject.subject_type == 2));
+        assert!(results
+            .iter()
+            .any(|subject| !subject.match_aliases.is_empty()));
+    }
+
+    #[test]
+    #[ignore = "requires external network access"]
+    fn live_cover_download_survives_signature_validation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let subject = BangumiSubject {
+            subject_id: 25417,
+            title: "cover test".into(),
+            title_cn: None,
+            title_en: None,
+            title_ja: None,
+            title_ko: None,
+            match_aliases: Vec::new(),
+            date: None,
+            image_url: Some("https://lain.bgm.tv/pic/cover/l/22/43/25417_o675v.jpg".into()),
+            summary: None,
+            subject_type: 2,
+        };
+        let cover = download_cover(temp.path(), &subject)
+            .expect("Bangumi live cover should download")
+            .expect("test subject has an image");
+        assert!(cover.is_file());
+        assert!(std::fs::metadata(cover).unwrap().len() > 0);
+    }
+}

@@ -1,0 +1,253 @@
+export type NodeType =
+  | "AUTO_WORK"
+  | "WORK"
+  | "CONTAINER"
+  | "MIXED"
+  | "IGNORED";
+
+export type CoverSource = "BANGUMI" | "MANUAL" | "PLACEHOLDER";
+export type ViewMode = "grid" | "list";
+export type CollectionSort = "title-asc" | "title-desc" | "added-desc" | "added-asc";
+export type CollectionSortScope = "all" | "browse" | "favorites";
+export interface CollectionSortPreferences {
+  all: CollectionSort;
+  browse: CollectionSort;
+  favorites: CollectionSort;
+}
+export type AppLanguage = "zh-CN" | "en-US" | "ja-JP" | "ko-KR";
+export type AppTheme = "system" | "light" | "dark";
+export type ScanStatus = "IDLE" | "RUNNING" | "CANCELLING" | "COMPLETED" | "CANCELLED" | "FAILED";
+export type ResourceType =
+  | "DOCUMENT"
+  | "IMAGE"
+  | "AUDIO"
+  | "SUBTITLE"
+  | "ARCHIVE"
+  | "FONT"
+  | "PLAYLIST"
+  | "OTHER";
+
+export interface LibraryRoot {
+  id: number;
+  path: string;
+  displayName: string;
+  createdAt: string;
+  lastScanAt: string | null;
+  nodeCount?: number;
+  mediaCount?: number;
+}
+
+export interface MetadataBinding {
+  id?: number;
+  nodeId: number;
+  provider: "BANGUMI";
+  providerSubjectId: number;
+  providerTitle: string;
+  providerTitleCn: string | null;
+  providerTitleEn: string | null;
+  providerTitleJa: string | null;
+  providerTitleKo: string | null;
+  providerDate: string | null;
+  providerImageUrl: string | null;
+  boundAt: string;
+  updatedAt: string;
+  coverCachePath: string | null;
+  coverDownloadError: string | null;
+}
+
+/** A user-owned label stored in M²Shelf and never written into a media source. */
+export interface UserTag {
+  id: number;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A global user tag together with its assignment state for one Node. */
+export interface UserTagMembership extends UserTag {
+  assigned: boolean;
+}
+
+/** A named, app-owned favorites folder. Membership never changes source media. */
+export interface FavoriteFolder {
+  id: number;
+  name: string;
+  itemCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MediaNode {
+  id: number;
+  libraryRootId: number;
+  parentNodeId: number | null;
+  absolutePath: string;
+  folderName: string;
+  displayName: string;
+  nodeType: NodeType;
+  manualTypeOverride: boolean;
+  coverSource: CoverSource;
+  coverCachePath: string | null;
+  directVideoCount?: number;
+  childMediaBranchCount?: number;
+  totalVideoCount?: number;
+  createdAt: string;
+  updatedAt: string;
+  lastSeenAt: string;
+  binding?: MetadataBinding | null;
+  userTags: UserTag[];
+  /** Frontend-only cache-busting token; never persisted or sent to the media source. */
+  clientCoverRevision?: number;
+}
+
+export interface MediaFile {
+  id: number;
+  nodeId: number;
+  absolutePath: string;
+  fileName: string;
+  extension: string;
+  fileSize: number;
+  modifiedAt: string;
+  durationMs: number | null;
+  width: number | null;
+  height: number | null;
+  codec: string | null;
+  lastSeenAt: string;
+}
+
+/** A non-video file indexed as an attachment of its directory node. */
+export interface ResourceFile {
+  id: number;
+  nodeId: number;
+  absolutePath: string;
+  fileName: string;
+  extension: string;
+  fileSize: number;
+  modifiedAt: string;
+  resourceType: ResourceType;
+  lastSeenAt: string;
+}
+
+export interface BreadcrumbItem {
+  id: number;
+  displayName: string;
+}
+
+export interface BrowseResult {
+  root: LibraryRoot;
+  breadcrumbs: BreadcrumbItem[];
+  nodes: MediaNode[];
+  mediaFiles: MediaFile[];
+  resourceFiles: ResourceFile[];
+}
+
+export interface AllResourcesResult {
+  nodes: MediaNode[];
+  totalCount: number;
+}
+
+/** A locally recorded playback, ordered newest first by the native API. */
+export interface RecentlyWatchedEntry {
+  node: MediaNode;
+  watchedAt: string;
+}
+
+export interface SearchHit {
+  kind: "NODE" | "MEDIA_FILE";
+  node: MediaNode;
+  mediaFile?: MediaFile | null;
+}
+
+export interface BangumiSubject {
+  subjectId: number;
+  title: string;
+  titleCn: string | null;
+  titleEn: string | null;
+  titleJa: string | null;
+  titleKo: string | null;
+  matchAliases: string[];
+  date: string | null;
+  imageUrl: string | null;
+  summary: string | null;
+  subjectType: number;
+}
+
+export interface ScanProgress {
+  scanId: string;
+  rootId: number;
+  currentPath: string;
+  foldersScanned: number;
+  videosFound: number;
+  status: ScanStatus;
+  errors: number;
+  message?: string | null;
+  phase: "SCANNING" | "AUTO_MATCHING";
+  autoMatchCurrent: number;
+  autoMatchTotal: number;
+  autoMatchMatched: number;
+  autoMatchPending: number;
+  autoMatchUnmatched: number;
+  autoMatchErrors: number;
+}
+
+/** Summary returned by one transactional multi-node metadata mutation. */
+export interface BatchMutationResult {
+  requested: number;
+  updated: number;
+  skipped: number;
+}
+
+export interface AppSettings {
+  mpvPath: string | null;
+  defaultViewMode: "GRID" | "LIST";
+  videoExtensions: string[];
+  bangumiSearchEnabled: boolean;
+  language: AppLanguage;
+  theme: AppTheme;
+  coverCacheDirectory: string;
+}
+
+export interface CacheStats {
+  fileCount: number;
+  totalBytes: number;
+  cacheDirectory: string;
+}
+
+export interface AppBootstrap {
+  name: string;
+  version: string;
+  databaseUrl: string;
+  buildDate: string;
+  architecture: string;
+  websiteUrl: string;
+  xUrl: string;
+}
+
+export interface BangumiSearchPrefill {
+  originalName: string;
+  extractedName: string;
+  candidates: string[];
+}
+
+export interface RebuildResult {
+  scanId: string;
+}
+
+export interface ScanStarted {
+  scanId: string;
+}
+
+export interface NodeDetail {
+  node: MediaNode;
+  children: MediaNode[];
+  mediaFiles: MediaFile[];
+  resourceFiles: ResourceFile[];
+  breadcrumbs: BreadcrumbItem[];
+  binding: MetadataBinding | null;
+}
+
+export interface PlayerTestResult {
+  ok: boolean;
+  message: string;
+  version: string | null;
+}

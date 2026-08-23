@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "M²Shelf desktop window with user-triggered file pickers only.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}
