@@ -6,6 +6,8 @@
 
 <p align="center"><strong>MORI MEDIA SHELF</strong></p>
 
+<p align="center"><a href="./README.en-US.md">English</a> · <a href="./README.ja-JP.md">日本語</a> · <a href="./README.ko-KR.md">한국어</a></p>
+
 <p align="center">完全由 GPT 完成，面向 Windows 本地媒体收藏的本地优先、媒体源只读浏览器。</p>
 
 M²Shelf 把本地硬盘、移动硬盘或 NAS 映射目录中的动画、电影及相关资源建立为独立索引，提供海报墙浏览、Bangumi 元数据、标签、收藏夹、观看记录和外部播放器入口。
