@@ -1,7 +1,8 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
-    path::{Path, PathBuf},
+    fs,
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -23,6 +24,7 @@ pub enum ConditionalBindingSave {
 }
 
 const MAX_BATCH_NODE_IDS: usize = 500;
+const NODE_METADATA_CHUNK_SIZE: usize = 500;
 const MAX_SEARCH_QUERY_CHARS: usize = 500;
 const MAX_DISPLAY_NAME_CHARS: usize = 240;
 const MAX_VIDEO_EXTENSIONS: usize = 64;
@@ -172,10 +174,7 @@ impl Database {
     }
 
     pub fn add_root(&self, path: &Path, display_name: Option<String>) -> AppResult<LibraryRoot> {
-        if !path.is_dir() {
-            return Err("所选资源目录不存在或不是文件夹。".into());
-        }
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical = canonical_library_root(path)?;
         let normalized = display_path(&canonical);
         let derived_name = Path::new(&normalized)
             .file_name()
@@ -186,8 +185,12 @@ impl Database {
         let name = display_name
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(derived_name);
-        let connection = self.connect()?;
-        connection
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        ensure_root_does_not_overlap_conn(&transaction, &canonical, None)?;
+        transaction
             .execute(
                 "INSERT INTO library_roots(path, display_name) VALUES (?1, ?2)",
                 params![normalized, name],
@@ -199,7 +202,41 @@ impl Database {
                     db_error(error)
                 }
             })?;
-        get_root_conn(&connection, connection.last_insert_rowid())
+        let root_id = transaction.last_insert_rowid();
+        transaction.commit().map_err(db_error)?;
+        get_root_conn(&connection, root_id)
+    }
+
+    /// Resolves a proposed Library Root and rejects any path that is equal to, contains, or is
+    /// contained by a registered root. `add_root` repeats this inside an immediate transaction;
+    /// this public check lets the Tauri command fail before doing other setup work.
+    pub fn validate_new_root_path(&self, path: &Path) -> AppResult<PathBuf> {
+        let canonical = canonical_library_root(path)?;
+        let connection = self.connect()?;
+        ensure_root_does_not_overlap_conn(&connection, &canonical, None)?;
+        Ok(canonical)
+    }
+
+    /// Defense for legacy databases and forged scan targets. A scan may proceed only when its
+    /// root still resolves to the registered directory and does not overlap another root.
+    pub fn validate_scan_root(&self, root: &LibraryRoot) -> AppResult<PathBuf> {
+        let supplied = canonical_library_root(Path::new(&root.path))?;
+        let connection = self.connect()?;
+        let registered = connection
+            .query_row(
+                "SELECT path FROM library_roots WHERE id=?1",
+                [root.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .ok_or_else(|| "资源库不存在。".to_string())?;
+        let registered = canonical_library_root(Path::new(&registered))?;
+        if !paths_equal_for_library_roots(&supplied, &registered) {
+            return Err("扫描目标与已登记的资源库路径不一致，已拒绝扫描。".into());
+        }
+        ensure_root_does_not_overlap_conn(&connection, &registered, Some(root.id))?;
+        Ok(registered)
     }
 
     /// Removes only M²Shelf's SQLite index. It never touches the source directory.
@@ -301,10 +338,7 @@ impl Database {
             .map_err(db_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_error)?;
-        for node in &mut nodes {
-            node.binding = get_binding_conn(&connection, node.id)?;
-            node.user_tags = list_node_tags_conn(&connection, node.id)?;
-        }
+        hydrate_nodes_metadata_conn(&connection, &mut nodes)?;
         nodes.sort_by(|left, right| {
             natural_cmp(&left.display_name, &right.display_name)
                 .then_with(|| left.library_root_id.cmp(&right.library_root_id))
@@ -1915,12 +1949,84 @@ fn list_nodes_conn(
         .map_err(db_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error)?;
-    for node in &mut nodes {
-        node.binding = get_binding_conn(connection, node.id)?;
-        node.user_tags = list_node_tags_conn(connection, node.id)?;
-    }
+    hydrate_nodes_metadata_conn(connection, &mut nodes)?;
     nodes.sort_by(|a, b| natural_cmp(&a.display_name, &b.display_name));
     Ok(nodes)
+}
+
+/// Hydrate card-list metadata in bounded batches. The previous per-Node binding and tag lookups
+/// made All Resources and ordinary directory browsing execute 1 + 2N SQL statements.
+fn hydrate_nodes_metadata_conn(connection: &Connection, nodes: &mut [MediaNode]) -> AppResult<()> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    for node in nodes.iter_mut() {
+        node.binding = None;
+        node.user_tags.clear();
+    }
+    let positions = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect::<HashMap<_, _>>();
+    let node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+
+    for chunk in node_ids.chunks(NODE_METADATA_CHUNK_SIZE) {
+        let placeholders = sql_placeholders(chunk.len());
+        let binding_sql = format!(
+            "SELECT b.id,b.node_id,b.provider,b.provider_subject_id,b.provider_title,b.provider_title_cn,
+             b.provider_title_en,b.provider_title_ja,b.provider_title_ko,
+             b.provider_date,b.provider_image_url,b.bound_at,b.updated_at,
+             CASE WHEN n.cover_source='BANGUMI' THEN n.cover_cache_path ELSE NULL END,
+             b.cover_download_error
+             FROM metadata_bindings b JOIN nodes n ON n.id=b.node_id
+             WHERE b.provider='BANGUMI' AND b.node_id IN ({placeholders})"
+        );
+        let mut binding_statement = connection.prepare(&binding_sql).map_err(db_error)?;
+        let bindings = binding_statement
+            .query_map(rusqlite::params_from_iter(chunk.iter()), binding_from_row)
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        for binding in bindings {
+            if let Some(index) = positions.get(&binding.node_id) {
+                nodes[*index].binding = Some(binding);
+            }
+        }
+
+        let tag_sql = format!(
+            "SELECT nt.node_id,t.id,t.name,t.created_at,t.updated_at
+             FROM node_tags nt JOIN tags t ON t.id=nt.tag_id
+             WHERE nt.node_id IN ({placeholders})
+             ORDER BY nt.node_id,t.name COLLATE NOCASE,t.id"
+        );
+        let mut tag_statement = connection.prepare(&tag_sql).map_err(db_error)?;
+        let tags = tag_statement
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    UserTag {
+                        id: row.get(1)?,
+                        name: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        for (node_id, tag) in tags {
+            if let Some(index) = positions.get(&node_id) {
+                nodes[*index].user_tags.push(tag);
+            }
+        }
+    }
+    for node in nodes {
+        node.user_tags
+            .sort_by(|left, right| natural_cmp(&left.name, &right.name));
+    }
+    Ok(())
 }
 
 fn user_tag_from_row(row: &Row<'_>) -> rusqlite::Result<UserTag> {
@@ -2171,28 +2277,30 @@ fn get_binding_conn(connection: &Connection, node_id: i64) -> AppResult<Option<M
              FROM metadata_bindings b JOIN nodes n ON n.id=b.node_id
              WHERE b.node_id=?1 AND b.provider='BANGUMI'",
             [node_id],
-            |row| {
-                Ok(MetadataBinding {
-                    id: row.get(0)?,
-                    node_id: row.get(1)?,
-                    provider: row.get(2)?,
-                    provider_subject_id: row.get(3)?,
-                    provider_title: row.get(4)?,
-                    provider_title_cn: row.get(5)?,
-                    provider_title_en: row.get(6)?,
-                    provider_title_ja: row.get(7)?,
-                    provider_title_ko: row.get(8)?,
-                    provider_date: row.get(9)?,
-                    provider_image_url: row.get(10)?,
-                    bound_at: row.get(11)?,
-                    updated_at: row.get(12)?,
-                    cover_cache_path: row.get(13)?,
-                    cover_download_error: row.get(14)?,
-                })
-            },
+            binding_from_row,
         )
         .optional()
         .map_err(db_error)
+}
+
+fn binding_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataBinding> {
+    Ok(MetadataBinding {
+        id: row.get(0)?,
+        node_id: row.get(1)?,
+        provider: row.get(2)?,
+        provider_subject_id: row.get(3)?,
+        provider_title: row.get(4)?,
+        provider_title_cn: row.get(5)?,
+        provider_title_en: row.get(6)?,
+        provider_title_ja: row.get(7)?,
+        provider_title_ko: row.get(8)?,
+        provider_date: row.get(9)?,
+        provider_image_url: row.get(10)?,
+        bound_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        cover_cache_path: row.get(13)?,
+        cover_download_error: row.get(14)?,
+    })
 }
 
 fn escape_like(value: &str) -> String {
@@ -2200,6 +2308,104 @@ fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+fn canonical_library_root(path: &Path) -> AppResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err("资源库目录必须是绝对路径。".into());
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("无法确认所选资源目录的实际位置：{error}"))?;
+    if !canonical.is_dir() {
+        return Err("所选资源目录不存在或不是文件夹。".into());
+    }
+    Ok(canonical)
+}
+
+fn ensure_root_does_not_overlap_conn(
+    connection: &Connection,
+    candidate: &Path,
+    ignored_root_id: Option<i64>,
+) -> AppResult<()> {
+    let mut statement = connection
+        .prepare("SELECT id,path FROM library_roots ORDER BY id")
+        .map_err(db_error)?;
+    let roots = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    for (root_id, path) in roots {
+        if ignored_root_id == Some(root_id) {
+            continue;
+        }
+        let existing_path = Path::new(&path);
+        let existing = existing_path
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_library_root_lexically(existing_path));
+        if paths_equal_for_library_roots(candidate, &existing) {
+            return Err("该资源目录已经添加。".into());
+        }
+        if library_root_paths_overlap(candidate, &existing) {
+            return Err("资源库目录不能与已有资源库重叠；请勿添加其上级或下级目录。".into());
+        }
+    }
+    Ok(())
+}
+
+fn library_root_paths_overlap(left: &Path, right: &Path) -> bool {
+    library_root_path_starts_with(left, right) || library_root_path_starts_with(right, left)
+}
+
+fn paths_equal_for_library_roots(left: &Path, right: &Path) -> bool {
+    library_root_path_starts_with(left, right) && library_root_path_starts_with(right, left)
+}
+
+/// `Path::starts_with` is component-aware but follows the host's `OsStr` equality. M²Shelf is a
+/// Windows product, so comparison on Windows must additionally be case-insensitive. This avoids
+/// treating `D:\Anime` and `d:\ANIME\Season` as unrelated while still keeping textual siblings
+/// such as `Anime-Backup` separate.
+fn library_root_path_starts_with(candidate: &Path, root: &Path) -> bool {
+    let mut candidate_components = candidate.components();
+    for expected in root.components() {
+        let Some(actual) = candidate_components.next() else {
+            return false;
+        };
+        if !library_root_component_eq(actual, expected) {
+            return false;
+        }
+    }
+    true
+}
+
+fn library_root_component_eq(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // Canonical paths normalize drive/UNC prefixes. Unicode lowercase supplies the remaining
+        // case-insensitive component comparison without ever converting paths into shell text.
+        left.as_os_str().to_string_lossy().to_lowercase()
+            == right.as_os_str().to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+fn normalize_library_root_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn display_path(path: &Path) -> String {
@@ -2294,6 +2500,169 @@ mod tests {
         for expected in ["mkv", "mp4", "m2ts", "webm", "ts"] {
             assert!(extensions.iter().any(|value| value == expected));
         }
+    }
+
+    #[test]
+    fn bulk_card_metadata_hydration_preserves_bindings_and_natural_tag_order_across_chunks() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("library");
+        fs::create_dir_all(&root_path).unwrap();
+        let database = Database::new(temp.path().join("bulk-hydration.db"));
+        database.migrate().unwrap();
+        let root = database.add_root(&root_path, None).unwrap();
+        let mut connection = database.connect().unwrap();
+        let mut empty_nodes = Vec::new();
+        hydrate_nodes_metadata_conn(&connection, &mut empty_nodes).unwrap();
+        assert!(empty_nodes.is_empty());
+        connection
+            .execute(
+                "INSERT INTO nodes(
+                    library_root_id,absolute_path,folder_name,display_name,node_type,total_video_count
+                 ) VALUES(?1,?2,'library','library','CONTAINER',?3)",
+                params![
+                    root.id,
+                    display_path(&root_path),
+                    (NODE_METADATA_CHUNK_SIZE + 1) as i64
+                ],
+            )
+            .unwrap();
+        let hidden_root_id = connection.last_insert_rowid();
+        let transaction = connection.transaction().unwrap();
+        let mut node_ids = Vec::with_capacity(NODE_METADATA_CHUNK_SIZE + 1);
+        for index in 0..=NODE_METADATA_CHUNK_SIZE {
+            let name = format!("Work {index}");
+            transaction
+                .execute(
+                    "INSERT INTO nodes(
+                        library_root_id,parent_node_id,absolute_path,folder_name,display_name,
+                        node_type,total_video_count
+                     ) VALUES(?1,?2,?3,?4,?4,'WORK',1)",
+                    params![
+                        root.id,
+                        hidden_root_id,
+                        display_path(&root_path.join(&name)),
+                        name
+                    ],
+                )
+                .unwrap();
+            node_ids.push(transaction.last_insert_rowid());
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let last_node_id = *node_ids.last().unwrap();
+        database
+            .save_confirmed_binding(
+                last_node_id,
+                &crate::models::BangumiSubject {
+                    subject_id: 42,
+                    title: "Bulk Hydration Work".into(),
+                    title_cn: Some("批量装载作品".into()),
+                    title_en: None,
+                    title_ja: None,
+                    title_ko: None,
+                    match_aliases: Vec::new(),
+                    date: None,
+                    image_url: None,
+                    summary: None,
+                    subject_type: 2,
+                },
+            )
+            .unwrap();
+        database
+            .create_or_assign_user_tag(last_node_id, "Tag 10")
+            .unwrap();
+        database
+            .create_or_assign_user_tag(last_node_id, "Tag 2")
+            .unwrap();
+
+        let resources = database.list_all_resources().unwrap();
+        assert_eq!(
+            resources.nodes.len(),
+            NODE_METADATA_CHUNK_SIZE + 1,
+            "all visible card rows must survive metadata chunking"
+        );
+        let hydrated = resources
+            .nodes
+            .iter()
+            .find(|node| node.id == last_node_id)
+            .unwrap();
+        assert_eq!(hydrated.binding.as_ref().unwrap().provider_subject_id, 42);
+        assert_eq!(
+            hydrated
+                .user_tags
+                .iter()
+                .map(|tag| tag.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Tag 2", "Tag 10"]
+        );
+    }
+
+    #[test]
+    fn library_roots_reject_equal_ancestor_and_descendant_paths() {
+        let temp = TempDir::new().unwrap();
+        let registered = temp.path().join("Library");
+        let child = registered.join("Season 1");
+        let prefix_sibling = temp.path().join("Library-Archive");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&prefix_sibling).unwrap();
+        let sentinel = child.join("01.mkv");
+        fs::write(&sentinel, b"read only source").unwrap();
+
+        let database = Database::new(temp.path().join("roots.db"));
+        database.migrate().unwrap();
+        database.add_root(&registered, None).unwrap();
+
+        let equal = database.add_root(&registered.join("."), None).unwrap_err();
+        assert!(equal.contains("已经添加"), "{equal}");
+        let descendant = database.add_root(&child, None).unwrap_err();
+        assert!(descendant.contains("上级或下级"), "{descendant}");
+        let ancestor = database.add_root(temp.path(), None).unwrap_err();
+        assert!(ancestor.contains("上级或下级"), "{ancestor}");
+        database.add_root(&prefix_sibling, None).unwrap();
+
+        assert_eq!(database.list_roots().unwrap().len(), 2);
+        assert_eq!(fs::read(sentinel).unwrap(), b"read only source");
+    }
+
+    #[test]
+    fn scan_guard_rejects_legacy_overlapping_root_rows() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("Library");
+        let child = parent.join("Nested");
+        fs::create_dir_all(&child).unwrap();
+
+        let database = Database::new(temp.path().join("legacy-overlap.db"));
+        database.migrate().unwrap();
+        let parent_root = database.add_root(&parent, None).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO library_roots(path,display_name) VALUES(?1,'Nested')",
+                [display_path(&child)],
+            )
+            .unwrap();
+        let child_id = connection.last_insert_rowid();
+        drop(connection);
+        let child_root = database.get_root(child_id).unwrap();
+
+        let parent_error = database.validate_scan_root(&parent_root).unwrap_err();
+        assert!(parent_error.contains("上级或下级"), "{parent_error}");
+        let child_error = database.validate_scan_root(&child_root).unwrap_err();
+        assert!(child_error.contains("上级或下级"), "{child_error}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_library_root_comparison_is_component_and_case_aware() {
+        assert!(library_root_paths_overlap(
+            Path::new(r"C:\Media"),
+            Path::new(r"c:\MEDIA\Season 2")
+        ));
+        assert!(!library_root_paths_overlap(
+            Path::new(r"C:\Media"),
+            Path::new(r"C:\Media-Backup")
+        ));
     }
 
     #[test]
@@ -3652,8 +4021,10 @@ mod tests {
             .into_iter()
             .filter(|(_, _, path)| crate::cache::is_equal_or_within(path, &active_cache))
             .collect::<Vec<_>>();
-        crate::cache::clear_cover_cache(&active_cache).unwrap();
+        let cache_clear = crate::cache::begin_cover_cache_clear();
+        crate::cache::clear_cover_cache(&cache_clear, &active_cache).unwrap();
         database.clear_cover_paths_for_nodes(&affected).unwrap();
+        drop(cache_clear);
 
         let active_after = database.get_node(active_node_id).unwrap();
         let old_after = database.get_node(old_node_id).unwrap();
@@ -3665,7 +4036,8 @@ mod tests {
         assert!(database.get_binding(old_node_id).unwrap().is_some());
         assert!(!active_path.exists());
         assert!(old_path.exists());
-        assert!(crate::cache::cover_data_url(&old_path)
+        let cache_operation = crate::cache::begin_cover_cache_operation();
+        assert!(crate::cache::cover_data_url(&cache_operation, &old_path)
             .unwrap()
             .starts_with("data:image/png;base64,"));
     }

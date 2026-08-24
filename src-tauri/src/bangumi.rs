@@ -1,6 +1,5 @@
 use std::{
     error::Error as StdError,
-    fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -478,7 +477,11 @@ fn error_chain(error: &(dyn StdError + 'static)) -> String {
     messages.join(": ")
 }
 
-pub fn download_cover(cache_root: &Path, subject: &BangumiSubject) -> AppResult<Option<PathBuf>> {
+pub fn download_cover(
+    _cache_operation: &cache::CoverCacheOperationGuard,
+    cache_root: &Path,
+    subject: &BangumiSubject,
+) -> AppResult<Option<PathBuf>> {
     let Some(image_url) = subject.image_url.as_deref() else {
         return Ok(None);
     };
@@ -515,44 +518,37 @@ pub fn download_cover(cache_root: &Path, subject: &BangumiSubject) -> AppResult<
         return Err("Bangumi 封面超过 15 MiB 安全限制。".into());
     }
 
-    let temporary = destination.with_extension("download");
-    // File::create opens a write-only handle. The old implementation then attempted to read that
-    // same handle for signature validation, which fails on Windows and removed every downloaded
-    // cover before it could be committed. Open the temporary file for both reading and writing.
-    let mut temporary_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)
-        .map_err(|error| format!("创建封面缓存失败：{error}"))?;
+    // Every request stages to its own same-directory file. This prevents concurrent retries for
+    // the same Subject from truncating one another and lets the final replace remain atomic.
+    let (mut pending_file, mut temporary_file) =
+        cache::create_pending_cache_file(&destination, true)
+            .map_err(|error| format!("创建封面缓存失败：{error}"))?;
     let mut limited = response.by_ref().take(MAX_COVER_DOWNLOAD_BYTES + 1);
     let copied = match std::io::copy(&mut limited, &mut temporary_file) {
         Ok(copied) => copied,
         Err(error) => {
             drop(temporary_file);
-            let _ = fs::remove_file(&temporary);
             return Err(format!("读取 Bangumi 封面失败：{error}"));
         }
     };
     if let Err(error) = temporary_file.flush() {
         drop(temporary_file);
-        let _ = fs::remove_file(&temporary);
         return Err(format!("写入封面缓存失败：{error}"));
+    }
+    if let Err(error) = temporary_file.sync_all() {
+        drop(temporary_file);
+        return Err(format!("同步封面缓存失败：{error}"));
     }
     if copied > MAX_COVER_DOWNLOAD_BYTES {
         drop(temporary_file);
-        let _ = fs::remove_file(&temporary);
         return Err("Bangumi 封面超过 15 MiB 安全限制。".into());
     }
     if copied == 0 {
         drop(temporary_file);
-        let _ = fs::remove_file(&temporary);
         return Err("Bangumi 返回了空封面文件。".into());
     }
     if let Err(error) = temporary_file.seek(SeekFrom::Start(0)) {
         drop(temporary_file);
-        let _ = fs::remove_file(&temporary);
         return Err(format!("校验封面缓存失败：{error}"));
     }
     let mut signature = [0_u8; 12];
@@ -560,23 +556,17 @@ pub fn download_cover(cache_root: &Path, subject: &BangumiSubject) -> AppResult<
         Ok(length) => length,
         Err(error) => {
             drop(temporary_file);
-            let _ = fs::remove_file(&temporary);
             return Err(format!("校验封面缓存失败：{error}"));
         }
     };
     if !valid_image_signature(&content_type, &signature[..signature_length]) {
         drop(temporary_file);
-        let _ = fs::remove_file(&temporary);
         return Err("Bangumi 封面内容与图片格式不匹配。".into());
     }
     drop(temporary_file);
-    if destination.exists() {
-        cache::remove_cached_file(&destination, cache_root)?;
-    }
-    fs::rename(&temporary, &destination).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        format!("保存封面缓存失败：{error}")
-    })?;
+    pending_file
+        .commit_to(&destination)
+        .map_err(|error| format!("保存封面缓存失败：{error}"))?;
     Ok(Some(destination))
 }
 
@@ -807,7 +797,8 @@ mod tests {
             summary: None,
             subject_type: 2,
         };
-        let cover = download_cover(temp.path(), &subject)
+        let cache_operation = cache::begin_cover_cache_operation();
+        let cover = download_cover(&cache_operation, temp.path(), &subject)
             .expect("Bangumi live cover should download")
             .expect("test subject has an image");
         assert!(cover.is_file());

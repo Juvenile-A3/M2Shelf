@@ -2,10 +2,19 @@ import { useEffect, useMemo, useState } from "react";
 import type { MediaNode } from "../types/media";
 import { api, desktopAvailable } from "../lib/api";
 
-const coverRequests = new Map<string, Promise<string | null>>();
+interface ResolvedCoverEntry {
+  url: string | null;
+  characters: number;
+}
+
+const inFlightCoverRequests = new Map<string, Promise<string | null>>();
+const resolvedCoverUrls = new Map<string, ResolvedCoverEntry>();
 const coverQueue: Array<() => void> = [];
 const MAX_CONCURRENT_COVER_REQUESTS = 4;
+const MAX_RESOLVED_COVER_ENTRIES = 128;
+const MAX_RESOLVED_COVER_CHARACTERS = 32 * 1024 * 1024;
 let activeCoverRequests = 0;
+let resolvedCoverCharacters = 0;
 
 function scheduleCoverRequest(run: () => Promise<string | null>): Promise<string | null> {
   return new Promise((resolve, reject) => {
@@ -23,15 +32,50 @@ function scheduleCoverRequest(run: () => Promise<string | null>): Promise<string
   });
 }
 
+function removeResolvedCover(key: string) {
+  const existing = resolvedCoverUrls.get(key);
+  if (!existing) return;
+  resolvedCoverCharacters -= existing.characters;
+  resolvedCoverUrls.delete(key);
+}
+
+function rememberResolvedCover(key: string, url: string | null) {
+  removeResolvedCover(key);
+  const entry = { url, characters: url?.length ?? 0 };
+  resolvedCoverUrls.set(key, entry);
+  resolvedCoverCharacters += entry.characters;
+  while (resolvedCoverUrls.size > MAX_RESOLVED_COVER_ENTRIES
+    || resolvedCoverCharacters > MAX_RESOLVED_COVER_CHARACTERS) {
+    const oldestKey = resolvedCoverUrls.keys().next().value;
+    if (oldestKey == null) break;
+    removeResolvedCover(oldestKey);
+  }
+}
+
 function requestCover(nodeId: number, key: string): Promise<string | null> {
-  const cached = coverRequests.get(key);
-  if (cached) return cached;
-  if (coverRequests.size > 600) coverRequests.clear();
-  const request = scheduleCoverRequest(() => api.getCoverDataUrl(nodeId)).catch((error) => {
-    coverRequests.delete(key);
-    throw error;
-  });
-  coverRequests.set(key, request);
+  const resolved = resolvedCoverUrls.get(key);
+  if (resolved) {
+    // Refresh insertion order so active covers survive the bounded LRU eviction.
+    resolvedCoverUrls.delete(key);
+    resolvedCoverUrls.set(key, resolved);
+    return Promise.resolve(resolved.url);
+  }
+  const inFlight = inFlightCoverRequests.get(key);
+  if (inFlight) return inFlight;
+
+  // A metadata/cover revision supersedes the previous data URL for this Node immediately.
+  const nodePrefix = `${nodeId}:`;
+  [...resolvedCoverUrls.keys()]
+    .filter((existingKey) => existingKey !== key && existingKey.startsWith(nodePrefix))
+    .forEach(removeResolvedCover);
+
+  const request = scheduleCoverRequest(() => api.getCoverDataUrl(nodeId))
+    .then((url) => {
+      rememberResolvedCover(key, url);
+      return url;
+    })
+    .finally(() => inFlightCoverRequests.delete(key));
+  inFlightCoverRequests.set(key, request);
   return request;
 }
 

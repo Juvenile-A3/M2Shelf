@@ -3,6 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -22,6 +23,26 @@ const CACHE_MARKER_CONTENT: &[u8] = b"M2Shelf cover cache v1\n";
 const MAX_COVER_BYTES: u64 = 15 * 1024 * 1024;
 const MAX_COVER_DIMENSION: u32 = 16_384;
 const MAX_COVER_PIXELS: u64 = 40_000_000;
+
+/// Cache operations may run on Tauri worker threads and on the background matcher at the same
+/// time. Ordinary reads and atomic writes can coexist, while an explicit cache clear waits for all
+/// of them so it cannot remove an in-flight download or clear a freshly committed database path.
+static COVER_CACHE_CLEAR_BARRIER: RwLock<()> = RwLock::new(());
+
+pub(crate) type CoverCacheOperationGuard = RwLockReadGuard<'static, ()>;
+pub(crate) type CoverCacheClearGuard = RwLockWriteGuard<'static, ()>;
+
+pub(crate) fn begin_cover_cache_operation() -> CoverCacheOperationGuard {
+    COVER_CACHE_CLEAR_BARRIER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn begin_cover_cache_clear() -> CoverCacheClearGuard {
+    COVER_CACHE_CLEAR_BARRIER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Creates or upgrades the application-owned default cache. Custom locations must first pass
 /// `initialize_custom_cache` so an arbitrary non-empty user directory cannot be claimed.
@@ -224,7 +245,12 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
-pub fn copy_manual_cover(cache_root: &Path, node_id: i64, source: &Path) -> AppResult<PathBuf> {
+pub fn copy_manual_cover(
+    _cache_operation: &CoverCacheOperationGuard,
+    cache_root: &Path,
+    node_id: i64,
+    source: &Path,
+) -> AppResult<PathBuf> {
     if node_id <= 0 {
         return Err("目录节点无效。".into());
     }
@@ -271,15 +297,7 @@ pub fn copy_manual_cover(cache_root: &Path, node_id: i64, source: &Path) -> AppR
     ensure_existing_custom_cache(cache_root)?;
     let manual_directory = cache_root.join("manual");
     let destination = manual_directory.join(format!("node-{node_id}.{extension}"));
-    let temporary_path = manual_directory.join(format!(
-        ".node-{node_id}-{}.tmp",
-        Uuid::new_v4().as_simple()
-    ));
-    let mut pending_file = PendingCacheFile::new(temporary_path);
-    let mut temporary_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(pending_file.path())
+    let (mut pending_file, mut temporary_file) = create_pending_cache_file(&destination, false)
         .map_err(|error| format!("无法创建封面缓存临时文件：{error}"))?;
     temporary_file
         .write_all(&bytes)
@@ -292,9 +310,9 @@ pub fn copy_manual_cover(cache_root: &Path, node_id: i64, source: &Path) -> AppR
         .map_err(|error| format!("同步封面缓存临时文件失败：{error}"))?;
     drop(temporary_file);
 
-    replace_file_atomically(pending_file.path(), &destination)
+    pending_file
+        .commit_to(&destination)
         .map_err(|error| format!("提交封面缓存失败：{error}"))?;
-    pending_file.commit();
     Ok(destination)
 }
 
@@ -449,7 +467,7 @@ fn read_u24_le(bytes: &[u8]) -> u32 {
     u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
 }
 
-struct PendingCacheFile {
+pub(crate) struct PendingCacheFile {
     path: PathBuf,
     committed: bool,
 }
@@ -462,12 +480,14 @@ impl PendingCacheFile {
         }
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    fn commit(&mut self) {
+    pub(crate) fn commit_to(&mut self, destination: &Path) -> std::io::Result<()> {
+        replace_file_atomically(self.path(), destination)?;
         self.committed = true;
+        Ok(())
     }
 }
 
@@ -477,6 +497,35 @@ impl Drop for PendingCacheFile {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+/// Creates a collision-resistant temporary file beside its destination. Same-directory staging is
+/// required for an atomic rename/replace on Windows and avoids cross-volume fallbacks.
+pub(crate) fn create_pending_cache_file(
+    destination: &Path,
+    readable: bool,
+) -> std::io::Result<(PendingCacheFile, File)> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cache destination has no parent directory",
+        )
+    })?;
+    let stem = destination
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cache destination has no valid file stem",
+            )
+        })?;
+    let temporary_path = parent.join(format!(".{stem}-{}.tmp", Uuid::new_v4().as_simple()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).read(readable);
+    let file = options.open(&temporary_path)?;
+    Ok((PendingCacheFile::new(temporary_path), file))
 }
 
 #[cfg(target_os = "windows")]
@@ -524,7 +573,15 @@ pub fn bangumi_cover_path(cache_root: &Path, subject_id: i64, image_url: &str) -
         .join(format!("{subject_id}.{extension}"))
 }
 
-pub fn remove_cached_file(path: &Path, cache_root: &Path) -> AppResult<()> {
+pub fn remove_cached_file(
+    _cache_operation: &CoverCacheOperationGuard,
+    path: &Path,
+    cache_root: &Path,
+) -> AppResult<()> {
+    remove_cached_file_inner(path, cache_root)
+}
+
+fn remove_cached_file_inner(path: &Path, cache_root: &Path) -> AppResult<()> {
     if !is_owned_cache_file(path, cache_root) {
         return Err("拒绝删除不是由 M²Shelf 命名的缓存文件。".into());
     }
@@ -535,7 +592,7 @@ pub fn remove_cached_file(path: &Path, cache_root: &Path) -> AppResult<()> {
     }
 }
 
-pub fn clear_cover_cache(cache_root: &Path) -> AppResult<()> {
+pub fn clear_cover_cache(_cache_clear: &CoverCacheClearGuard, cache_root: &Path) -> AppResult<()> {
     ensure_existing_custom_cache(cache_root)?;
     for directory in [cache_root.join("bangumi"), cache_root.join("manual")] {
         for entry in
@@ -548,7 +605,7 @@ pub fn clear_cover_cache(cache_root: &Path) -> AppResult<()> {
                 .is_file()
                 && is_owned_cache_file(&entry.path(), cache_root)
             {
-                remove_cached_file(&entry.path(), cache_root)?;
+                remove_cached_file_inner(&entry.path(), cache_root)?;
             }
         }
     }
@@ -582,7 +639,10 @@ pub fn stats(cache_root: &Path) -> AppResult<CacheStats> {
     })
 }
 
-pub fn cover_data_url(path: &Path) -> AppResult<String> {
+pub fn cover_data_url(
+    _cache_operation: &CoverCacheOperationGuard,
+    path: &Path,
+) -> AppResult<String> {
     if !path.is_absolute() || !path.is_file() {
         return Err("封面缓存文件不存在。".into());
     }
@@ -642,6 +702,9 @@ fn is_same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn is_bangumi_file_name(name: &str) -> bool {
+    if is_unique_temporary_name(name, false) {
+        return true;
+    }
     let path = Path::new(name);
     let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
     let extension = path
@@ -657,6 +720,9 @@ fn is_bangumi_file_name(name: &str) -> bool {
 }
 
 fn is_manual_file_name(name: &str) -> bool {
+    if is_unique_temporary_name(name, true) {
+        return true;
+    }
     let path = Path::new(name);
     let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
     let extension = path
@@ -668,6 +734,24 @@ fn is_manual_file_name(name: &str) -> bool {
         && matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
 }
 
+fn is_unique_temporary_name(name: &str, manual: bool) -> bool {
+    let Some(body) = name
+        .strip_prefix('.')
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((stem, uuid)) = body.rsplit_once('-') else {
+        return false;
+    };
+    let valid_stem = if manual {
+        stem.strip_prefix("node-").is_some_and(positive_decimal)
+    } else {
+        positive_decimal(stem)
+    };
+    valid_stem && uuid.len() == 32 && uuid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn positive_decimal(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
@@ -677,6 +761,7 @@ fn positive_decimal(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::mpsc, time::Duration};
     use tempfile::TempDir;
 
     fn png_fixture(width: u32, height: u32) -> Vec<u8> {
@@ -710,7 +795,8 @@ mod tests {
         let source = temp.path().join("source.jpg");
         ensure_directories(&cache).unwrap();
         fs::write(&source, b"source").unwrap();
-        assert!(remove_cached_file(&source, &cache).is_err());
+        let cache_operation = begin_cover_cache_operation();
+        assert!(remove_cached_file(&cache_operation, &source, &cache).is_err());
         assert!(source.exists());
     }
 
@@ -720,22 +806,94 @@ mod tests {
         let cache = temp.path().join("cache");
         ensure_directories(&cache).unwrap();
         let owned_bangumi = cache.join("bangumi/123.jpg");
+        let owned_legacy_download = cache.join("bangumi/123.download");
+        let owned_bangumi_temporary =
+            cache.join("bangumi/.123-0123456789abcdef0123456789abcdef.tmp");
         let owned_manual = cache.join("manual/node-7.png");
+        let owned_manual_temporary =
+            cache.join("manual/.node-7-abcdef0123456789abcdef0123456789.tmp");
         let foreign_bangumi = cache.join("bangumi/family.jpg");
+        let foreign_temporary = cache.join("bangumi/.123-not-a-uuid.tmp");
         let foreign_manual = cache.join("manual/notes.txt");
         fs::write(&owned_bangumi, b"owned").unwrap();
+        fs::write(&owned_legacy_download, b"owned").unwrap();
+        fs::write(&owned_bangumi_temporary, b"owned").unwrap();
         fs::write(&owned_manual, b"owned").unwrap();
+        fs::write(&owned_manual_temporary, b"owned").unwrap();
         fs::write(&foreign_bangumi, b"foreign").unwrap();
+        fs::write(&foreign_temporary, b"foreign").unwrap();
         fs::write(&foreign_manual, b"foreign").unwrap();
-        assert_eq!(stats(&cache).unwrap().file_count, 2);
+        assert_eq!(stats(&cache).unwrap().file_count, 5);
 
-        clear_cover_cache(&cache).unwrap();
+        let cache_clear = begin_cover_cache_clear();
+        clear_cover_cache(&cache_clear, &cache).unwrap();
 
         assert!(!owned_bangumi.exists());
+        assert!(!owned_legacy_download.exists());
+        assert!(!owned_bangumi_temporary.exists());
         assert!(!owned_manual.exists());
+        assert!(!owned_manual_temporary.exists());
         assert!(foreign_bangumi.exists());
+        assert!(foreign_temporary.exists());
         assert!(foreign_manual.exists());
         assert_eq!(stats(&cache).unwrap().file_count, 0);
+    }
+
+    #[test]
+    fn pending_cache_files_are_unique_same_directory_and_preserve_destination_on_failure() {
+        let temp = TempDir::new().unwrap();
+        let cache = temp.path().join("cache");
+        ensure_directories(&cache).unwrap();
+        let destination = cache.join("bangumi/123.jpg");
+        fs::write(&destination, b"old-cover").unwrap();
+        let cache_operation = begin_cover_cache_operation();
+
+        let (mut first, mut first_file) = create_pending_cache_file(&destination, false).unwrap();
+        let (second, second_file) = create_pending_cache_file(&destination, false).unwrap();
+        assert_eq!(first.path().parent(), destination.parent());
+        assert_eq!(second.path().parent(), destination.parent());
+        assert_ne!(first.path(), second.path());
+        first_file.write_all(b"new-cover").unwrap();
+        first_file.flush().unwrap();
+        first_file.sync_all().unwrap();
+        drop(first_file);
+        first.commit_to(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new-cover");
+        drop(second_file);
+        drop(second);
+
+        let (mut failed, mut failed_file) = create_pending_cache_file(&destination, false).unwrap();
+        failed_file.write_all(b"must-not-replace").unwrap();
+        failed_file.flush().unwrap();
+        drop(failed_file);
+        fs::remove_file(failed.path()).unwrap();
+        assert!(failed.commit_to(&destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"new-cover");
+        drop(cache_operation);
+    }
+
+    #[test]
+    fn cache_clear_waits_for_an_in_flight_read_or_write_operation() {
+        let cache_operation = begin_cover_cache_operation();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (acquired_sender, acquired_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let _cache_clear = begin_cover_cache_clear();
+            acquired_sender.send(()).unwrap();
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(acquired_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        drop(cache_operation);
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
@@ -762,7 +920,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cover = temp.path().join("cover.bin");
         fs::write(&cover, b"\x89PNG\r\n\x1a\nrest").unwrap();
-        let data_url = cover_data_url(&cover).unwrap();
+        let cache_operation = begin_cover_cache_operation();
+        let data_url = cover_data_url(&cache_operation, &cover).unwrap();
         assert!(data_url.starts_with("data:image/png;base64,"));
     }
 
@@ -777,7 +936,8 @@ mod tests {
             .set_len(MAX_COVER_BYTES + 1)
             .unwrap();
 
-        let error = copy_manual_cover(&cache, 1, &source).unwrap_err();
+        let cache_operation = begin_cover_cache_operation();
+        let error = copy_manual_cover(&cache_operation, &cache, 1, &source).unwrap_err();
 
         assert!(error.contains("15 MiB"));
         assert!(!cache.join("manual/node-1.png").exists());
@@ -791,7 +951,8 @@ mod tests {
         ensure_directories(&cache).unwrap();
         fs::write(&source, png_fixture(600, 900)).unwrap();
 
-        let error = copy_manual_cover(&cache, 2, &source).unwrap_err();
+        let cache_operation = begin_cover_cache_operation();
+        let error = copy_manual_cover(&cache_operation, &cache, 2, &source).unwrap_err();
 
         assert!(error.contains("扩展名"));
         assert!(!cache.join("manual/node-2.jpg").exists());
@@ -805,7 +966,8 @@ mod tests {
         ensure_directories(&cache).unwrap();
         fs::write(&source, png_fixture(20_000, 20_000)).unwrap();
 
-        let error = copy_manual_cover(&cache, 3, &source).unwrap_err();
+        let cache_operation = begin_cover_cache_operation();
+        let error = copy_manual_cover(&cache_operation, &cache, 3, &source).unwrap_err();
 
         assert!(error.contains("尺寸过大"));
         assert!(!cache.join("manual/node-3.png").exists());
@@ -818,10 +980,11 @@ mod tests {
         let source = temp.path().join("cover.png");
         ensure_directories(&cache).unwrap();
         fs::write(&source, png_fixture(600, 900)).unwrap();
-        let destination = copy_manual_cover(&cache, 4, &source).unwrap();
+        let cache_operation = begin_cover_cache_operation();
+        let destination = copy_manual_cover(&cache_operation, &cache, 4, &source).unwrap();
         fs::write(&source, png_fixture(800, 1_200)).unwrap();
 
-        let replaced = copy_manual_cover(&cache, 4, &source).unwrap();
+        let replaced = copy_manual_cover(&cache_operation, &cache, 4, &source).unwrap();
 
         assert_eq!(replaced, destination);
         assert_eq!(fs::read(destination).unwrap(), png_fixture(800, 1_200));
@@ -836,7 +999,8 @@ mod tests {
         fs::write(&source, png_fixture(600, 900)).unwrap();
         fs::create_dir(cache.join("manual/node-5.png")).unwrap();
 
-        assert!(copy_manual_cover(&cache, 5, &source).is_err());
+        let cache_operation = begin_cover_cache_operation();
+        assert!(copy_manual_cover(&cache_operation, &cache, 5, &source).is_err());
         let has_temporary_file = fs::read_dir(cache.join("manual"))
             .unwrap()
             .flatten()

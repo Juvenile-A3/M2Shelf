@@ -38,9 +38,9 @@ Bangumi search and cover downloads require an internet connection. Browsing the 
 
 ## Download
 
-Current version: **M²Shelf 0.5.6** (Windows x64)
+Current version: **M²Shelf 0.5.7** (Windows x64)
 
-- [Download the Portable build](https://github.com/Undermori/M2Shelf/releases/download/v0.5.6/M2Shelf-Portable-0.5.6-x64.zip)
+- [Download the Portable build](https://github.com/Undermori/M2Shelf/releases/download/v0.5.7/M2Shelf-Portable-0.5.7-x64.zip)
 - [View the latest release](https://github.com/Undermori/M2Shelf/releases/latest)
 - [View all releases](https://github.com/Undermori/M2Shelf/releases)
 

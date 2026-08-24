@@ -305,18 +305,15 @@ fn run_scan_inner(
     for target in targets {
         check_cancel(control)?;
         let configured_root = Path::new(&target.root.path);
-        let canonical_root = fs::canonicalize(configured_root).map_err(|error| {
+        // Revalidate the registered root immediately before each scan. Besides resolving links
+        // and junctions, this blocks legacy overlapping-root rows from moving a Node between root
+        // owners and cascading application metadata when either root is later removed.
+        let canonical_root = database.validate_scan_root(&target.root).map_err(|error| {
             ScanAbort::Failed(format!(
-                "无法确认资源库根目录 {} 的实际位置：{error}",
+                "资源库根目录校验失败 {}：{error}",
                 configured_root.display()
             ))
         })?;
-        if !canonical_root.is_dir() {
-            return Err(ScanAbort::Failed(format!(
-                "资源库根目录不是可扫描的目录：{}",
-                configured_root.display()
-            )));
-        }
         let canonical_target = canonicalize_within_library_root(&target.path, &canonical_root)
             .map_err(|message| ScanAbort::Failed(format!("拒绝扫描目标：{message}")))?;
         if !canonical_target.is_dir() {

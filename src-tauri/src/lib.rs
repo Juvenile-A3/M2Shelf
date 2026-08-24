@@ -77,6 +77,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_bootstrap,
+            commands::show_main_window,
             commands::list_library_roots,
             commands::add_library_root,
             commands::remove_library_root,

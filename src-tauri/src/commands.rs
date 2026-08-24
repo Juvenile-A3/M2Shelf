@@ -114,6 +114,7 @@ fn prepare_cover_cache_directory(state: &AppState, path: &str) -> AppResult<Path
 }
 
 fn remove_cached_file_if_unreferenced(
+    cache_operation: &cache::CoverCacheOperationGuard,
     database: &crate::db::Database,
     path: &Path,
     cache_root: &Path,
@@ -121,7 +122,7 @@ fn remove_cached_file_if_unreferenced(
     if cache::is_equal_or_within(path, cache_root)
         && database.cover_path_reference_count(path).ok() == Some(0)
     {
-        let _ = cache::remove_cached_file(path, cache_root);
+        let _ = cache::remove_cached_file(cache_operation, path, cache_root);
     }
 }
 
@@ -136,6 +137,22 @@ pub fn get_app_bootstrap() -> AppBootstrap {
         website_url: BILIBILI_URL,
         x_url: X_URL,
     }
+}
+
+/// The main window is created hidden so restoring its persisted size and preparing the themed
+/// React shell never expose the configured fallback frame. The frontend calls this once after its
+/// startup settings have been applied.
+#[tauri::command]
+pub fn show_main_window(app: AppHandle) -> AppResult<()> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口。".to_owned())?;
+    window
+        .show()
+        .map_err(|error| format!("无法显示主窗口：{error}"))?;
+    // Match normal desktop startup behavior without making focus a prerequisite for visibility.
+    let _ = window.set_focus();
+    Ok(())
 }
 
 fn display_architecture() -> &'static str {
@@ -158,11 +175,14 @@ pub fn add_library_root(
     display_name: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<LibraryRoot> {
+    // Reject duplicate, ancestor and descendant roots before any other setup. `add_root` repeats
+    // the same check transactionally so concurrent or non-command callers cannot bypass it.
+    let canonical = state.database.validate_new_root_path(Path::new(&path))?;
     let active_cache = active_cover_cache_directory(&state)?;
-    if cache::paths_overlap(Path::new(&path), &active_cache) {
+    if cache::paths_overlap(&canonical, &active_cache) {
         return Err("媒体资源库不能等于、包含封面缓存目录，或位于封面缓存目录内。".into());
     }
-    state.database.add_root(Path::new(&path), display_name)
+    state.database.add_root(&canonical, display_name)
 }
 
 #[tauri::command]
@@ -615,7 +635,8 @@ pub async fn bind_bangumi(
     let active_cache = active_cover_cache_directory(&state);
     let previous_path = database.save_confirmed_binding(node_id, &subject)?;
     if let (Some(path), Ok(cache_root)) = (previous_path.as_deref(), active_cache.as_ref()) {
-        remove_cached_file_if_unreferenced(&database, path, cache_root);
+        let cache_operation = cache::begin_cover_cache_operation();
+        remove_cached_file_if_unreferenced(&cache_operation, &database, path, cache_root);
     }
     let cache_root = match active_cache {
         Ok(cache_root) => cache_root,
@@ -710,8 +731,9 @@ fn refresh_bound_cover(
     node_id: i64,
     subject: &BangumiSubject,
 ) -> AppResult<MetadataBinding> {
+    let cache_operation = cache::begin_cover_cache_operation();
     let previous_node = database.get_node(node_id)?;
-    match bangumi::download_cover(cache_root, subject) {
+    match bangumi::download_cover(&cache_operation, cache_root, subject) {
         Ok(Some(path)) => {
             if database.set_bangumi_cover_for_subject_unless_manual(
                 node_id,
@@ -722,11 +744,16 @@ fn refresh_bound_cover(
                 if let Some(old_path) = previous_node.cover_cache_path.as_deref() {
                     let old_path = Path::new(old_path);
                     if old_path != path {
-                        remove_cached_file_if_unreferenced(database, old_path, cache_root);
+                        remove_cached_file_if_unreferenced(
+                            &cache_operation,
+                            database,
+                            old_path,
+                            cache_root,
+                        );
                     }
                 }
             } else {
-                remove_cached_file_if_unreferenced(database, &path, cache_root);
+                remove_cached_file_if_unreferenced(&cache_operation, database, &path, cache_root);
             }
         }
         Ok(None) => {
@@ -751,10 +778,16 @@ fn refresh_bound_cover(
 
 #[tauri::command]
 pub fn clear_bangumi_binding(node_id: i64, state: State<'_, AppState>) -> AppResult<MediaNode> {
+    let cache_operation = cache::begin_cover_cache_operation();
     let active_cache = active_cover_cache_directory(&state).ok();
     if let Some(path) = state.database.clear_binding(node_id)? {
         if let Some(cache_root) = active_cache.as_deref() {
-            remove_cached_file_if_unreferenced(&state.database, &path, cache_root);
+            remove_cached_file_if_unreferenced(
+                &cache_operation,
+                &state.database,
+                &path,
+                cache_root,
+            );
         }
     }
     state.database.get_node(node_id)
@@ -766,19 +799,30 @@ pub fn set_container_cover(
     source_path: String,
     state: State<'_, AppState>,
 ) -> AppResult<MediaNode> {
+    let cache_operation = cache::begin_cover_cache_operation();
     let node = state.database.get_node(node_id)?;
     if !matches!(node.node_type, NodeType::Container | NodeType::Mixed) {
         return Err("本地图片封面只用于系列或其他资源。".into());
     }
     let cache_root = active_cover_cache_directory(&state)?;
-    let destination = cache::copy_manual_cover(&cache_root, node_id, Path::new(&source_path))?;
+    let destination = cache::copy_manual_cover(
+        &cache_operation,
+        &cache_root,
+        node_id,
+        Path::new(&source_path),
+    )?;
     state
         .database
         .set_node_cover(node_id, CoverSource::Manual, Some(&destination))?;
     if let Some(old_path) = node.cover_cache_path.as_deref() {
         let old_path = Path::new(old_path);
         if old_path != destination {
-            remove_cached_file_if_unreferenced(&state.database, old_path, &cache_root);
+            remove_cached_file_if_unreferenced(
+                &cache_operation,
+                &state.database,
+                old_path,
+                &cache_root,
+            );
         }
     }
     state.database.get_node(node_id)
@@ -786,6 +830,7 @@ pub fn set_container_cover(
 
 #[tauri::command]
 pub fn clear_node_cover(node_id: i64, state: State<'_, AppState>) -> AppResult<MediaNode> {
+    let cache_operation = cache::begin_cover_cache_operation();
     let node = state.database.get_node(node_id)?;
     if node.cover_source == CoverSource::Bangumi && state.database.get_binding(node_id)?.is_some() {
         return Err("请使用“清除 Bangumi 绑定”；不能只移除仍被绑定使用的封面。".into());
@@ -796,13 +841,14 @@ pub fn clear_node_cover(node_id: i64, state: State<'_, AppState>) -> AppResult<M
         .database
         .set_node_cover(node_id, CoverSource::Placeholder, None)?;
     if let (Some(path), Some(cache_root)) = (previous_path.as_deref(), active_cache.as_deref()) {
-        remove_cached_file_if_unreferenced(&state.database, path, cache_root);
+        remove_cached_file_if_unreferenced(&cache_operation, &state.database, path, cache_root);
     }
     state.database.get_node(node_id)
 }
 
 #[tauri::command]
 pub fn get_cover_data_url(node_id: i64, state: State<'_, AppState>) -> AppResult<Option<String>> {
+    let cache_operation = cache::begin_cover_cache_operation();
     let (cover_path, library_roots) = state.database.cover_read_context(node_id)?;
     let Some(path) = cover_path else {
         return Ok(None);
@@ -812,7 +858,7 @@ pub fn get_cover_data_url(node_id: i64, state: State<'_, AppState>) -> AppResult
             return Err("拒绝从媒体资源库读取封面数据。".into());
         }
     }
-    cache::cover_data_url(&path).map(Some)
+    cache::cover_data_url(&cache_operation, &path).map(Some)
 }
 
 #[tauri::command]
@@ -959,11 +1005,14 @@ fn allowed_external_url(url: &str) -> Option<&'static str> {
 
 #[tauri::command]
 pub fn get_cache_stats(state: State<'_, AppState>) -> AppResult<CacheStats> {
+    let _cache_operation = cache::begin_cover_cache_operation();
     cache::stats(&active_cover_cache_directory(&state)?)
 }
 
 #[tauri::command]
 pub fn clear_cover_cache(state: State<'_, AppState>) -> AppResult<CacheStats> {
+    ensure_no_active_scan(&state)?;
+    let cache_clear = cache::begin_cover_cache_clear();
     let cache_root = active_cover_cache_directory(&state)?;
     let affected = state
         .database
@@ -971,7 +1020,7 @@ pub fn clear_cover_cache(state: State<'_, AppState>) -> AppResult<CacheStats> {
         .into_iter()
         .filter(|(_, _, path)| cache::is_equal_or_within(path, &cache_root))
         .collect::<Vec<_>>();
-    cache::clear_cover_cache(&cache_root)?;
+    cache::clear_cover_cache(&cache_clear, &cache_root)?;
     state.database.clear_cover_paths_for_nodes(&affected)?;
     cache::stats(&cache_root)
 }
@@ -1000,6 +1049,11 @@ fn start_scan_internal(
     };
     if roots.is_empty() {
         return Err("请先添加至少一个资源库。".into());
+    }
+    // Fail synchronously for stale, forged, or legacy-overlapping roots. The scanner repeats this
+    // immediately before filesystem traversal to close the command-to-worker timing gap.
+    for root in &roots {
+        state.database.validate_scan_root(root)?;
     }
     let mut targets = Vec::new();
     for root in roots {

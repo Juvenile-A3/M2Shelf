@@ -38,9 +38,9 @@ Bangumi 搜索和封面下载需要联网；本地索引浏览与打开本地文
 
 ## 下载
 
-当前版本：**M²Shelf 0.5.6**（Windows x64）
+当前版本：**M²Shelf 0.5.7**（Windows x64）
 
-- [下载 Portable 免安装版](https://github.com/Undermori/M2Shelf/releases/download/v0.5.6/M2Shelf-Portable-0.5.6-x64.zip)
+- [下载 Portable 免安装版](https://github.com/Undermori/M2Shelf/releases/download/v0.5.7/M2Shelf-Portable-0.5.7-x64.zip)
 - [查看最新 Release](https://github.com/Undermori/M2Shelf/releases/latest)
 - [查看全部版本](https://github.com/Undermori/M2Shelf/releases)
 

@@ -560,6 +560,36 @@ def check_source_safety() -> None:
         ):
             fail("custom cache cleanup lacks an application marker guard")
 
+    bangumi_source = production.get("bangumi.rs", "")
+    commands_source = production.get("commands.rs", "")
+    auto_match_source = production.get("auto_match.rs", "")
+    download_start = bangumi_source.find("pub fn download_cover")
+    download_end = bangumi_source.find("fn download_response_with_retry", download_start)
+    download_region = bangumi_source[download_start:download_end]
+    clear_start = commands_source.find("pub fn clear_cover_cache")
+    clear_end = commands_source.find("fn start_scan_internal", clear_start)
+    clear_region = commands_source[clear_start:clear_end]
+    cache_coordination_ok = all(
+        (
+            "static COVER_CACHE_CLEAR_BARRIER: RwLock<()>" in cache_source,
+            "pub(crate) fn begin_cover_cache_operation" in cache_source,
+            "pub(crate) fn begin_cover_cache_clear" in cache_source,
+            "_cache_clear: &CoverCacheClearGuard" in cache_source,
+            "_cache_operation: &CoverCacheOperationGuard" in cache_source,
+            "ensure_no_active_scan(&state)?" in clear_region,
+            "cache::begin_cover_cache_clear()" in clear_region,
+            "cache::begin_cover_cache_operation()" in auto_match_source,
+            "cache::create_pending_cache_file(&destination, true)" in download_region,
+            "pending_file" in download_region and ".commit_to(&destination)" in download_region,
+            'with_extension("download")' not in download_region,
+            "destination.exists()" not in download_region,
+        )
+    )
+    if not cache_coordination_ok:
+        fail("cover cache clear/download/read coordination or atomic replacement contract is missing")
+    else:
+        passed("cover cache clear barrier and same-directory atomic cover replacement")
+
     public_mutation_names = re.findall(
         r"#\[tauri::command(?:\([^\]]*\))?\]\s*pub\s+(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)",
         production.get("commands.rs", ""),
@@ -589,13 +619,33 @@ def check_source_safety() -> None:
         fail("mpv executable is not validated before play")
 
     scanner = production.get("scanner.rs", "")
+    scanner_with_tests = read("src-tauri/src/scanner.rs")
     mutating_tokens = ["remove_file", "remove_dir", "rename(", "fs::write", "fs::copy"]
     scanner_hits = [token for token in mutating_tokens if token in scanner]
     if scanner_hits:
         fail(f"scanner production code mutates filesystem: {scanner_hits}")
 
-    if not any(message.startswith(("filesystem mutation", "dangerous", "scanner production", "shell-mediated", "cache deletion", "mpv")) for message in ERRORS):
-        passed("source-media read-only and literal mpv launch safety")
+    database = production.get("db.rs", "")
+    database_with_tests = read("src-tauri/src/db.rs")
+    commands = production.get("commands.rs", "")
+    root_overlap_guard = all(
+        (
+            "canonical_library_root(path)?" in database,
+            "ensure_root_does_not_overlap_conn(&transaction, &canonical, None)?" in database,
+            "pub fn validate_new_root_path" in database,
+            "pub fn validate_scan_root" in database,
+            "validate_new_root_path(Path::new(&path))?" in commands,
+            "state.database.validate_scan_root(root)?" in commands,
+            "database.validate_scan_root(&target.root)" in scanner_with_tests,
+            "library_roots_reject_equal_ancestor_and_descendant_paths" in database_with_tests,
+            "scan_guard_rejects_legacy_overlapping_root_rows" in database_with_tests,
+        )
+    )
+    if not root_overlap_guard:
+        fail("Library Root overlap protection is missing from command, transaction, or scan boundary")
+
+    if not any(message.startswith(("filesystem mutation", "dangerous", "scanner production", "shell-mediated", "cache deletion", "mpv", "Library Root")) for message in ERRORS):
+        passed("source-media read-only, non-overlapping roots, and literal mpv launch safety")
 
 
 def check_extensions_and_product_spec() -> None:
@@ -797,7 +847,12 @@ def check_phase2_contract() -> None:
     else:
         passed("phase-2 resource, cover, title, root, and all-resources contract")
 
-    if "OpenOptions::new()" not in read("src-tauri/src/bangumi.rs") or ".read(true)" not in read("src-tauri/src/bangumi.rs"):
+    bangumi_source = read("src-tauri/src/bangumi.rs")
+    cache_source = read("src-tauri/src/cache.rs")
+    if (
+        "cache::create_pending_cache_file(&destination, true)" not in bangumi_source
+        or "options.write(true).create_new(true).read(readable)" not in cache_source
+    ):
         fail("Bangumi temporary cover file must be opened read+write for signature validation")
     else:
         passed("Bangumi cover temporary file supports post-download signature read")
@@ -1421,18 +1476,65 @@ def check_ui_windows_interaction_contract() -> None:
             "SELECT cover_cache_path FROM nodes" in rust_database,
             "SELECT path FROM library_roots" in rust_database,
             "MAX_CONCURRENT_COVER_REQUESTS = 4" in cover_hook,
+            "MAX_RESOLVED_COVER_ENTRIES = 128" in cover_hook,
+            "MAX_RESOLVED_COVER_CHARACTERS = 32 * 1024 * 1024" in cover_hook,
+            "inFlightCoverRequests" in cover_hook,
+            "resolvedCoverUrls" in cover_hook,
+            "rememberResolvedCover" in cover_hook,
+            "coverRequests.size > 600" not in cover_hook,
             "scheduleCoverRequest" in cover_hook,
             "IntersectionObserver" in media_card,
             'rootMargin: "700px 0px"' in media_card,
             'decoding="async"' in media_card,
-            'loading="lazy"' in media_card,
+            'loading="lazy"' not in media_card,
             "!enabled || state.key !== cacheKey || state.loading" in cover_hook,
         )
     )
     if not startup_cover_loading_ok:
         fail("startup cover loading can regress to eager full-Node/root-stat IPC or deferred-cover failure state")
     else:
-        passed("lazy bounded cover IPC and lightweight cover safety context")
+        passed("single-gate lazy cover IPC with bounded resolved-data LRU and lightweight safety context")
+
+    scan_listener_region = app[
+        app.find("const handleScanProgress") : app.find("const selectRoot")
+    ]
+    scan_listener_lifecycle_ok = all(
+        (
+            "scanProgressHandlerRef" in scan_listener_region,
+            "scanFinishedHandlerRef" in scan_listener_region,
+            "let disposed = false" in scan_listener_region,
+            "if (disposed) unlisten()" in scan_listener_region,
+            "unlisteners.splice(0)" in scan_listener_region,
+            "if (finishedIds.has(progress.scanId)) return" in scan_listener_region,
+            "api.scanStatus()" in scan_listener_region,
+            'current.status === "RUNNING" || current.status === "CANCELLING"' in scan_listener_region,
+            app.count("onScanProgress(") == 1,
+            app.count("onScanFinished(") == 1,
+        )
+    )
+    if not scan_listener_lifecycle_ok:
+        fail("scan event subscriptions can leak, duplicate completion effects, or miss a terminal registration-window event")
+    else:
+        passed("single-lifetime scan listeners close async cleanup gaps and reconcile terminal registration races")
+
+    list_all_resources_region = rust_database[
+        rust_database.find("pub fn list_all_resources") : rust_database.find("pub fn record_node_watched")
+    ]
+    bulk_metadata_hydration_ok = all(
+        (
+            "hydrate_nodes_metadata_conn(&connection, &mut nodes)" in list_all_resources_region,
+            "get_binding_conn" not in list_all_resources_region,
+            "list_node_tags_conn" not in list_all_resources_region,
+            "const NODE_METADATA_CHUNK_SIZE: usize = 500" in rust_database,
+            "fn hydrate_nodes_metadata_conn" in rust_database,
+            "node_ids.chunks(NODE_METADATA_CHUNK_SIZE)" in rust_database,
+            "bulk_card_metadata_hydration_preserves_bindings_and_natural_tag_order_across_chunks" in rust_database,
+        )
+    )
+    if not bulk_metadata_hydration_ok:
+        fail("All Resources metadata hydration can regress to per-Node binding/tag SQL queries")
+    else:
+        passed("All Resources and Browse hydrate bindings/tags in bounded SQL batches")
 
     search_cover_ok = all(
         (
@@ -1688,6 +1790,28 @@ def check_ui_windows_interaction_contract() -> None:
     else:
         passed("native main-window size memory uses one exit write with DPI/work-area safety")
 
+    first_frame_window_restore_ok = all(
+        (
+            main_window.get("visible") is False,
+            "pub fn show_main_window" in rust_commands,
+            "commands::show_main_window" in rust_lib,
+            'showMainWindow: () => call<void>("show_main_window")' in frontend_api,
+            "startupPresentationReady" in app,
+            "setStartupPresentationReady(true)" in app,
+            "api.showMainWindow()" in app,
+            'useLayoutEffect(() => {\n    const media = window.matchMedia' in app,
+            app.find('useLayoutEffect(() => {\n    const media = window.matchMedia')
+            < app.find("api.showMainWindow()"),
+            "resolve_startup_size" in window_state,
+            rust_lib.find("window_state::restore_window_size")
+            < rust_lib.find("app.manage(AppState"),
+        )
+    )
+    if not first_frame_window_restore_ok:
+        fail("main window can become visible before restored size and themed React shell are ready")
+    else:
+        passed("main window stays hidden until safe size restore and themed first React frame")
+
     other_resource_action_ok = all(
         (
             '| "other"' in context_menu,
@@ -1841,12 +1965,34 @@ def check_ui_windows_interaction_contract() -> None:
             re.search(r"naturalWidth\s*/\s*naturalHeight", poster_helper) is not None,
             re.search(r"shouldContainPosterArtwork\s*\(\s*event\.currentTarget\.naturalWidth", media_card) is not None,
             re.search(r"shouldContainPosterArtwork\s*\(\s*event\.currentTarget\.naturalWidth", work_detail) is not None,
+            re.search(
+                r"\.poster-grid-grid\s*\{\s*grid-template-columns:\s*repeat\(auto-fill,\s*\d+px\)",
+                css,
+            )
+            is not None,
+            re.search(
+                r"\.poster-grid-grid\s*\{[^}]*grid-template-columns:[^}]*\b1fr\b",
+                css,
+            )
+            is None,
+            "--poster-aspect-ratio: 2 / 2.82" in css,
+            re.search(
+                r"\.cover-frame\s*\{[^}]*aspect-ratio:\s*var\(--poster-aspect-ratio\)",
+                css,
+            )
+            is not None,
+            re.search(
+                r"\.detail-cover\s*\{[^}]*aspect-ratio:\s*var\(--poster-aspect-ratio\)",
+                css,
+            )
+            is not None,
+            'loading="lazy"' not in media_card,
         )
     )
     if not poster_image_quality_ok:
-        fail("poster images must fill an exact block layer with normal interpolation and no transformed hover surface")
+        fail("poster images must share one frame ratio, use integer grid tracks, one lazy-load gate, normal interpolation, and no transformed hover surface")
     else:
-        passed("poster image interpolation and non-transformed hover rendering contract")
+        passed("shared-ratio poster sampling, interpolation, and non-transformed rendering contract")
 
     if "all.waterfall" in all_page:
         fail("All Resources page still renders the unified-waterfall eyebrow")

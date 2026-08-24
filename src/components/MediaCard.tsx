@@ -62,7 +62,7 @@ function MediaCardComponent({ node, viewMode, onOpen, onMenu, onBangumi, onRetry
     >
       <button aria-pressed={editMode ? selected : undefined} className="media-card-open" onClick={() => editMode ? onSelect?.(node) : onOpen(node)} type="button">
         <span className={`cover-frame ${cover ? "has-cover" : ""} ${container ? "is-container" : ""}`}>
-          {cover && !coverFailed ? <img alt={t("card.coverAlt", { title })} decoding="async" loading="lazy" onError={() => setImageFailed(true)} onLoad={(event) => event.currentTarget.classList.toggle("is-wide-artwork", shouldContainPosterArtwork(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight))} src={cover} /> : (
+          {cover && !coverFailed ? <img alt={t("card.coverAlt", { title })} decoding="async" onError={() => setImageFailed(true)} onLoad={(event) => event.currentTarget.classList.toggle("is-wide-artwork", shouldContainPosterArtwork(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight))} src={cover} /> : (
             <span className="cover-placeholder">
               <span className="cover-art"><Icon name={container ? "folder-open" : "work"} /></span>
               <small>{coverError ? t("card.coverFailed") : container ? t("card.resourceContainer") : t("card.noCover")}</small>

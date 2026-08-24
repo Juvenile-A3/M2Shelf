@@ -89,6 +89,16 @@ pub fn clamp_to_work_area(size: WindowSize, work_area: Option<(u32, u32)>) -> Wi
     }
 }
 
+/// Resolve a persisted logical size before the hidden native window is shown. Keeping validation
+/// and work-area clamping in this pure step makes the first visible frame obey the same safety
+/// contract as later window events.
+pub fn resolve_startup_size(
+    saved: WindowSize,
+    work_area: Option<(u32, u32)>,
+) -> Option<WindowSize> {
+    validate_persisted_size(saved).map(|size| clamp_to_work_area(size, work_area))
+}
+
 fn monitor_work_area_logical(window: &WebviewWindow) -> Option<(u32, u32)> {
     let monitor = window
         .current_monitor()
@@ -107,8 +117,7 @@ fn monitor_work_area_logical(window: &WebviewWindow) -> Option<(u32, u32)> {
 }
 
 pub fn restore_window_size(window: &WebviewWindow, saved: WindowSize) -> Option<WindowSize> {
-    let saved = validate_persisted_size(saved)?;
-    let restored = clamp_to_work_area(saved, monitor_work_area_logical(window));
+    let restored = resolve_startup_size(saved, monitor_work_area_logical(window))?;
     window
         .set_size(LogicalSize::new(
             f64::from(restored.width),
@@ -221,6 +230,33 @@ mod tests {
                 width: MIN_WINDOW_WIDTH,
                 height: MIN_WINDOW_HEIGHT,
             }
+        );
+    }
+
+    #[test]
+    fn resolves_only_safe_startup_sizes_before_first_show() {
+        assert_eq!(
+            resolve_startup_size(
+                WindowSize {
+                    width: 2_560,
+                    height: 1_440,
+                },
+                Some((1_920, 1_040)),
+            ),
+            Some(WindowSize {
+                width: 1_920,
+                height: 1_040,
+            })
+        );
+        assert_eq!(
+            resolve_startup_size(
+                WindowSize {
+                    width: 640,
+                    height: 480,
+                },
+                Some((1_920, 1_040)),
+            ),
+            None
         );
     }
 

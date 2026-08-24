@@ -114,6 +114,7 @@ export const desktopAvailable = isTauri();
 
 export const api = {
   bootstrap: () => call<AppBootstrap>("get_app_bootstrap"),
+  showMainWindow: () => call<void>("show_main_window"),
   listRoots: () => call<LibraryRoot[]>("list_library_roots"),
   addRoot: (path: string) => call<LibraryRoot>("add_library_root", { path, displayName: null }),
   removeRoot: (rootId: number) => call<void>("remove_library_root", { rootId }),

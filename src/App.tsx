@@ -160,6 +160,7 @@ function App() {
   const { setLanguage, t, number } = useI18n();
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [initialized, setInitialized] = useState(false);
+  const [startupPresentationReady, setStartupPresentationReady] = useState(!desktopAvailable);
   const [roots, setRoots] = useState<LibraryRoot[]>([]);
   const [rootsLoading, setRootsLoading] = useState(desktopAvailable);
   const [page, setPage] = useState<AppPage>("all");
@@ -209,6 +210,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchRootId, setSearchRootId] = useState<number | null>(null);
   const toastSequence = useRef(0);
+  const mainWindowShowRequested = useRef(false);
   const contentScrollRef = useRef<HTMLDivElement>(null);
   const navigationSnapshots = useRef<Map<number, NavigationSnapshot>>(new Map());
   const sectionSnapshots = useRef<Map<BrowsingSectionKey, NavigationSnapshot>>(new Map());
@@ -362,7 +364,7 @@ function App() {
     applyPendingScroll();
   }, [allResourcesLoading, applyPendingScroll, contentLoading, currentNode?.id, detail?.node.id, favoritesLoading, page, recentlyWatchedLoading, scrollRestoreEpoch]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => {
       const resolved = theme === "system" ? (media.matches ? "dark" : "light") : theme;
@@ -374,6 +376,18 @@ function App() {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, [theme]);
+
+  useEffect(() => {
+    if (!desktopAvailable || !startupPresentationReady || mainWindowShowRequested.current) return;
+    mainWindowShowRequested.current = true;
+    // Passive effects run after React has committed the shell, and the layout effect above has
+    // already applied the persisted theme. The hidden native window therefore becomes visible at
+    // its restored size with a painted first frame instead of flashing the configured fallback.
+    void api.showMainWindow().catch((error) => {
+      mainWindowShowRequested.current = false;
+      console.error("failed to show the prepared main window", error);
+    });
+  }, [startupPresentationReady]);
 
   const toast = useCallback((text: string, kind: ToastKind = "info") => {
     const id = ++toastSequence.current;
@@ -643,20 +657,32 @@ function App() {
       setInitialized(true);
       return;
     }
-    void Promise.all([api.bootstrap(), api.listRoots(), api.getSettings(), api.getCollectionSortPreferences(), api.scanStatus(), api.allResources(), api.listRecentlyWatched().catch((error) => { toast(errorMessage(error), "error"); return [] as RecentlyWatchedEntry[]; })])
-      .then(([app, nextRoots, settings, sortPreferences, activeScan, resources, recentEntries]) => {
+    const settingsPromise = api.getSettings();
+    // Apply persisted visual settings independently from heavier index queries. This lets the
+    // prepared window appear promptly while the normal loading UI continues to hydrate.
+    void settingsPromise.then(
+      (settings) => {
+        if (!active) return;
+        setViewMode(settings.defaultViewMode === "LIST" ? "list" : "grid");
+        setLanguage(settings.language ?? "zh-CN");
+        setTheme(settings.theme ?? "system");
+        setStartupPresentationReady(true);
+      },
+      () => {
+        if (active) setStartupPresentationReady(true);
+      },
+    );
+    void Promise.all([api.bootstrap(), api.listRoots(), settingsPromise, api.getCollectionSortPreferences(), api.scanStatus(), api.allResources(), api.listRecentlyWatched().catch((error) => { toast(errorMessage(error), "error"); return [] as RecentlyWatchedEntry[]; })])
+      .then(([app, nextRoots, , sortPreferences, activeScan, resources, recentEntries]) => {
         if (!active) return;
         setBootstrap(app);
         setRoots(nextRoots);
         setSelectedRootId(nextRoots[0]?.id ?? null);
-        setViewMode(settings.defaultViewMode === "LIST" ? "list" : "grid");
         persistedSortPreferences.current = sortPreferences;
         currentSortPreferences.current = sortPreferences;
         setAllSort(sortPreferences.all);
         setBrowseSort(sortPreferences.browse);
         setFavoriteSort(sortPreferences.favorites);
-        setLanguage(settings.language ?? "zh-CN");
-        setTheme(settings.theme ?? "system");
         setAllResources(resources);
         setRecentlyWatched(recentEntries);
         if (activeScan?.status === "RUNNING" || activeScan?.status === "CANCELLING") setScan(activeScan);
@@ -699,45 +725,85 @@ function App() {
     if (refreshedNode) setCurrentNode(refreshedNode);
   }, [currentNode, detail, loadAllResources, loadFavoriteFolderNodes, loadFavoriteFolders, loadRecentlyWatched, page, selectedFavoriteFolderId, selectedRootId]);
 
-  useEffect(() => {
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenFinished: (() => void) | undefined;
-    void onScanProgress((progress) => {
-      if (!finishedScanIds.current.has(progress.scanId)) setScan(progress);
-    }).then((fn) => { unlistenProgress = fn; });
-    void onScanFinished((progress) => {
-      const finishedIds = finishedScanIds.current;
-      finishedIds.add(progress.scanId);
-      if (finishedIds.size > 32) {
-        const oldest = finishedIds.values().next().value;
-        if (oldest) finishedIds.delete(oldest);
-      }
-      setScan((current) => current?.scanId === progress.scanId ? null : current);
-      const matchOnly = matchOnlyScanIds.current.delete(progress.scanId)
-        || (progress.foldersScanned === 0 && progress.videosFound === 0 && progress.phase === "AUTO_MATCHING");
-      const labels: Record<string, string> = { COMPLETED: t("app.scanCompleted"), CANCELLED: t("app.scanCancelled"), FAILED: t("app.scanFailed") };
-      const summary = matchOnly ? t(progress.status === "CANCELLED" ? "app.matchCancelled" : progress.status === "FAILED" ? "app.matchFailed" : "app.matchCompleted") : t("app.scanSummary", {
-        status: labels[progress.status] ?? t("app.scanEnded"),
-        videos: number(progress.videosFound),
-        errors: progress.errors ? t("app.scanErrorsSuffix", { count: number(progress.errors) }) : "",
-      });
-      const hasAutoMatchSummary = progress.autoMatchMatched > 0 || (progress.autoMatchPending ?? 0) > 0 || progress.autoMatchUnmatched > 0 || progress.autoMatchErrors > 0;
-      const autoMatchSummary = hasAutoMatchSummary ? t("app.scanAutoMatchSummary", {
-        matched: number(progress.autoMatchMatched),
-        pending: number(progress.autoMatchPending ?? 0),
-        unmatched: number(progress.autoMatchUnmatched),
-        errors: number(progress.autoMatchErrors),
-      }) : null;
-      toast(autoMatchSummary ? `${summary} · ${autoMatchSummary}` : summary, progress.status === "FAILED" ? "error" : "success");
-      void Promise.all([
-        loadRoots(selectedRootId),
-        refreshCurrent(),
-        page === "all" ? Promise.resolve(null) : loadAllResources(),
-        page === "recent" ? Promise.resolve([]) : loadRecentlyWatched(),
-      ]).catch((error) => toast(errorMessage(error), "error"));
-    }).then((fn) => { unlistenFinished = fn; });
-    return () => { unlistenProgress?.(); unlistenFinished?.(); };
+  const handleScanProgress = useCallback((progress: ScanProgress) => {
+    if (!finishedScanIds.current.has(progress.scanId)) setScan(progress);
+  }, []);
+
+  const handleScanFinished = useCallback((progress: ScanProgress) => {
+    const finishedIds = finishedScanIds.current;
+    if (finishedIds.has(progress.scanId)) return;
+    finishedIds.add(progress.scanId);
+    if (finishedIds.size > 32) {
+      const oldest = finishedIds.values().next().value;
+      if (oldest) finishedIds.delete(oldest);
+    }
+    setScan((current) => current?.scanId === progress.scanId ? null : current);
+    const matchOnly = matchOnlyScanIds.current.delete(progress.scanId)
+      || (progress.foldersScanned === 0 && progress.videosFound === 0 && progress.phase === "AUTO_MATCHING");
+    const labels: Record<string, string> = { COMPLETED: t("app.scanCompleted"), CANCELLED: t("app.scanCancelled"), FAILED: t("app.scanFailed") };
+    const summary = matchOnly ? t(progress.status === "CANCELLED" ? "app.matchCancelled" : progress.status === "FAILED" ? "app.matchFailed" : "app.matchCompleted") : t("app.scanSummary", {
+      status: labels[progress.status] ?? t("app.scanEnded"),
+      videos: number(progress.videosFound),
+      errors: progress.errors ? t("app.scanErrorsSuffix", { count: number(progress.errors) }) : "",
+    });
+    const hasAutoMatchSummary = progress.autoMatchMatched > 0 || (progress.autoMatchPending ?? 0) > 0 || progress.autoMatchUnmatched > 0 || progress.autoMatchErrors > 0;
+    const autoMatchSummary = hasAutoMatchSummary ? t("app.scanAutoMatchSummary", {
+      matched: number(progress.autoMatchMatched),
+      pending: number(progress.autoMatchPending ?? 0),
+      unmatched: number(progress.autoMatchUnmatched),
+      errors: number(progress.autoMatchErrors),
+    }) : null;
+    toast(autoMatchSummary ? `${summary} · ${autoMatchSummary}` : summary, progress.status === "FAILED" ? "error" : "success");
+    void Promise.all([
+      loadRoots(selectedRootId),
+      refreshCurrent(),
+      page === "all" ? Promise.resolve(null) : loadAllResources(),
+      page === "recent" ? Promise.resolve([]) : loadRecentlyWatched(),
+    ]).catch((error) => toast(errorMessage(error), "error"));
   }, [loadAllResources, loadRecentlyWatched, loadRoots, number, page, refreshCurrent, selectedRootId, t, toast]);
+
+  const scanProgressHandlerRef = useRef(handleScanProgress);
+  const scanFinishedHandlerRef = useRef(handleScanFinished);
+  scanProgressHandlerRef.current = handleScanProgress;
+  scanFinishedHandlerRef.current = handleScanFinished;
+
+  useEffect(() => {
+    if (!desktopAvailable) return;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const attach = async (registration: Promise<() => void>, eventName: string) => {
+      try {
+        const unlisten = await registration;
+        if (disposed) unlisten();
+        else unlisteners.push(unlisten);
+      } catch (error) {
+        if (!disposed) console.error(`failed to subscribe to ${eventName}`, error);
+      }
+    };
+    // Register once for the app lifetime. Latest-handler refs avoid dependency-driven listener
+    // churn, while `disposed` closes the async registration/cleanup gap used by StrictMode.
+    void Promise.all([
+      attach(onScanProgress((progress) => scanProgressHandlerRef.current(progress)), "scan-progress"),
+      attach(onScanFinished((progress) => scanFinishedHandlerRef.current(progress)), "scan-completed"),
+    ]).then(async () => {
+      if (disposed) return;
+      // A short scan can finish while the two native listeners are still registering. The native
+      // control retains its terminal snapshot, so reconcile once after both subscriptions settle.
+      const current = await api.scanStatus();
+      if (disposed || current == null) return;
+      if (current.status === "RUNNING" || current.status === "CANCELLING") {
+        scanProgressHandlerRef.current(current);
+      } else if (!finishedScanIds.current.has(current.scanId)) {
+        scanFinishedHandlerRef.current(current);
+      }
+    }).catch((error) => {
+      if (!disposed) console.error("failed to reconcile scan listeners", error);
+    });
+    return () => {
+      disposed = true;
+      unlisteners.splice(0).forEach((unlisten) => unlisten());
+    };
+  }, []);
 
   const selectRoot = useCallback(async (rootId: number, recordHistory = true) => {
     const returnSnapshot = recordHistory ? captureNavigation() : null;

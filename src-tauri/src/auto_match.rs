@@ -317,6 +317,11 @@ where
         return Ok(AutoMatchNodeResult::Cancelled);
     }
 
+    // Hold a shared cache-operation guard from the binding write through the cover/database
+    // commit. An explicit cache clear takes the exclusive side of this barrier and therefore sees
+    // either the complete old state or the complete new state, never an in-flight download.
+    let cache_operation = cache::begin_cover_cache_operation();
+
     // Re-read after network I/O. In explicit-rematch mode a binding changed after this run began
     // is a newer user decision; the DB compares that expected Subject and replaces it in the same
     // immediate transaction so there is no check/write race.
@@ -340,7 +345,12 @@ where
                 ConditionalBindingSave::Stale => return Ok(AutoMatchNodeResult::AlreadyBound),
             };
             if let (Some(old_path), Ok(active_cache)) = (old_path.as_deref(), cache_root) {
-                remove_cached_file_if_unreferenced(database, old_path, active_cache);
+                remove_cached_file_if_unreferenced(
+                    &cache_operation,
+                    database,
+                    old_path,
+                    active_cache,
+                );
             }
         }
     }
@@ -355,7 +365,7 @@ where
     }
 
     let cover_result = match cache_root {
-        Ok(cache_root) => bangumi::download_cover(cache_root, &subject),
+        Ok(cache_root) => bangumi::download_cover(&cache_operation, cache_root, &subject),
         Err(error) => Err(error.to_string()),
     };
     if is_cancelled() {
@@ -397,11 +407,16 @@ where
     })
 }
 
-fn remove_cached_file_if_unreferenced(database: &Database, path: &Path, cache_root: &Path) {
+fn remove_cached_file_if_unreferenced(
+    cache_operation: &cache::CoverCacheOperationGuard,
+    database: &Database,
+    path: &Path,
+    cache_root: &Path,
+) {
     if cache::is_equal_or_within(path, cache_root)
         && database.cover_path_reference_count(path).ok() == Some(0)
     {
-        let _ = cache::remove_cached_file(path, cache_root);
+        let _ = cache::remove_cached_file(cache_operation, path, cache_root);
     }
 }
 
