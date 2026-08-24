@@ -12,6 +12,12 @@
 
 M²Shelf creates a separate index for anime, movies, and related resources stored on local drives, external drives, or mapped NAS folders. It provides poster-wall browsing, Bangumi metadata, tags, favorites, watch history, and shortcuts to external players.
 
+Simply put, M²Shelf can turn an anime collection filled with long, hard-to-identify names—from different languages, encodes, and subtitle groups in File Explorer—into the clear poster wall shown below with a single click:
+
+<img width="1427" height="888" alt="M²Shelf poster-wall example" src="https://github.com/user-attachments/assets/c09f2e18-aef0-4e13-ae1a-b5a7825bc3dc" />
+
+The original file names remain visible on each anime's details page, where you can also open the item in Windows File Explorer with a single click.
+
 **The app never moves, deletes, renames, or modifies source media files, and it does not require you to reorganize existing folders.**
 
 ## Key features
