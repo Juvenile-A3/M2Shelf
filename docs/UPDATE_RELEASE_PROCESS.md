@@ -9,37 +9,51 @@
 - 版本只允许严格高于当前版本的规范 `major.minor.patch`；
 - 每个资产同时校验固定文件名、长度、SHA-256 和 Ed25519；签名绑定应用 ID、版本、平台、长度和摘要；
 - GitHub Actions 不接触生产私钥，只构建无签名候选；
-- 生产 seed 只存于独立、离线、日常开发工具和 Agent 均无法访问的签名环境。CurrentUser DPAPI 只能保护静态文件，不能隔离同一 Windows 用户下的进程，因此开发机上的 DPAPI 文件只能用于开发验收，不能单独充当生产私钥边界；
+- 生产 seed 只以密码加密的 `M2Shelf-Production-Key/encrypted-private-key.m2key` 存放在可移动 USB 中；日常开发环境不保存其副本。容器不绑定 Windows 用户或单台电脑，密码只在签名工具中交互输入；
 - 已发布 Release 视为不可变。修复错误发布必须提升版本，不能替换原资产。
 
 ## 2. 发布前准备
 
 ### 2.1 长期生产更新密钥规则
 
-自 `v0.5.11` 起，当前 production seed 与 `src-tauri/update-public-key.txt` 中的 update public key 作为 M²Shelf 的长期生产更新签名密钥使用。后续正常版本发布必须继续使用现有 production seed，在隔离环境完成签名；不得重新生成 production seed，也不得生成、替换或改写 `src-tauri/update-public-key.txt`。只有在明确执行生产密钥轮换流程时，才允许建立新的 seed 和公钥。
+自 `v0.5.11` 起，当前 production seed 与 `src-tauri/update-public-key.txt` 中的 update public key 作为 M²Shelf 的长期生产更新签名密钥使用。后续正常版本发布必须继续使用现有 production seed，通过加密 USB 和人工输入密码完成签名；不得重新生成 production seed，也不得生成、替换或改写 `src-tauri/update-public-key.txt`。只有在明确执行生产密钥轮换流程时，才允许建立新的 seed 和公钥。
 
-任何涉及 production key/seed 的生成、替换或轮换操作，都必须立即停止当前发布流程，并先取得项目所有者的明确确认。不得根据版本升级、文件缺失、Agent 建议或自动化结果自行推断需要轮换密钥。
+任何涉及 production key/seed 的生成、迁移、替换或轮换操作，都必须立即停止当前发布流程，并先取得项目所有者的明确确认。不得根据版本升级、文件缺失、Agent 建议或自动化结果自行推断需要迁移或轮换密钥。
 
-### 2.2 首次建立或轮换生产信任根
+### 2.2 一次性迁移到可移动 USB 密钥
 
-分发版 `M2ShelfUpdater.exe` 不提供密钥生成命令。仓库中的 `tools/offline-key-init` 是独立 Cargo crate，不属于主 workspace，也不得出现在 CI、NSIS、Portable、Release 或 PATH 中。日常开发账号与 Agent 只允许审查、测试不涉及真实密钥的纯逻辑并通过 `scripts/build_offline_key_init.ps1` 编译该工具；脚本会先运行该独立 crate 的 fmt、test 与 clippy，再锁定依赖、重映射私人路径、验证 x64 并输出 SHA-256，但绝不执行其 `init` 命令。每个版本的 `bundle/offline-key-init-v{version}` 必须预先不存在；脚本拒绝覆盖已有交付目录或文件。
+`v0.5.11` 的既有 production seed 和公钥保持不变。CurrentUser-DPAPI 文件只作为一次性迁移源，不再作为长期日常签名格式。仓库中的 `tools/portable-key-tool` 是独立、非分发工具；`scripts/build_portable_key_tool.ps1` 只执行该 crate 的 fmt、test、clippy 与锁定 release 构建，绝不执行迁移或读取密钥。Agent 只能以合成测试 seed 验证它。
 
-在无 Codex/Agent、无日常浏览器、无远程控制、无剪贴板/终端录制且离线的专用 Windows 账号中，先独立核对工具源码与二进制指纹，再执行一次：
+真实迁移不是普通构建步骤。每次准备操作真实 production seed 时，必须先停止并重新取得项目所有者的明确确认；不得由 Agent 自动发现、读取或执行。获得确认后，由密钥所有者在旧 DPAPI 所属 Windows 用户中手动运行一次：
 
 ```powershell
-M2ShelfOfflineKeyInit.exe init `
-  --output-directory C:\M2Shelf-Production-Key-v0.5.11 `
-  --confirm NEW_PRODUCTION_KEY
+M2ShelfPortableKeyTool.exe migrate-dpapi `
+  --input $legacyDpapiSeed `
+  --output (Join-Path $usbRoot "M2Shelf-Production-Key\encrypted-private-key.m2key") `
+  --public-key .\src-tauri\update-public-key.txt `
+  --key-id production-v0.5.11
 ```
 
-目标必须是本机普通卷上尚不存在的新目录，父目录也不得经过符号链接、junction 或其他重解析点，目录组件不得使用尾随点/空格、DOS 保留名、ADS 或相对跳转。工具不会输出 seed、私钥 Base64、公钥正文或绝对路径；它在内存中生成 Ed25519 seed，立即以该账号的 CurrentUser DPAPI 保护，拒绝超过签名 wrapper 16 KiB 上限的密文，并在原子提交前后复核父链、目录、重解析属性和精确文件内容。只有复核成功才报告结果；失败清理也只处理经过验证的两个固定文件。随后以不覆盖的同卷目录重命名一次提交：
+工具会在控制台无回显地要求输入并确认新密码；明文 seed 只存在于 Rust 进程内。它先确认旧 seed 对应当前公钥，再以 Argon2id 派生密钥、用 XChaCha20-Poly1305 认证加密，写出以下固定结构：
 
-- `production-seed.dpapi`：只留在隔离签名账号，用于 `scripts/sign_update_offline.ps1`；
-- `update-public-key.txt`：唯一允许带回开发仓库并替换 `src-tauri/update-public-key.txt` 的文件。
+```text
+M2Shelf-Production-Key/
+├─ encrypted-private-key.m2key
+├─ key-metadata.json
+└─ README.txt
+```
 
-不要把整个输出目录复制到开发机、云盘或聊天。DPAPI 文件与该 Windows 用户绑定；应通过隔离机器/账号的加密离线备份保证灾难恢复，备份位置不得写入仓库。公钥替换后必须废弃全部旧 helper、旧候选、旧签名和旧 manifest，并重新执行完整构建与验证。
+写入后工具会重新解密，确认 seed、公钥和确定性 Ed25519 签名均与迁移前一致。旧 `production-seed.dpapi` 不会被修改或删除，应作为独立离线恢复副本保留，直到项目所有者明确批准退役。密码不得写入脚本、仓库、密码参数、环境变量或日志；USB 内容不得上传到 GitHub、云盘或聊天。
 
-1. 确认 `package.json`、lockfile、`src-tauri/Cargo.toml`、Cargo lockfile 和 `src-tauri/tauri.conf.json` 版本完全一致，且为稳定规范 SemVer。
+迁移后可随时执行只读身份核对；该命令不会签名或生成 Release 文件：
+
+```powershell
+M2ShelfPortableKeyTool.exe verify-key `
+  --key (Join-Path $usbRoot "M2Shelf-Production-Key\encrypted-private-key.m2key") `
+  --public-key .\src-tauri\update-public-key.txt
+```
+
+1. 确认 `package.json`、lockfile、`src-tauri/Cargo.toml`、Cargo lockfile 和 `src-tauri/tauri.conf.json` 版本完全一致，且为稳定规范 SemVer；版本变更后同时刷新并审查 `tools/portable-key-tool/Cargo.lock`，因为它锁定了当前 `m2shelf_lib` 路径依赖。刷新锁文件不执行任何密钥命令。
 2. 更新四语言 release notes，并确认所有长期文档与源码一致。
 3. 在干净工作树运行 `AGENTS.md` 的完整质量门禁。
 4. 使用 `scripts/build_windows_release.ps1 -Bundles nsis` 与 `scripts/build_portable.ps1` 做一次本地候选验证；检查版本、x64、图标、隐私扫描、Portable 五文件集合、helper identity 和启动。
@@ -60,40 +74,30 @@ tag 会触发 `.github/workflows/windows-release.yml`。该 workflow 使用固�
 
 下载候选到仓库外或忽略的本地目录，保留原文件名与 provenance。`candidate-provenance.json` 是便于核对的 CI 元数据，不是密码学来源证明，不能单独授权生产签名。只接受 tag 触发、`tagExists=true`，且 repository、version、tag、commit 和资产摘要均与本地目标一致的候选。联网机使用 `gh attestation download` 获取两个候选的 bundle，并同时获取新的 `gh attestation trusted-root`；隔离签名环境按 GitHub 官方离线流程对两个候选执行 `gh attestation verify --bundle ... --custom-trusted-root ... -R Undermori/M2Shelf`，确认 source ref 为精确 `refs/tags/v{version}`（本次为 `refs/tags/v0.5.11`）和预期 commit 后，独立记录两个 SHA-256。若不使用 attestation，则必须在隔离环境从已验证 tag 独立构建并得到正式候选的可信精确摘要。正式签名只接受这条独立路径得到的摘要。
 
-## 4. 线下签名
+## 4. USB 密钥签名
 
-发布负责人应预先拥有七项仓库外、独立核对的输入：
+发布负责人应预先拥有：已核对的 CI 无签名候选及其 attestation 或独立构建摘要、`candidate-provenance.json`、四语言 release notes、由锁定源码构建的 `M2ShelfPortableKeyTool.exe`，以及单独保存的加密生产密钥 USB。日常开发电脑不保存密钥副本；签名前插入，成功后拔出。
 
-1. CurrentUser DPAPI 保护的 32 字节 Ed25519 seed；
-2. 已审查的 `M2ShelfUpdater.exe` 签名 helper；
-3. 在不同步骤、独立保存的该 helper SHA-256 指纹；
-4. 已审查 `generate_update_manifest.ps1` 的 SHA-256 指纹；
-5. 通过受信 attestation 或隔离环境独立构建得到的 Portable SHA-256；
-6. 同一路径得到的 NSIS SHA-256；
-7. 四语言 release notes。
-
-生产操作必须在独立签名机/用户上进行，且该环境不得向 Codex、其他 Agent、日常浏览器或普通开发进程提供命令执行能力。签名脚本和 helper 使用仓库外只读受信副本；建立 `0.5.11` 新信任根时必须在该环境生成 seed 并立即以该 Windows 用户的 CurrentUser DPAPI 封装，只把规范 Base64 公钥带回源码。开发机 DPAPI seed 只允许验证流程，不得发布为生产信任根。
-
-不要在命令行直接设置或回显私钥。使用 wrapper，使明文 seed 只短暂存在于当前 PowerShell 进程环境和内存中：
+正常发版只运行一个包装命令：
 
 ```powershell
-pwsh ./scripts/sign_update_offline.ps1 `
+pwsh ./scripts/sign_update_from_usb.ps1 `
   -CandidateDirectory $candidateDirectory `
-  -EncryptedSeedPath $encryptedSeedPath `
-  -UpdaterPath $trustedUpdaterPath `
-  -TrustedSignerSha256 $trustedUpdaterSha256 `
-  -TrustedManifestGeneratorSha256 $trustedManifestGeneratorSha256 `
-  -TrustedPortableSha256 $trustedPortableSha256 `
-  -TrustedNsisSha256 $trustedNsisSha256 `
   -NotesPath $localizedNotesJson
 ```
 
-`-NotesPath` 可省略；正式发布必须提供恰好包含 `zh-CN`、`en-US`、`ja-JP`、`ko-KR` 的非空 JSON。wrapper 会在解密 seed 前核对 manifest generator、helper 和两个候选的独立指纹，再核对 app ID、版本、嵌入公钥和固定资产名，并生成：
+默认模式只在已就绪的可移动盘中查找唯一的 `M2Shelf-Production-Key/encrypted-private-key.m2key`。若 Windows 把某个 USB 设备报告为固定磁盘，可显式传入 `-UsbRoot`；脚本不会打印密钥路径。候选目录和 release-notes 文件只有在当前版本恰好找到一个匹配项时才会自动采用，否则必须显式指定，避免误用旧候选。
 
-- 两个资产各自的 `.sha256` 和 `.sig`；
-- 严格 schema 的 `latest.json`。
+PowerShell 只传递文件路径和公开元数据，不读取密码或私钥。`M2ShelfPortableKeyTool sign-release` 在控制台无回显地读取密码，在同一 Rust 进程内解密 seed、核对 `src-tauri/update-public-key.txt`、调用客户端共享的 Ed25519 签名消息实现，并立即用当前公钥验签。签名格式、URL 和 `latest.json` schema 与既有客户端完全相同。
 
-签名后不要修改任何候选、sidecar、manifest 或 provenance。不要把签名目录提交到 Git。
+输出包含一个只含以下八项正式文件的目录，以及同内容的 `M2Shelf-v{version}-SIGNED-RETURN.zip` 和其 SHA-256 sidecar：
+
+- Portable ZIP、`.sha256`、`.sig`；
+- NSIS EXE、`.sha256`、`.sig`；
+- `latest.json`；
+- 原 `candidate-provenance.json`。
+
+正式 release notes JSON 必须恰好包含非空的 `zh-CN`、`en-US`、`ja-JP`、`ko-KR`。签名完成后拔出 USB；不要修改任何候选、sidecar、manifest 或 provenance，也不要把签名目录提交到 Git。现有 `scripts/publish_signed_release.ps1` 仍负责发布前用随包 helper 再次执行独立 fail-closed 公钥验签并发布，不改变 Release 的精确八项资产集合。
 
 ## 5. Fail-closed 验证与发布
 

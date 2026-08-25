@@ -124,11 +124,13 @@ Bangumi 网络访问限于批准的官方主机，使用 TLS、连接/总超时�
 
 Ed25519 签名绑定协议域、应用 ID、版本、平台、长度和 SHA-256，客户端在下载结束和执行前都验证。仅有清单自带 SHA-256 不构成信任。启动自动检查只提示，不自动下载或安装；后两步必须是用户明确操作。设置页将自动检查开关与手动检查按钮保持为同层级操作；手动检查无更新或失败仅给出短提示，只有有效新版本才打开更新详情。
 
-## D28：更新信任根和正式签名保持离线
+## D28：更新信任根长期不变，生产 seed 由加密 USB 携带
 
-生产 Ed25519 私钥绝不进入仓库、GitHub Secrets、Actions、Release、命令行、日志或项目文档。随软件分发的 `M2ShelfUpdater.exe` 不再提供会把私钥写入 stdout 的 keygen；首次建立或轮换信任根只使用独立、非 workspace、非打包目标的 `tools/offline-key-init`，在隔离 Windows 用户中把内存 seed 直接保护为有界 CurrentUser DPAPI 文件，拒绝易产生 Windows 路径歧义的目录组件，并在同卷新目录原子提交前后复核无重解析父链、目录和精确文件。其构建脚本必须执行独立 crate 门禁且拒绝覆盖任何既有版本化交付目录。Agent 只能审查和编译该工具，不能执行生产初始化或读取输出；只有公钥文件返回仓库。GitHub Actions 使用固定 action commit，只运行完整门禁并生成包含 tag/commit/资产哈希来源证明的无签名候选。
+生产 Ed25519 私钥绝不进入仓库、GitHub Secrets、Actions、Release、命令行、环境变量、日志、临时文件或项目文档。自 `v0.5.11` 起，现有 production seed 与 `src-tauri/update-public-key.txt` 是长期更新信任根；普通发版不得重新生成 seed 或替换公钥。任何真实 production key/seed 的生成、迁移、替换或轮换都必须停止发布并先取得项目所有者的明确确认。随软件分发的 `M2ShelfUpdater.exe` 仍不提供密钥生成能力，客户端 updater、Ed25519 消息格式和 Release schema 均不因密钥存储方式改变。
 
-正式签名必须在独立、离线、日常开发工具和 Agent 均无法执行命令的 Windows 签名环境中进行。CurrentUser DPAPI 只能保护静态文件，不能隔离同一 Windows 用户进程；因此开发机 DPAPI seed 仅可用于流程验收，不能单独作为生产私钥边界。`scripts/sign_update_offline.ps1` 在解密前必须核对独立保存的 manifest generator、helper、Portable 和 NSIS SHA-256，并确认 helper 的 app ID、版本和嵌入公钥。生产 seed 另有加密离线恢复副本，但位置和内容不写入仓库。
+现有 CurrentUser-DPAPI 文件仅作为一次性迁移源和保留的恢复副本，不再进入日常签名。独立、非分发的 `tools/portable-key-tool migrate-dpapi` 在原 DPAPI 所属 Windows 用户中解出同一个 32 字节 seed，先核对当前公钥，再用 Argon2id 和 XChaCha20-Poly1305 写入 USB 固定目录的 `encrypted-private-key.m2key`；迁移后重新解密、核对公钥和确定性签名，且绝不删除或覆盖旧 DPAPI 文件。Agent 只允许用合成测试 seed 编译和验证流程，不得寻找、读取或迁移真实生产文件。
+
+日常发版只使用 `scripts/sign_update_from_usb.ps1` 和 `tools/portable-key-tool sign-release`：插入密钥盘、交互输入密码、在 Rust 进程内解密并调用与客户端共享的签名函数、立即用当前公钥验签、输出既有八项正式文件和 `SIGNED-RETURN`，随后拔出 USB。密码与明文 seed 不离开该进程，不传给 PowerShell 或子进程，也不产生长期缓存。`verify-key` 只验证 USB 密钥是否仍对应当前公钥，不产生签名。该可移动加密容器不绑定 Windows 用户或单台电脑；密钥盘丢失但没有密码时不能直接签名。
 
 `scripts/publish_signed_release.ps1` 是正式发布入口。CI provenance 只是核对元数据，生产签名还必须依赖受信 Artifact Attestation 或隔离环境独立构建得到的候选摘要。发布脚本在修改 GitHub 前 fail-closed 验证干净工作树、不可变 tag/commit、全部本地哈希/签名/清单，并通过独立指纹固定且身份匹配的 helper 对两个资产执行真实 Ed25519 公钥验签；上传到草稿后强制远端名称、大小和 SHA-256 digest 完全匹配再公开。已发布 Release 不修改或替换。
 

@@ -1779,6 +1779,150 @@ def check_brand_release_and_icons() -> None:
     else:
         passed("offline signing requires independent script, helper, and candidate fingerprints before DPAPI decrypt")
 
+    portable_key_manifest = read("tools/portable-key-tool/Cargo.toml")
+    portable_key_lock = read("tools/portable-key-tool/Cargo.lock")
+    portable_key_gitignore = read(".gitignore")
+    portable_key_source = "\n".join(
+        read(path)
+        for path in (
+            "tools/portable-key-tool/src/main.rs",
+            "tools/portable-key-tool/src/commands.rs",
+            "tools/portable-key-tool/src/key_container.rs",
+            "tools/portable-key-tool/src/password.rs",
+        )
+    )
+    portable_key_contract = (
+        'name = "m2shelf-portable-key-tool"',
+        'publish = false',
+        'argon2 = "=0.5.3"',
+        'chacha20poly1305 = "=0.10.1"',
+        'ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }',
+        'rpassword = "=7.4.0"',
+        'zeroize = "=1.8.1"',
+        'm2shelf_lib = { package = "m2shelf", path = "../../src-tauri" }',
+        '"migrate-dpapi" => migrate_dpapi(options)',
+        '"verify-key" => verify_key(options)',
+        '"sign-release" => sign_release(options)',
+        'std::env::var_os("M2SHELF_UPDATE_PRIVATE_KEY").is_some()',
+        "CryptUnprotectData",
+        "ARGON2_MEMORY_KIB",
+        "memory_kib != ARGON2_MEMORY_KIB",
+        "iterations != ARGON2_ITERATIONS",
+        "parallelism != ARGON2_PARALLELISM",
+        "Argon2::new(Algorithm::Argon2id, Version::V0x13",
+        "XChaCha20Poly1305",
+        "Zeroizing",
+        'pub const KEY_FILE_NAME: &str = "encrypted-private-key.m2key"',
+        'pub const KEY_DIRECTORY_NAME: &str = "M2Shelf-Production-Key"',
+        'pub const METADATA_FILE_NAME: &str = "key-metadata.json"',
+        'pub const README_FILE_NAME: &str = "README.txt"',
+        "sign_digest(",
+        "verify_signature(",
+        "RETURN_FILE_COUNT: usize = 8",
+        "#[serde(deny_unknown_fields)]",
+        '"windows-x64-portable"',
+        '"windows-x64-nsis"',
+        "The original DPAPI file was left unchanged.",
+    )
+    portable_key_forbidden = (
+        "std::env::set_var",
+        "Command::new(",
+        "sign_artifact_for_cli(",
+        "decode_signing_key(",
+        "remove_file(&args.input",
+        "Write-Host $privateKey",
+        "Write-Output $privateKey",
+    )
+    if any(
+        token not in portable_key_manifest + portable_key_source
+        for token in portable_key_contract
+    ):
+        fail("portable USB key tool lacks the encrypted-key, in-process signing, or exact-release contract")
+    elif any(token in portable_key_source for token in portable_key_forbidden):
+        fail("portable USB key tool may export, spawn with, or delete production key material")
+    elif 'name = "m2shelf-portable-key-tool"' not in portable_key_lock:
+        fail("portable USB key tool must have an independent checked-in Cargo lockfile")
+    elif any(
+        token not in portable_key_gitignore
+        for token in (
+            "tools/portable-key-tool/target/",
+            "M2Shelf-Production-Key/",
+            "*.m2key",
+        )
+    ):
+        fail("portable USB key material and build cache must be ignored by Git")
+    elif re.search(
+        r"(?i)[A-Z]:\\Users\\[^\\\s]+",
+        portable_key_source + portable_key_manifest,
+    ):
+        fail("portable USB key tool contains a literal user-profile path")
+    else:
+        passed("password-encrypted portable key with testable DPAPI migration and in-process signing")
+
+    portable_key_builder = read("scripts/build_portable_key_tool.ps1")
+    portable_key_builder_contract = (
+        "CARGO_ENCODED_RUSTFLAGS",
+        "--remap-path-prefix=",
+        "cargo fmt --manifest-path $manifestPath -- --check",
+        "cargo test --manifest-path $manifestPath --locked",
+        "cargo clippy --manifest-path $manifestPath --all-targets --locked -- -D warnings",
+        "cargo build --manifest-path $manifestPath --release --locked --bin M2ShelfPortableKeyTool",
+        "Assert-X64Pe -Path",
+        "Assert-NoPrivateBuildPath -Path",
+        "Get-FileHash -LiteralPath $outputItem.FullName -Algorithm SHA256",
+        '"bundle\\portable-key-tool-v$version"',
+    )
+    if any(token not in portable_key_builder for token in portable_key_builder_contract):
+        fail("portable key tool builder lacks locked tests, x64 validation, path remapping, or checksum output")
+    elif any(
+        token in portable_key_builder
+        for token in (
+            "M2SHELF_UPDATE_PRIVATE_KEY",
+            "production-seed.dpapi",
+            "encrypted-private-key.m2key",
+            " migrate-dpapi ",
+            " sign-release ",
+        )
+    ):
+        fail("portable key tool builder must compile only and never access key material")
+    else:
+        passed("portable key tool builder is locked, x64, path-remapped, and compile-only")
+
+    usb_signer = read("scripts/sign_update_from_usb.ps1")
+    usb_signer_contract = (
+        "[System.IO.DriveInfo]::GetDrives()",
+        "[System.IO.DriveType]::Removable",
+        '"M2Shelf-Production-Key\\encrypted-private-key.m2key"',
+        '"sign-release"',
+        '"--key", $resolvedKeyPath',
+        '"--public-key", $resolvedPublicKeyPath',
+        '"--candidate-directory", $resolvedCandidateDirectory',
+        '"--notes", $resolvedNotesPath',
+        '"--provenance", $resolvedProvenancePath',
+        '"--output-directory", $resolvedOutputDirectory',
+        "& $resolvedToolPath @arguments",
+        "Signed return directory does not contain the exact eight Release files.",
+        "SIGNED-RETURN SHA-256 sidecar does not match the archive.",
+    )
+    usb_signer_forbidden = (
+        "M2SHELF_UPDATE_PRIVATE_KEY",
+        "production-seed.dpapi",
+        "Get-Content -LiteralPath $resolvedKeyPath",
+        "Read-Host",
+        "Invoke-WebRequest",
+        "Invoke-RestMethod",
+        "Start-BitsTransfer",
+        "gh release",
+    )
+    if any(token not in usb_signer for token in usb_signer_contract):
+        fail("USB signing wrapper lacks removable-drive discovery, private in-process signing, or output verification")
+    elif any(token in usb_signer for token in usb_signer_forbidden):
+        fail("USB signing wrapper may read key material, accept legacy seed transport, or use the network")
+    elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", usb_signer):
+        fail("USB signing wrapper contains a literal user-profile path")
+    else:
+        passed("USB signing wrapper locates one removable encrypted key and verifies the exact return package")
+
     release_workflow = read(".github/workflows/windows-release.yml")
     workflow_contract = (
         "workflow_dispatch:",
@@ -3111,6 +3255,12 @@ def main() -> int:
         ("tools/offline-key-init/Cargo.toml", 500),
         ("tools/offline-key-init/Cargo.lock", 2_000),
         ("tools/offline-key-init/src/main.rs", 8_000),
+        ("tools/portable-key-tool/Cargo.toml", 800),
+        ("tools/portable-key-tool/Cargo.lock", 100_000),
+        ("tools/portable-key-tool/src/main.rs", 300),
+        ("tools/portable-key-tool/src/commands.rs", 30_000),
+        ("tools/portable-key-tool/src/key_container.rs", 10_000),
+        ("tools/portable-key-tool/src/password.rs", 1_000),
         ("src/lib/api.ts", 1_000),
         ("src/components/TagManagerDialog.tsx", 2_000),
         ("scripts/build_portable.ps1", 1_000),
@@ -3118,6 +3268,8 @@ def main() -> int:
         ("scripts/build_windows_release.ps1", 1_000),
         ("scripts/generate_update_manifest.ps1", 3_000),
         ("scripts/sign_update_offline.ps1", 3_000),
+        ("scripts/build_portable_key_tool.ps1", 5_000),
+        ("scripts/sign_update_from_usb.ps1", 8_000),
         ("scripts/publish_signed_release.ps1", 3_000),
         ("scripts/build_brand_assets.ps1", 1_000),
         ("scripts/prepare_logo_source.ps1", 1_000),

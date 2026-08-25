@@ -36,6 +36,9 @@ secrets.json
 *.key
 *.dpapi
 tools/offline-key-init/target/
+tools/portable-key-tool/target/
+M2Shelf-Production-Key/
+*.m2key
 *.pfx
 *.p12
 *.tsbuildinfo

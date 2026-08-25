@@ -59,9 +59,11 @@
 - `scripts/run_validate.mjs`：先探测可用 Python 解释器并跳过无效的 Windows Store 别名，再运行验证器；
 - `scripts/build_windows_release.ps1`：公开 Windows 主程序、updater helper 与 NSIS 构建；验证稳定版本、x64 PE、产品元数据和隐私路径，并输出固定命名安装包及 SHA-256；
 - `scripts/build_offline_key_init.ps1`：只编译独立密钥初始化工具；先执行该 crate 的 fmt/test/clippy，再做锁定依赖、路径重映射、x64 PE、隐私扫描和 SHA-256，并只写入全新的版本化交付目录；不会运行 `init`、覆盖旧交付或接触密钥材料；
+- `tools/portable-key-tool/`：非分发的可移动密钥工具；提供一次性 `migrate-dpapi`、只读 `verify-key` 和长期 `sign-release`，直接复用 `m2shelf_lib::update` 的签名与验签实现；
+- `scripts/build_portable_key_tool.ps1`：对可移动密钥工具执行锁定 fmt/test/clippy/release 构建和 x64/隐私/校验和验证，不执行迁移或签名；
 - `scripts/build_portable.ps1`：Portable 目录和 ZIP；
-- `scripts/generate_update_manifest.ps1`：为两个固定版本化资产生成 SHA-256、Ed25519 签名边车和严格 `latest.json`；
-- `scripts/sign_update_offline.ps1`：在隔离 Windows 签名环境中核对独立保存的脚本、helper 与候选摘要后解开仓库外 seed；开发机 CurrentUser DPAPI 仅用于流程验收，不构成生产隔离；
+- `scripts/generate_update_manifest.ps1`、`scripts/sign_update_offline.ps1`：保留的旧 DPAPI 签名兼容实现，不再作为普通发版入口；
+- `scripts/sign_update_from_usb.ps1`：日常生产签名入口；只定位唯一 USB 加密密钥和当前候选，由 Rust 工具内部交互解密、签名、自验并生成固定八项返回包；
 - `scripts/publish_signed_release.ps1`：在本地和远端条件全部匹配后创建、核对并发布不可变 Release；
 - `.github/workflows/windows-release.yml`：固定 action commit 的质量门禁和无签名 Windows 候选构建，只上传资产、校验和与来源证明；
 - `scripts/generate_icons.ps1`、`build_brand_assets.ps1`：从固定母版生成图标。
@@ -136,7 +138,7 @@ Bangumi 手动弹窗为每次预填、搜索和绑定维护 Node ID 与请求代
 
 NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当前目录标记、更新缓存及安装目录的 Library Root 隔离，复制已安装的可信 `M2ShelfUpdater.exe` 到应用数据事务目录，并在取得 SQLite 单写入屏障后通过 online backup 建立一致快照及长度/SHA-256 记录；该屏障保留到旧进程退出，避免快照后的写入在回滚时丢失。helper 全程持有 Windows 命名更新互斥锁，在旧程序退出前锁定、复验并密封 ZIP，原子写入 helper-ready；普通手动启动会先等待该锁。只有新版子进程携带的规范事务 ID 能同时认证精确活动事务、当前可执行文件、目标版本和 `Launched` 阶段时才允许绕过等待。helper 严格验证 ZIP 的扁平固定文件集、Portable 标记和 Windows 产品版本，在同卷暂存/备份后替换且最后处理 `M2Shelf.exe`，启动新进程并等待精确版本健康回执及完整三秒存活观察。成功后先原子写入仍保留事务材料的终态 `Completed`，完成受校验清理后再清除保留标记；下次启动会续作中断的 `Completed` 清理。失败时先确认新进程终止、逆序恢复文件，再以长度、SHA-256、SQLite `quick_check` 复验快照，预检并隔离 WAL/SHM 后原子恢复主库；无法安全恢复时保持当前数据库并保留材料。helper 异常终止留下的非终态事务会在下次启动严格识别并标为 `RECOVERY_REQUIRED`，不执行缺少可靠文件日志的猜测式回滚。回滚和人工恢复提示都持久显示到用户明确确认。
 
-`v0.5.8` 仅保留为 CI 失败的不可变历史 tag，`v0.5.9` 仅保留为最终修复前创建且未公开的不可变历史 tag，`v0.5.10` 仅保留为最终匹配修复和生产密钥轮换前创建的不可变未发布 tag；三者都没有 Release、资产或 `latest.json`，不授权更新。`0.5.11` 被指定为第一个携带该更新器、Portable helper 与新生产信任根的引导版本，只有正式签名 Release 存在后才能称为公开版本。`0.5.7` 及更早用户和任何旧公钥测试包用户都需要手动安装 `0.5.11` 一次，之后客户端才具备兼容的更新能力。
+`v0.5.8` 仅保留为 CI 失败的不可变历史 tag，`v0.5.9` 仅保留为最终修复前创建且未公开的不可变历史 tag，`v0.5.10` 仅保留为最终匹配修复和生产密钥轮换前创建的不可变未发布 tag；三者都没有 Release、资产或 `latest.json`，不授权更新。`0.5.11` 是第一个携带该更新器、Portable helper 与新生产信任根的引导版本，其正式签名 Release 已存在并公开。`0.5.7` 及更早用户和任何旧公钥测试包用户都需要手动安装 `0.5.11` 一次，之后客户端才具备兼容的更新能力。
 
 ## 持久化设置
 
@@ -159,7 +161,7 @@ NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当
 - 手工封面在原子写入缓存前校验 15 MiB 上限、格式签名和像素尺寸；播放器测试有 5 秒超时；持久化 IPC 文本有后端长度上限；
 - 批量标签、收藏夹和分类操作先验证 Node 集并事务提交；
 - Portable 安装目录不得与 Library Root 重叠；更新 ZIP 仅接受固定的五个扁平普通文件，拒绝目录、链接、未知项、路径穿越、大小写重名和越界尺寸；
-- 生产 Ed25519 私钥不在源码或 GitHub；CI 仅产出无签名候选和仅供核对的 `candidate-provenance.json`。分发 helper 不生成密钥；独立离线初始化工具把 seed 直接写成不超过 16 KiB 的 CurrentUser DPAPI 密文，拒绝覆盖、远程/设备/ADS/尾随点空格/DOS 保留名路径和重解析点，并在原子提交前后复核父链与精确文件，只允许公钥带回源码。生产签名必须位于 Agent 不可访问的独立离线环境，并在解密前核对受信 attestation 或独立构建的候选摘要、manifest generator/helper 指纹以及匹配的 app ID、版本和嵌入公钥；开发机 CurrentUser DPAPI 仅用于流程测试；
+- 生产 Ed25519 私钥不在源码或 GitHub；CI 仅产出无签名候选和仅供核对的 `candidate-provenance.json`。新增独立工具可在再次获得明确确认后，把现有 seed 一次性迁移为 Argon2id + XChaCha20-Poly1305 加密的可移动 `.m2key`，不绑定 Windows 用户或单机；旧 DPAPI 文件不会删除。密码和解密 seed 只在非分发 Rust 工具内存中存在，不通过参数、环境、日志或临时文件。Agent 只能使用合成 seed 测试，真实生产迁移或轮换必须重新取得所有者明确确认；公钥、updater、签名格式和八项 Release schema 保持不变；
 - 仓库不得包含密钥、个人路径、真实索引数据库或私密截图。
 
 ## 修改路由
@@ -188,13 +190,9 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 
 ## 当前发布状态
 
-- 当前工作树已一致提升为 `0.5.11`；它取消自动匹配待确认区间、保留主查询第一项的直接绑定信号，并通过 migration 0010 增加仅由人工确认产生的本地标题别名。当前改动尚未提交、打 tag 或发布；
-- 当前工作树已通过 TypeScript typecheck、前端 production build、109 项仓库契约；在 CI 固定的 Rust `1.88.0` 上通过 fmt、189 项默认测试（另有 5 项实网测试在默认门禁中按设计忽略）和 Clippy `-D warnings`；随后显式执行这 5 项 Bangumi 动画、真人影视、罗马字别名与封面实网回归，全部通过。独立离线密钥初始化 crate 的 fmt、11 项非生产测试和 Clippy `-D warnings` 也已通过；
-- 用户已在 Agent 无法访问的隔离 Windows 环境中初始化新的生产 seed，并只把规范的 32-byte Base64 公钥带回 `src-tauri/update-public-key.txt`；该公钥已确认不同于 `v0.5.10`，开发工作区未发现 DPAPI seed。所有主程序、helper、NSIS、Portable、签名和 manifest 必须从这一新公钥状态重新生成，旧候选一律不得复用；
-- `.github/workflows/windows-release.yml` 为 Rust 1.88 最小 profile 显式安装 `rustfmt` 和 `clippy`，tag 构建只生成短期无签名候选，不接触生产私钥或自动发布；
-- `bundle/M2Shelf-Portable-0.5.11-x64.zip`（8,038,060 bytes，SHA-256 `06c4bb93911db67ae96909430c9f6268bd38e5283e7de72f5c737333c053f892`）与 `bundle/M2Shelf-Setup-0.5.11-x64.exe`（5,095,814 bytes，SHA-256 `b5a4f10c89145d64010c3f35949cd0d77996c764323d5cc613c086e7c9c88141`）已从新公钥工作树重新构建；随包 helper SHA-256 为 `85c03e8a32fe5a6df8325db870c2a2e0dfe8401e33bd4b794e77e9d8e132d743`；
-- 正式构建脚本已验证 x64 主程序、NSIS、helper、产品版本、helper identity、新嵌入公钥、Portable 固定五文件、内部哈希、输入新鲜度与个人路径扫描；解压后的 Portable 在临时目录完成六秒隐藏启动冒烟并保持存活；
-- 这些本地产物仍是发布前验证候选，尚未取得 tag CI attestation，也未由隔离生产 seed 生成 Ed25519 `.sig` 与 `latest.json`，因此不得作为正式更新 Release 发布或替代随后从 tag CI 获取并验真的候选；
-- `v0.5.8` annotated tag 保留为不可变失败记录，`v0.5.9` annotated tag 保留为最终修复前的不可变未发布记录，`v0.5.10` annotated tag 保留为最终匹配修复和生产密钥轮换前的不可变未发布记录；三者均没有 Release。README 在正式 `v0.5.11` Release 完成前继续指向 `v0.5.7`；
-- `0.5.7` 没有内置更新器，必须手动安装 `0.5.11` 这一新信任根引导版本；任何旧公钥测试包也必须手动安装。首次更新链路测试使用受控且内含新信任根的测试客户端，不能把 `v0.5.8`、`v0.5.9` 或 `v0.5.10` 当作上一稳定版；
-- 任何后续 Agent 应以当前工作树的实际质量门禁、构建、tag CI、隔离签名和发布结果更新本节，不得把未运行或未公开的阶段写成已完成。
+- `v0.5.11` 已完成正式签名并作为公开稳定 Release 发布；正式集合仍严格为 Portable/NSIS 各自资产、SHA-256、Ed25519 签名边车，加 `latest.json` 和 `candidate-provenance.json` 共八项。README 已指向该公开版本；
+- `0.5.11` 是首个携带当前 updater 信任根和 Portable helper 的引导版本。`0.5.7` 及更早用户和任何旧公钥测试包必须手动安装它一次；后续版本才能沿用内置更新链；
+- `v0.5.8`、`v0.5.9`、`v0.5.10` 继续作为不可变但未发布的历史标记，不得移动、复用或视为更新授权；
+- 当前 production seed 与 `src-tauri/update-public-key.txt` 自 `v0.5.11` 起长期使用。新增 USB 流程只改变私钥静态存储和人工发版入口，不改变已发布客户端的信任链。真实 DPAPI 到 `.m2key` 的迁移尚未由本轮执行，必须等待项目所有者再次明确确认；
+- `.github/workflows/windows-release.yml` 继续只生成无签名候选和 attestation；后续发版用 `scripts/sign_update_from_usb.ps1` 生成签名返回包，再由既有 `scripts/publish_signed_release.ps1` 完成最终 helper 验签和公开发布；
+- 任何后续 Agent 应以仓库和公开 Release 的实际状态更新本节，不得把未运行的迁移、签名、测试或发布写成已完成。
