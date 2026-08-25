@@ -1039,11 +1039,11 @@ function App() {
       videos: number(progress.videosFound),
       errors: progress.errors ? t("app.scanErrorsSuffix", { count: number(progress.errors) }) : "",
     });
-    const hasAutoMatchSummary = progress.autoMatchMatched > 0 || (progress.autoMatchPending ?? 0) > 0 || progress.autoMatchUnmatched > 0 || progress.autoMatchErrors > 0;
+    const unmatched = progress.autoMatchUnmatched + (progress.autoMatchPending ?? 0);
+    const hasAutoMatchSummary = progress.autoMatchMatched > 0 || unmatched > 0 || progress.autoMatchErrors > 0;
     const autoMatchSummary = hasAutoMatchSummary ? t("app.scanAutoMatchSummary", {
       matched: number(progress.autoMatchMatched),
-      pending: number(progress.autoMatchPending ?? 0),
-      unmatched: number(progress.autoMatchUnmatched),
+      unmatched: number(unmatched),
       errors: number(progress.autoMatchErrors),
     }) : null;
     toast(autoMatchSummary ? `${summary} · ${autoMatchSummary}` : summary, progress.status === "FAILED" ? "error" : "success");

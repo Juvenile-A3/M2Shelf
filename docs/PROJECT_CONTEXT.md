@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- 版本：`0.5.10`
+- 版本：`0.5.11`
 - 目标：Windows x64 桌面应用
 - 前端：React 19、TypeScript 5.8、Vite 6
 - 客户端：Tauri 2、Rust 2021
@@ -48,6 +48,7 @@
 - `portable_update.rs`：Portable 事务准备、helper-ready、受限解包、替换、健康回执、SQLite/文件回滚和恢复提示；
 - `single_instance.rs`：Windows 单实例互斥锁及已有窗口唤醒；
 - `bin/m2shelf_updater.rs`：随 Portable 分发的更新 helper，同时为受控线下签名/发布提供严格的 identity、sign 和公钥 verify 命令。
+- `tools/offline-key-init/`：独立 Cargo crate，仅用于隔离 Windows 账号首次建立或轮换生产 Ed25519 信任根；不会进入主 crate、CI、NSIS 或 Portable，分发 updater 也不再包含 keygen。
 
 ### 配置与脚本
 
@@ -57,6 +58,7 @@
 - `scripts/validate_project.py`：跨源码和构建契约验证；
 - `scripts/run_validate.mjs`：先探测可用 Python 解释器并跳过无效的 Windows Store 别名，再运行验证器；
 - `scripts/build_windows_release.ps1`：公开 Windows 主程序、updater helper 与 NSIS 构建；验证稳定版本、x64 PE、产品元数据和隐私路径，并输出固定命名安装包及 SHA-256；
+- `scripts/build_offline_key_init.ps1`：只编译独立密钥初始化工具；先执行该 crate 的 fmt/test/clippy，再做锁定依赖、路径重映射、x64 PE、隐私扫描和 SHA-256，并只写入全新的版本化交付目录；不会运行 `init`、覆盖旧交付或接触密钥材料；
 - `scripts/build_portable.ps1`：Portable 目录和 ZIP；
 - `scripts/generate_update_manifest.ps1`：为两个固定版本化资产生成 SHA-256、Ed25519 签名边车和严格 `latest.json`；
 - `scripts/sign_update_offline.ps1`：在隔离 Windows 签名环境中核对独立保存的脚本、helper 与候选摘要后解开仓库外 seed；开发机 CurrentUser DPAPI 仅用于流程验收，不构成生产隔离；
@@ -79,6 +81,7 @@
 7. `0007_favorite_folders.sql`：`favorite_folders`、`node_favorite_folders`。
 8. `0008_bangumi_subject_type.sql`：为绑定增加 `provider_subject_type`；旧记录兼容默认动画 type 2，新绑定只允许动画 type 2 或真人影视 type 6。
 9. `0009_library_recognition_mode.sql`：为每个 Root 保存 `FOLDER` / `VIDEO_FILE` 识别方式；旧 Root 默认 `FOLDER`。
+10. `0010_confirmed_title_aliases.sql`：保存用户手动确认产生的本地标题别名观察，以来源 Node 外键级联清理，并按规范化别名建立查询索引。
 
 关键关系：
 
@@ -86,6 +89,7 @@
 - Node 通过 `parent_node_id` 形成同 Root 层级；
 - 视频和附件分别落入 `media_files` 与 `resource_files`；
 - 每个 Node 最多一个 Bangumi 绑定；
+- 人工确认别名按来源 Node 保存；同一规范化文本只有在全部观察一致指向同一 Subject 时才可复用；
 - 标签、收藏夹通过关联表实现多对多；
 - 最近观看每个 Node 一行，删除 Node 时外键级联；
 - `settings` 同时保存 AppSettings（含 `auto_check_updates`）、窗口尺寸和分作用域排序键；更新器运行态和下载进度不写入 SQLite。
@@ -98,12 +102,17 @@ Rust 先取得 Windows 单实例锁，再以隐藏状态创建主窗口，创建
 
 ### 扫描
 
-前端添加 Root 时先用四语言模态框选择识别方式，再把选择随 Root 写入 SQLite。`scanner.rs` 的 `FOLDER` 分支原样保留目录树、分类和局部扫描；`VIDEO_FILE` 分支递归只读遍历，把普通视频以真实文件路径创建为隐藏 Root 下的扁平 `AUTO_WORK` Node，每个 Node 挂一个媒体文件并独立进入绑定，BDMV 则按一套结构聚合为一个 Work。非视频资源挂在隐藏 Root，不成为作品。文件 Node 的局部重扫请求由 Rust 升级为整 Root 扫描；只有完整无错误遍历才清理未见旧 Node。`db.rs` 更新 Node、文件、计数和分类。Rust 以扫描生命周期互斥锁和独立 worker 活跃标记串行化扫描、匹配现有资源、清缓存、删除 Root 与更新退出准备；活跃状态持续到后台线程完整退出，不能在终态事件与线程收尾之间启动第二个 worker。完成后，未绑定且合格的 Node 可进入自动匹配；人工分类和应用元数据不被普通扫描覆盖。自动匹配在每个 Node 开始时发布活动项，并在结果落定后立即发布累计的成功、待确认、未匹配和错误数，前端运行横幅因此显示实时计数而非全程为零。
+前端添加 Root 时先用四语言模态框选择识别方式，再把选择随 Root 写入 SQLite。`scanner.rs` 的 `FOLDER` 分支原样保留目录树、分类和局部扫描；`VIDEO_FILE` 分支递归只读遍历，把普通视频以真实文件路径创建为隐藏 Root 下的扁平 `AUTO_WORK` Node，每个 Node 挂一个媒体文件并独立进入绑定，BDMV 则按一套结构聚合为一个 Work。非视频资源挂在隐藏 Root，不成为作品。文件 Node 的局部重扫请求由 Rust 升级为整 Root 扫描；只有完整无错误遍历才清理未见旧 Node。`db.rs` 更新 Node、文件、计数和分类。Rust 以扫描生命周期互斥锁和独立 worker 活跃标记串行化扫描、匹配现有资源、清缓存、删除 Root 与更新退出准备；活跃状态持续到后台线程完整退出，不能在终态事件与线程收尾之间启动第二个 worker。完成后，未绑定且合格的 Node 可进入自动匹配；人工分类和应用元数据不被普通扫描覆盖。自动匹配在每个 Node 开始时发布活动项，并在结果落定后立即发布累计的成功、未匹配和错误数；旧 `auto_match_pending` DTO 字段仅为前后端兼容保留且始终为零，当前界面不再展示待确认列。
 
 ### 自动匹配
 
-`title_extractor.rs` 生成结构化证据，并仅对具有年份/技术段的多点发行名把点号视为分隔符。影视发行名中的全角方括号、嵌套 HDR/字幕等技术组使用平衡括号清洗；相邻 CJK 与拉丁标题会保留组合证据并拆成独立候选，电影、影视、Movies 等通用父目录不占查询名额。`auto_match.rs` 最多发起三个搜索并公平合并候选，依据多语言标题、季度、年份和类型评分。搜索元数据已经形成高置信且含图的结果会直接使用；高置信缺图只补全胜出项，模糊结果最多补全五项，详情以两路小批并发执行。单次匹配运行最多新发起 256 个 Subject 详情请求，同一 Subject 复用本轮缓存；详情服务出现提供方级故障后本轮停止新详情请求并继续以搜索元数据保守评分。`bangumi.rs` 只请求并接收动画 type 2 与真人影视 type 6；两者都必须达到同一高置信度和领先分差才写入绑定，其他 Subject 类型保持强冲突。`provider_subject_type` 随绑定持久化，使真人影视可在重启后重新读取详情和重试封面。普通路径不替换绑定或手工封面。
-目录或显示名没有年份时，提取器会从视频文件名补取唯一占优年份，并区分标题数字、后出现的真实发行年以及 `1920x1080`、`2048×1080` 等分辨率；文件名提供后续真实年份时，会恢复 `Blade Runner 2049`、`2001 A Space Odyssey` 一类位于标题任意词位但被误作年份的四位数字。纯四位数字片名只有在文件名还提供独立发行年时才受限放行，单个歧义数字文件保持不查询。普通纯标题查询之后，只有有效主标题且未占满三次查询预算时才补充“作品名 + 年份”，所以不会替换文件原名、父目录或多语言独立候选。
+`title_extractor.rs` 生成结构化证据，并仅对具有年份/技术段的多点发行名把点号视为分隔符。影视发行名中的全角方括号、嵌套 HDR/字幕等技术组使用平衡括号清洗；相邻 CJK 与拉丁标题会保留组合证据并拆成独立候选，电影、影视、Movies 等通用父目录不占查询名额。显示名与真实名不同的情况下，真实文件夹或文件标题仍紧随主标题进入三查询计划。`auto_match.rs` 公平合并最多三个官方搜索的候选，依据多语言标题、季度、年份、版本和类型评分。搜索元数据已经形成高置信且含图的结果会直接使用；高置信缺图只补全胜出项，其余结果最多补全五项，详情以两路小批并发执行。单次匹配运行最多新发起 256 个 Subject 详情请求，同一 Subject 复用本轮缓存；预算允许时为每个后续 Node 预留一次未缓存详情机会，避免前部 Node 独占预算。详情服务出现提供方级故障后本轮停止新详情请求并继续以搜索元数据评分。
+
+最终排序后的最高候选只要达到 `direct_threshold`（当前默认 60）、没有强季度/年份/版本/类型冲突，且系列 Node 的主标题精确匹配，就直接写入绑定；不再要求与次高候选保持分差，也没有用户可见的 Pending 结果。主关键词的 Bangumi 第一项在本地证据足够具体时可提升到该直接门槛，但全部硬冲突与系列精确规则仍在提升后执行。`automatic_threshold`（当前默认 82）继续用于识别可跳过更多详情补全的高置信快路径，不是唯一写入门槛。候选同分时以提供方排名稳定决胜。`bangumi.rs` 只接受动画 type 2 与真人影视 type 6，其他 Subject 类型保持强冲突；`provider_subject_type` 随绑定持久化，使真人影视可在重启后重新读取详情和重试封面。普通路径不替换绑定或手工封面，显式批量重匹配仍经过相同直接门槛和硬冲突保护。
+
+`commands.rs` 在用户明确选择并绑定 Bangumi 条目时，从当前 Node 自身的显示名、真实文件夹或文件名和代表性视频标题生成有界清洗别名，与绑定一起事务写入 `confirmed_title_aliases`；父目录上下文、路径和自动绑定结果不会进入表，入库不会再次剥离已提取出的季数或年份。`auto_match.rs` 按证据顺序查询这些本地观察：采用第一个有记录且其全部来源一致指向一个受支持 Subject 的别名；若该高优先级别名自身有歧义就回退普通官方搜索。唯一 Subject 获得官方详情补全优先级，同时仍执行普通有界官方查询，因此别名过期、详情失败或硬冲突时可继续选择搜索候选。确认别名只提供标题精确信号，不能反向伪造官方季数、年份或版本证据；复用结果仍需通过当前 Node 的硬冲突和系列精确标题保护。清除或替换来源绑定及删除来源 Node 会移除对应观察。该机制不引入新的第三方标题 API，也不把用户本地标题上传到 Bangumi 之外的服务。
+
+目录或显示名没有年份时，提取器会从视频文件名补取唯一占优年份，并区分标题数字、后出现的真实发行年以及 `1920x1080`、`2048×1080` 等分辨率；文件名提供后续真实年份时，会恢复 `Blade Runner 2049`、`2001 A Space Odyssey` 一类位于标题任意词位但被误作年份的四位数字。包含多个不同年份的发布名或仅由文件名推断的年份作为排序证据而不构成硬冲突；明确写在目录或显示标题中的单一年份仍可阻止错误绑定。纯四位数字片名只有在文件名还提供独立发行年时才受限放行，单个歧义数字文件保持不查询。普通纯标题查询之后，只有有效主标题且未占满三次查询预算时才补充“作品名 + 年份”，所以不会替换文件原名、真实文件夹名或多语言独立候选。
 
 ### 封面
 
@@ -127,7 +136,7 @@ Bangumi 手动弹窗为每次预填、搜索和绑定维护 Node ID 与请求代
 
 NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当前目录标记、更新缓存及安装目录的 Library Root 隔离，复制已安装的可信 `M2ShelfUpdater.exe` 到应用数据事务目录，并在取得 SQLite 单写入屏障后通过 online backup 建立一致快照及长度/SHA-256 记录；该屏障保留到旧进程退出，避免快照后的写入在回滚时丢失。helper 全程持有 Windows 命名更新互斥锁，在旧程序退出前锁定、复验并密封 ZIP，原子写入 helper-ready；普通手动启动会先等待该锁。只有新版子进程携带的规范事务 ID 能同时认证精确活动事务、当前可执行文件、目标版本和 `Launched` 阶段时才允许绕过等待。helper 严格验证 ZIP 的扁平固定文件集、Portable 标记和 Windows 产品版本，在同卷暂存/备份后替换且最后处理 `M2Shelf.exe`，启动新进程并等待精确版本健康回执及完整三秒存活观察。成功后先原子写入仍保留事务材料的终态 `Completed`，完成受校验清理后再清除保留标记；下次启动会续作中断的 `Completed` 清理。失败时先确认新进程终止、逆序恢复文件，再以长度、SHA-256、SQLite `quick_check` 复验快照，预检并隔离 WAL/SHM 后原子恢复主库；无法安全恢复时保持当前数据库并保留材料。helper 异常终止留下的非终态事务会在下次启动严格识别并标为 `RECOVERY_REQUIRED`，不执行缺少可靠文件日志的猜测式回滚。回滚和人工恢复提示都持久显示到用户明确确认。
 
-`v0.5.8` 仅保留为 CI 失败的不可变历史 tag，`v0.5.9` 仅保留为最终修复前创建且未公开的不可变历史 tag；二者都没有 Release、资产或 `latest.json`，不授权更新。`0.5.10` 是第一个公开携带该更新器和 Portable helper 的引导版本，因此 `0.5.7` 及更早用户必须手动安装 `0.5.10` 一次。之后客户端才具备上述更新能力。
+`v0.5.8` 仅保留为 CI 失败的不可变历史 tag，`v0.5.9` 仅保留为最终修复前创建且未公开的不可变历史 tag，`v0.5.10` 仅保留为最终匹配修复和生产密钥轮换前创建的不可变未发布 tag；三者都没有 Release、资产或 `latest.json`，不授权更新。`0.5.11` 被指定为第一个携带该更新器、Portable helper 与新生产信任根的引导版本，只有正式签名 Release 存在后才能称为公开版本。`0.5.7` 及更早用户和任何旧公钥测试包用户都需要手动安装 `0.5.11` 一次，之后客户端才具备兼容的更新能力。
 
 ## 持久化设置
 
@@ -150,7 +159,7 @@ NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当
 - 手工封面在原子写入缓存前校验 15 MiB 上限、格式签名和像素尺寸；播放器测试有 5 秒超时；持久化 IPC 文本有后端长度上限；
 - 批量标签、收藏夹和分类操作先验证 Node 集并事务提交；
 - Portable 安装目录不得与 Library Root 重叠；更新 ZIP 仅接受固定的五个扁平普通文件，拒绝目录、链接、未知项、路径穿越、大小写重名和越界尺寸；
-- 生产 Ed25519 私钥不在源码或 GitHub；CI 仅产出无签名候选和仅供核对的 `candidate-provenance.json`。生产签名必须位于 Agent 不可访问的独立离线环境，并在解密前核对受信 attestation 或独立构建的候选摘要、manifest generator/helper 指纹以及匹配的 app ID、版本和嵌入公钥；开发机 CurrentUser DPAPI 仅用于流程测试；
+- 生产 Ed25519 私钥不在源码或 GitHub；CI 仅产出无签名候选和仅供核对的 `candidate-provenance.json`。分发 helper 不生成密钥；独立离线初始化工具把 seed 直接写成不超过 16 KiB 的 CurrentUser DPAPI 密文，拒绝覆盖、远程/设备/ADS/尾随点空格/DOS 保留名路径和重解析点，并在原子提交前后复核父链与精确文件，只允许公钥带回源码。生产签名必须位于 Agent 不可访问的独立离线环境，并在解密前核对受信 attestation 或独立构建的候选摘要、manifest generator/helper 指纹以及匹配的 app ID、版本和嵌入公钥；开发机 CurrentUser DPAPI 仅用于流程测试；
 - 仓库不得包含密钥、个人路径、真实索引数据库或私密截图。
 
 ## 修改路由
@@ -179,12 +188,13 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 
 ## 当前发布状态
 
-- 仓库源码版本已更新为 `0.5.10`；本轮包含设置页分隔线与开关一致性修复，以及电影/真人影视作品名、发行年份、数字片名和标题内四位数字的受限匹配改进；
-- 最终工作树已通过 TypeScript typecheck、前端 production build、103 项仓库契约；在 CI 固定的 Rust `1.88.0` 上通过 fmt、169 项默认测试（5 项实网测试默认忽略）和 Clippy `-D warnings`，并额外显式运行 5 项 Bangumi 动画、真人影视、罗马字别名与封面实网回归，全部通过；
+- 当前工作树已一致提升为 `0.5.11`；它取消自动匹配待确认区间、保留主查询第一项的直接绑定信号，并通过 migration 0010 增加仅由人工确认产生的本地标题别名。当前改动尚未提交、打 tag 或发布；
+- 当前工作树已通过 TypeScript typecheck、前端 production build、109 项仓库契约；在 CI 固定的 Rust `1.88.0` 上通过 fmt、189 项默认测试（另有 5 项实网测试在默认门禁中按设计忽略）和 Clippy `-D warnings`；随后显式执行这 5 项 Bangumi 动画、真人影视、罗马字别名与封面实网回归，全部通过。独立离线密钥初始化 crate 的 fmt、11 项非生产测试和 Clippy `-D warnings` 也已通过；
+- 用户已在 Agent 无法访问的隔离 Windows 环境中初始化新的生产 seed，并只把规范的 32-byte Base64 公钥带回 `src-tauri/update-public-key.txt`；该公钥已确认不同于 `v0.5.10`，开发工作区未发现 DPAPI seed。所有主程序、helper、NSIS、Portable、签名和 manifest 必须从这一新公钥状态重新生成，旧候选一律不得复用；
 - `.github/workflows/windows-release.yml` 为 Rust 1.88 最小 profile 显式安装 `rustfmt` 和 `clippy`，tag 构建只生成短期无签名候选，不接触生产私钥或自动发布；
-- 本地发布候选为 `bundle/M2Shelf-Portable-0.5.10-x64.zip`（8,202,468 bytes，SHA-256 `94631ae7aaa9a1afbc408fa72298d43d1a66e24a5c044373aa71fa3cd54aeb90`）和 `bundle/M2Shelf-Setup-0.5.10-x64.exe`（5,169,592 bytes，SHA-256 `a7f7929a0b8442b4a04c295da6009ef4d89a3163916fd848465d464f75e6631b`）；
-- 正式构建脚本已验证 x64 主程序/NSIS/helper、产品版本、helper identity、公钥、Portable 固定五文件、内部哈希、输入新鲜度和个人路径扫描；解压后的 Portable 在隔离 AppData 中完成五秒隐藏启动冒烟并保持响应；
-- 上述本地产物尚未经过隔离生产私钥的 Ed25519 签名，也没有 `.sig`、`latest.json` 或 tag CI 的受信 provenance，因此当前只能作为本地测试和离线签名候选，不能冒充正式更新 Release；
-- `v0.5.8` annotated tag 保留为不可变失败记录，`v0.5.9` annotated tag 保留为最终修复前的不可变未发布记录；二者均没有 Release。README 在正式 `v0.5.10` Release 完成前继续指向 `v0.5.7`；
-- `0.5.7` 没有内置更新器，必须手动安装 `0.5.10` 这一引导版本；首次更新链路测试使用受控且内含同一信任根的旧测试客户端，不能把 `v0.5.8` 或 `v0.5.9` 当作上一稳定版；
+- `bundle/M2Shelf-Portable-0.5.11-x64.zip`（8,038,060 bytes，SHA-256 `06c4bb93911db67ae96909430c9f6268bd38e5283e7de72f5c737333c053f892`）与 `bundle/M2Shelf-Setup-0.5.11-x64.exe`（5,095,814 bytes，SHA-256 `b5a4f10c89145d64010c3f35949cd0d77996c764323d5cc613c086e7c9c88141`）已从新公钥工作树重新构建；随包 helper SHA-256 为 `85c03e8a32fe5a6df8325db870c2a2e0dfe8401e33bd4b794e77e9d8e132d743`；
+- 正式构建脚本已验证 x64 主程序、NSIS、helper、产品版本、helper identity、新嵌入公钥、Portable 固定五文件、内部哈希、输入新鲜度与个人路径扫描；解压后的 Portable 在临时目录完成六秒隐藏启动冒烟并保持存活；
+- 这些本地产物仍是发布前验证候选，尚未取得 tag CI attestation，也未由隔离生产 seed 生成 Ed25519 `.sig` 与 `latest.json`，因此不得作为正式更新 Release 发布或替代随后从 tag CI 获取并验真的候选；
+- `v0.5.8` annotated tag 保留为不可变失败记录，`v0.5.9` annotated tag 保留为最终修复前的不可变未发布记录，`v0.5.10` annotated tag 保留为最终匹配修复和生产密钥轮换前的不可变未发布记录；三者均没有 Release。README 在正式 `v0.5.11` Release 完成前继续指向 `v0.5.7`；
+- `0.5.7` 没有内置更新器，必须手动安装 `0.5.11` 这一新信任根引导版本；任何旧公钥测试包也必须手动安装。首次更新链路测试使用受控且内含新信任根的测试客户端，不能把 `v0.5.8`、`v0.5.9` 或 `v0.5.10` 当作上一稳定版；
 - 任何后续 Agent 应以当前工作树的实际质量门禁、构建、tag CI、隔离签名和发布结果更新本节，不得把未运行或未公开的阶段写成已完成。

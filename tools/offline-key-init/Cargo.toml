@@ -1,0 +1,30 @@
+[package]
+name = "m2shelf-offline-key-init"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+autobins = false
+
+[[bin]]
+name = "M2ShelfOfflineKeyInit"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "=0.22.1"
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+sha2 = "=0.10.9"
+zeroize = "=1.9.0"
+windows-sys = { version = "=0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "unwind"
+strip = true

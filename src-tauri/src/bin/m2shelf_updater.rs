@@ -1,9 +1,5 @@
 use std::{collections::BTreeMap, env, path::PathBuf, process::ExitCode};
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use ed25519_dalek::SigningKey;
-use rand_core::OsRng;
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -21,12 +17,6 @@ fn run() -> Result<(), String> {
         .and_then(|value| value.to_str())
         .ok_or_else(usage)?;
     match command {
-        "keygen" => {
-            if args.len() != 1 {
-                return Err(usage());
-            }
-            keygen()
-        }
         "identity" => {
             if args.len() != 1 {
                 return Err(usage());
@@ -53,22 +43,6 @@ fn identity() -> Result<(), String> {
         "{}",
         serde_json::to_string(&identity)
             .map_err(|error| format!("failed to serialize signer identity: {error}"))?
-    );
-    Ok(())
-}
-
-fn keygen() -> Result<(), String> {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    eprintln!(
-        "SECURITY WARNING: stdout contains a new production-capable private key. Capture it only into an encrypted secret store; never commit, upload, log, or paste it into source files."
-    );
-    println!(
-        "M2SHELF_UPDATE_PRIVATE_KEY={}",
-        BASE64_STANDARD.encode(signing_key.to_bytes())
-    );
-    println!(
-        "M2SHELF_UPDATE_PUBLIC_KEY={}",
-        BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes())
     );
     Ok(())
 }
@@ -131,5 +105,5 @@ fn parse_options(
 }
 
 fn usage() -> String {
-    "usage: M2ShelfUpdater.exe keygen | identity | sign --version <semver> --platform <windows-x64-portable|windows-x64-nsis> --file <path> | verify --version <semver> --platform <windows-x64-portable|windows-x64-nsis> --file <path> --signature <base64> | apply --request <absolute-path>".into()
+    "usage: M2ShelfUpdater.exe identity | sign --version <semver> --platform <windows-x64-portable|windows-x64-nsis> --file <path> | verify --version <semver> --platform <windows-x64-portable|windows-x64-nsis> --file <path> --signature <base64> | apply --request <absolute-path>".into()
 }

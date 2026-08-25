@@ -140,7 +140,7 @@ pub fn run_scan_with_auto_match(
             progress.phase = ScanPhase::AutoMatching;
         }
         progress.auto_match_matched = report.matched as u64;
-        progress.auto_match_pending = report.pending as u64;
+        progress.auto_match_pending = 0;
         progress.auto_match_unmatched = report.unmatched as u64;
         progress.auto_match_errors = report.errors as u64;
     }
@@ -153,8 +153,8 @@ pub fn run_scan_with_auto_match(
             progress.status = ScanStatus::Completed;
             progress.message = Some(match auto_match_report {
                 Some(report) if report.examined > 0 || report.errors > 0 => format!(
-                    "扫描完成；自动匹配 {} 项，待确认 {} 项，未匹配 {} 项，{} 项稍后重试。",
-                    report.matched, report.pending, report.unmatched, report.errors
+                    "扫描完成；自动匹配 {} 项，未匹配 {} 项，{} 项稍后重试。",
+                    report.matched, report.unmatched, report.errors
                 ),
                 _ => "扫描完成。".into(),
             });
@@ -221,17 +221,17 @@ pub fn run_existing_content_match(
     progress.auto_match_current = report.examined as u64;
     progress.auto_match_total = nodes.len() as u64;
     progress.auto_match_matched = report.matched as u64;
-    progress.auto_match_pending = report.pending as u64;
+    progress.auto_match_pending = 0;
     progress.auto_match_unmatched = report.unmatched as u64;
     progress.auto_match_errors = report.errors as u64;
     if control.cancel.load(Ordering::Relaxed) {
         progress.status = ScanStatus::Cancelled;
-        progress.message = Some("现有资源匹配已停止；已完成的安全绑定保留。".into());
+        progress.message = Some("现有资源匹配已停止；已完成的绑定保留。".into());
     } else {
         progress.status = ScanStatus::Completed;
         progress.message = Some(format!(
-            "现有资源匹配完成；自动匹配 {} 项，待确认 {} 项，未匹配 {} 项，{} 项稍后重试。",
-            report.matched, report.pending, report.unmatched, report.errors
+            "现有资源匹配完成；自动匹配 {} 项，未匹配 {} 项，{} 项稍后重试。",
+            report.matched, report.unmatched, report.errors
         ));
     }
     let final_progress = progress.clone();
@@ -260,7 +260,7 @@ fn update_auto_match_progress(
         progress.auto_match_current = current as u64;
         progress.auto_match_total = total as u64;
         progress.auto_match_matched = report.matched as u64;
-        progress.auto_match_pending = report.pending as u64;
+        progress.auto_match_pending = 0;
         progress.auto_match_unmatched = report.unmatched as u64;
         progress.auto_match_errors = report.errors as u64;
         progress.message = Some(format!("正在自动匹配封面与标题（{current}/{total}）…"));
@@ -1777,7 +1777,6 @@ mod tests {
             auto_match::AutoMatchReport {
                 examined: 13,
                 matched: 4,
-                pending: 3,
                 unmatched: 5,
                 errors: 1,
             },
@@ -1789,7 +1788,7 @@ mod tests {
         assert_eq!(progress.auto_match_current, 13);
         assert_eq!(progress.auto_match_total, 19);
         assert_eq!(progress.auto_match_matched, 4);
-        assert_eq!(progress.auto_match_pending, 3);
+        assert_eq!(progress.auto_match_pending, 0);
         assert_eq!(progress.auto_match_unmatched, 5);
         assert_eq!(progress.auto_match_errors, 1);
     }

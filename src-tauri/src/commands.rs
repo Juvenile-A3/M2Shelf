@@ -802,6 +802,22 @@ pub async fn bind_bangumi(
     if !node.can_bind_bangumi() {
         return Err("只有作品或包含视频的系列可以绑定 Bangumi。".into());
     }
+    let media_file_names = database
+        .list_media(node_id)?
+        .into_iter()
+        .map(|file| file.file_name)
+        .collect::<Vec<_>>();
+    let parent_name = node
+        .parent_node_id
+        .and_then(|parent_id| database.get_node(parent_id).ok())
+        .map(|parent| parent.display_name);
+    let evidence = title_extractor::build_match_evidence(
+        &node.folder_name,
+        &node.display_name,
+        parent_name.as_deref(),
+        &media_file_names,
+    );
+    let confirmed_aliases = title_extractor::confirmed_alias_candidates(&evidence);
     // Detail enrichment improves multilingual metadata, but the confirmed search subject remains
     // authoritative when the optional detail request is unavailable.
     let fallback_subject = subject.clone();
@@ -815,7 +831,8 @@ pub async fn bind_bangumi(
         Ok(Err(_)) | Err(_) => fallback_subject,
     };
     let active_cache = active_cover_cache_directory(&state);
-    let previous_path = database.save_confirmed_binding(node_id, &subject)?;
+    let previous_path =
+        database.save_confirmed_binding_with_aliases(node_id, &subject, &confirmed_aliases)?;
     if let (Some(path), Ok(cache_root)) = (previous_path.as_deref(), active_cache.as_ref()) {
         let cache_operation = cache::begin_cover_cache_operation();
         remove_cached_file_if_unreferenced(&cache_operation, &database, path, cache_root);

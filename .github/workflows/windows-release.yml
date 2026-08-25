@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 concurrency:
   group: windows-release-${{ github.ref }}
@@ -147,6 +149,14 @@ jobs:
           )
           "installer=$destination" >> $env:GITHUB_OUTPUT
           "portable=$portable" >> $env:GITHUB_OUTPUT
+
+      - name: Attest unsigned release candidates
+        if: ${{ github.ref_type == 'tag' }}
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            bundle/M2Shelf-Portable-${{ steps.release.outputs.version }}-x64.zip
+            bundle/M2Shelf-Setup-${{ steps.release.outputs.version }}-x64.exe
 
       # Deliberately do not sign or publish here. The production Ed25519 private key is kept
       # offline so a compromised GitHub account/workflow cannot extract the update trust root.

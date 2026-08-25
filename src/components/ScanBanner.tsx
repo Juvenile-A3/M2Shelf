@@ -24,8 +24,7 @@ export function ScanBanner({ progress, onCancel }: ScanBannerProps) {
       </div>
       <dl>{autoMatching ? <>
         <div><dt>{t("scan.matched")}</dt><dd>{number(progress.autoMatchMatched)}</dd></div>
-        <div><dt>{t("scan.pending")}</dt><dd>{number(progress.autoMatchPending ?? 0)}</dd></div>
-        <div><dt>{t("scan.unmatched")}</dt><dd>{number(progress.autoMatchUnmatched)}</dd></div>
+        <div><dt>{t("scan.unmatched")}</dt><dd>{number(progress.autoMatchUnmatched + (progress.autoMatchPending ?? 0))}</dd></div>
       </> : <>
         <div><dt>{t("scan.directories")}</dt><dd>{number(progress.foldersScanned)}</dd></div>
         <div><dt>{t("scan.videos")}</dt><dd>{number(progress.videosFound)}</dd></div>

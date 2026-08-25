@@ -35,6 +35,7 @@ secrets.json
 *.pem
 *.key
 *.dpapi
+tools/offline-key-init/target/
 *.pfx
 *.p12
 *.tsbuildinfo

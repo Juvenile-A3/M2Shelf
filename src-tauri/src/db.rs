@@ -24,10 +24,19 @@ pub enum ConditionalBindingSave {
     Stale,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmedTitleAliasMatch {
+    pub subject_id: i64,
+    pub subject_type: i64,
+    pub matched_alias: String,
+}
+
 const MAX_BATCH_NODE_IDS: usize = 500;
 const NODE_METADATA_CHUNK_SIZE: usize = 500;
 const MAX_SEARCH_QUERY_CHARS: usize = 500;
 const MAX_DISPLAY_NAME_CHARS: usize = 240;
+const MAX_CONFIRMED_TITLE_ALIASES: usize = 32;
+const MAX_CONFIRMED_TITLE_ALIAS_CHARS: usize = 200;
 const MAX_VIDEO_EXTENSIONS: usize = 64;
 const WINDOW_SIZE_SETTING_KEY: &str = "main_window_size";
 
@@ -139,6 +148,10 @@ impl Database {
             (
                 9_i64,
                 include_str!("../migrations/0009_library_recognition_mode.sql"),
+            ),
+            (
+                10_i64,
+                include_str!("../migrations/0010_confirmed_title_aliases.sql"),
             ),
         ];
         for (version, sql) in migrations {
@@ -1401,15 +1414,79 @@ impl Database {
     /// Replaces a user-confirmed binding and clears an incompatible Bangumi cover in the same
     /// immediate transaction. This prevents an automatic cover write from landing between a
     /// stale cover snapshot and the confirmed Subject update.
+    #[allow(dead_code)] // Retained as the compatibility API for callers without alias evidence.
     pub fn save_confirmed_binding(
         &self,
         node_id: i64,
         subject: &crate::models::BangumiSubject,
     ) -> AppResult<Option<PathBuf>> {
-        match self.save_binding_transaction(node_id, subject, None)? {
+        match self.save_binding_transaction(node_id, subject, None, None)? {
             ConditionalBindingSave::Applied(path) => Ok(path),
             ConditionalBindingSave::Stale => Err("无条件人工绑定不应产生并发冲突。".to_string()),
         }
+    }
+
+    /// Replaces a user-confirmed binding and the local title observations which led to that
+    /// choice in one immediate transaction. Only cleaned title strings are stored; media paths
+    /// never enter the alias table.
+    pub fn save_confirmed_binding_with_aliases(
+        &self,
+        node_id: i64,
+        subject: &crate::models::BangumiSubject,
+        aliases: &[String],
+    ) -> AppResult<Option<PathBuf>> {
+        let aliases = sanitize_confirmed_title_aliases(aliases);
+        if aliases.is_empty() {
+            return self.save_confirmed_binding(node_id, subject);
+        }
+        match self.save_binding_transaction(node_id, subject, None, Some(&aliases))? {
+            ConditionalBindingSave::Applied(path) => Ok(path),
+            ConditionalBindingSave::Stale => Err("无条件人工绑定不应产生并发冲突。".to_string()),
+        }
+    }
+
+    /// Resolves the strongest locally learned title observation whose own history agrees on one
+    /// Bangumi Subject. An ambiguous higher-priority alias deliberately falls back to ordinary
+    /// provider search instead of guessing from weaker observations.
+    pub(crate) fn resolve_confirmed_title_alias(
+        &self,
+        aliases: &[String],
+    ) -> AppResult<Option<ConfirmedTitleAliasMatch>> {
+        let aliases = sanitize_confirmed_title_aliases(aliases);
+        if aliases.is_empty() {
+            return Ok(None);
+        }
+
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT subject_id,subject_type
+                 FROM confirmed_title_aliases WHERE normalized_alias=?1",
+            )
+            .map_err(db_error)?;
+        for (alias, normalized) in aliases {
+            let observations = statement
+                .query_map([normalized], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(db_error)?
+                .collect::<Result<Vec<(i64, i64)>, _>>()
+                .map_err(db_error)?;
+            if observations.is_empty() {
+                continue;
+            }
+            let subject = observations[0];
+            if observations
+                .iter()
+                .any(|observation| *observation != subject)
+            {
+                return Ok(None);
+            }
+            return Ok(Some(ConfirmedTitleAliasMatch {
+                subject_id: subject.0,
+                subject_type: subject.1,
+                matched_alias: alias,
+            }));
+        }
+        Ok(None)
     }
 
     /// Replaces a binding only if it still equals the Subject observed before an explicit
@@ -1421,7 +1498,7 @@ impl Database {
         expected_subject: Option<i64>,
         subject: &crate::models::BangumiSubject,
     ) -> AppResult<ConditionalBindingSave> {
-        self.save_binding_transaction(node_id, subject, Some(expected_subject))
+        self.save_binding_transaction(node_id, subject, Some(expected_subject), None)
     }
 
     fn save_binding_transaction(
@@ -1429,6 +1506,7 @@ impl Database {
         node_id: i64,
         subject: &crate::models::BangumiSubject,
         expected_subject: Option<Option<i64>>,
+        replacement_aliases: Option<&[(String, String)]>,
     ) -> AppResult<ConditionalBindingSave> {
         let mut connection = self.connect()?;
         let transaction = connection
@@ -1514,6 +1592,36 @@ impl Database {
                 ],
             )
             .map_err(db_error)?;
+        if previous_subject != Some(subject.subject_id) || replacement_aliases.is_some() {
+            transaction
+                .execute(
+                    "DELETE FROM confirmed_title_aliases WHERE source_node_id=?1",
+                    [node_id],
+                )
+                .map_err(db_error)?;
+        }
+        if let Some(aliases) = replacement_aliases {
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "INSERT INTO confirmed_title_aliases(
+                            normalized_alias,original_alias,subject_id,subject_type,source_node_id
+                         ) VALUES(?1,?2,?3,?4,?5)",
+                    )
+                    .map_err(db_error)?;
+                for (original_alias, normalized_alias) in aliases {
+                    statement
+                        .execute(params![
+                            normalized_alias,
+                            original_alias,
+                            subject.subject_id,
+                            subject.subject_type,
+                            node_id,
+                        ])
+                        .map_err(db_error)?;
+                }
+            }
+        }
         transaction.commit().map_err(db_error)?;
         Ok(ConditionalBindingSave::Applied(cleared_path))
     }
@@ -1611,6 +1719,12 @@ impl Database {
         transaction
             .execute(
                 "DELETE FROM metadata_bindings WHERE node_id=?1 AND provider='BANGUMI'",
+                [node_id],
+            )
+            .map_err(db_error)?;
+        transaction
+            .execute(
+                "DELETE FROM confirmed_title_aliases WHERE source_node_id=?1",
                 [node_id],
             )
             .map_err(db_error)?;
@@ -2675,10 +2789,76 @@ fn db_error(error: rusqlite::Error) -> String {
     format!("数据库操作失败：{error}")
 }
 
+fn sanitize_confirmed_title_aliases(aliases: &[String]) -> Vec<(String, String)> {
+    let mut sanitized = Vec::new();
+    for raw_alias in aliases {
+        if sanitized.len() >= MAX_CONFIRMED_TITLE_ALIASES {
+            break;
+        }
+        let trimmed = raw_alias.trim();
+        if trimmed.is_empty()
+            || Path::new(trimmed).is_absolute()
+            || trimmed.starts_with(r"\\")
+            || trimmed.contains('\0')
+        {
+            continue;
+        }
+        let bounded = trimmed
+            .chars()
+            .take(MAX_CONFIRMED_TITLE_ALIAS_CHARS)
+            .collect::<String>();
+        // Candidates already come from the structured title extractor. A second generic search
+        // cleanup would erase meaningful season/year qualifiers and collide seasons or remakes.
+        let original_alias = bounded
+            .trim()
+            .chars()
+            .take(MAX_CONFIRMED_TITLE_ALIAS_CHARS)
+            .collect::<String>();
+        if !(crate::title_extractor::is_safe_match_query(&original_alias)
+            || crate::title_extractor::is_four_digit_numeric_title(&original_alias))
+        {
+            continue;
+        }
+        let normalized_alias = crate::title_extractor::normalize_title_for_match(&original_alias)
+            .chars()
+            .take(MAX_CONFIRMED_TITLE_ALIAS_CHARS)
+            .collect::<String>();
+        if normalized_alias.is_empty()
+            || sanitized
+                .iter()
+                .any(|(_, existing)| existing == &normalized_alias)
+        {
+            continue;
+        }
+        sanitized.push((original_alias, normalized_alias));
+    }
+    sanitized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn test_bangumi_subject(
+        subject_id: i64,
+        subject_type: i64,
+        title: &str,
+    ) -> crate::models::BangumiSubject {
+        crate::models::BangumiSubject {
+            subject_id,
+            title: title.into(),
+            title_cn: None,
+            title_en: None,
+            title_ja: None,
+            title_ko: None,
+            match_aliases: Vec::new(),
+            date: None,
+            image_url: None,
+            summary: None,
+            subject_type,
+        }
+    }
 
     fn legacy_search_reference(
         database: &Database,
@@ -3223,6 +3403,16 @@ mod tests {
 
         let database = Database::new(path);
         database.migrate().unwrap();
+        database
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO confirmed_title_aliases(
+                    normalized_alias,original_alias,subject_id,subject_type,source_node_id
+                 ) VALUES('legacy observation','Legacy Observation',42,2,1)",
+                [],
+            )
+            .unwrap();
         database.migrate().unwrap();
         let connection = database.connect().unwrap();
         let versions: i64 = connection
@@ -3232,7 +3422,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(versions, 9);
+        assert_eq!(versions, 10);
         let recognition_mode: String = connection
             .query_row(
                 "SELECT recognition_mode FROM library_roots WHERE id=1",
@@ -3266,6 +3456,57 @@ mod tests {
         connection
             .prepare("SELECT folder_id,node_id,added_at FROM node_favorite_folders")
             .unwrap();
+        connection
+            .prepare(
+                "SELECT normalized_alias,original_alias,subject_id,subject_type,source_node_id,
+                        confirmed_at
+                 FROM confirmed_title_aliases",
+            )
+            .unwrap();
+        let alias_columns = connection
+            .prepare("PRAGMA table_info(confirmed_title_aliases)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            alias_columns,
+            vec![
+                "normalized_alias",
+                "original_alias",
+                "subject_id",
+                "subject_type",
+                "source_node_id",
+                "confirmed_at",
+            ]
+        );
+        let preserved_alias: (String, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT normalized_alias,original_alias,subject_id,subject_type,source_node_id
+                 FROM confirmed_title_aliases",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            preserved_alias,
+            (
+                "legacy observation".into(),
+                "Legacy Observation".into(),
+                42,
+                2,
+                1,
+            )
+        );
         let preserved: (
             i64,
             i64,
@@ -3292,6 +3533,254 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, (42, 2, "Original".into(), None, None, None));
+    }
+
+    #[test]
+    fn confirmed_title_aliases_resolve_only_one_observed_subject_and_are_bounded() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let database = Database::new(temp.path().join("confirmed-aliases.db"));
+        database.migrate().unwrap();
+        let root = database.add_root(&root_path, None).unwrap();
+        let connection = database.connect().unwrap();
+        let insert_node = |name: &str| {
+            connection
+                .execute(
+                    "INSERT INTO nodes(
+                        library_root_id,absolute_path,folder_name,display_name,node_type,
+                        total_video_count
+                     ) VALUES(?1,?2,?3,?3,'WORK',1)",
+                    params![root.id, root_path.join(name).to_string_lossy(), name],
+                )
+                .unwrap();
+            connection.last_insert_rowid()
+        };
+        let first_node_id = insert_node("First");
+        let agreeing_node_id = insert_node("Second");
+        let conflicting_node_id = insert_node("Third");
+        drop(connection);
+
+        let subject = test_bangumi_subject(100, 2, "Official title");
+        let aliases = vec![
+            "The Fan Translation".to_string(),
+            "THE FAN TRANSLATION".to_string(),
+            "Season 2".to_string(),
+            r"C:\Private\Anime\The Fan Translation".to_string(),
+            "x".repeat(MAX_CONFIRMED_TITLE_ALIAS_CHARS + 50),
+        ];
+        database
+            .save_confirmed_binding_with_aliases(first_node_id, &subject, &aliases)
+            .unwrap();
+        database
+            .save_confirmed_binding_with_aliases(
+                agreeing_node_id,
+                &subject,
+                &["The Fan Translation".into()],
+            )
+            .unwrap();
+
+        let resolved = database
+            .resolve_confirmed_title_alias(&["Unknown title".into(), "THE FAN TRANSLATION".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved,
+            ConfirmedTitleAliasMatch {
+                subject_id: subject.subject_id,
+                subject_type: subject.subject_type,
+                matched_alias: "THE FAN TRANSLATION".into(),
+            }
+        );
+
+        let connection = database.connect().unwrap();
+        let stored = connection
+            .prepare(
+                "SELECT original_alias,normalized_alias
+                 FROM confirmed_title_aliases WHERE source_node_id=?1 ORDER BY original_alias",
+            )
+            .unwrap()
+            .query_map([first_node_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            2,
+            "duplicates, generic labels, and paths are rejected"
+        );
+        assert!(stored.iter().all(|(original, normalized)| {
+            original.chars().count() <= MAX_CONFIRMED_TITLE_ALIAS_CHARS
+                && normalized.chars().count() <= MAX_CONFIRMED_TITLE_ALIAS_CHARS
+                && !original.contains("Private")
+        }));
+        drop(connection);
+
+        let conflicting_subject = test_bangumi_subject(200, 6, "Different official title");
+        database
+            .save_confirmed_binding_with_aliases(
+                conflicting_node_id,
+                &conflicting_subject,
+                &["Different unique translation".into()],
+            )
+            .unwrap();
+        let priority = database
+            .resolve_confirmed_title_alias(&[
+                "The Fan Translation".into(),
+                "Different unique translation".into(),
+            ])
+            .unwrap()
+            .unwrap();
+        assert_eq!(priority.subject_id, subject.subject_id);
+        assert_eq!(priority.matched_alias, "The Fan Translation");
+
+        database
+            .save_confirmed_binding_with_aliases(
+                conflicting_node_id,
+                &conflicting_subject,
+                &["The Fan Translation".into()],
+            )
+            .unwrap();
+        assert!(database
+            .resolve_confirmed_title_alias(&["The Fan Translation".into()])
+            .unwrap()
+            .is_none());
+
+        let many_aliases = (0..40)
+            .map(|index| {
+                format!(
+                    "Confirmed Alternate {}",
+                    char::from_u32(0x4e00 + index).unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        database
+            .save_confirmed_binding_with_aliases(first_node_id, &subject, &many_aliases)
+            .unwrap();
+        let count: i64 = database
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM confirmed_title_aliases WHERE source_node_id=?1",
+                [first_node_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_CONFIRMED_TITLE_ALIASES as i64);
+    }
+
+    #[test]
+    fn confirmed_title_alias_sanitizing_preserves_season_and_year_qualifiers() {
+        let aliases =
+            sanitize_confirmed_title_aliases(&["Example Show S2".into(), "Dune 2021".into()]);
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases.iter().any(
+            |(original, normalized)| original == "Example Show S2" && normalized.contains('2')
+        ));
+        assert!(aliases
+            .iter()
+            .any(|(original, normalized)| original == "Dune 2021" && normalized.ends_with("2021")));
+    }
+
+    #[test]
+    fn confirmed_title_aliases_follow_rebind_clear_and_node_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("library");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let database = Database::new(temp.path().join("confirmed-alias-cleanup.db"));
+        database.migrate().unwrap();
+        let root = database.add_root(&root_path, None).unwrap();
+        let connection = database.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO nodes(
+                    library_root_id,absolute_path,folder_name,display_name,node_type,
+                    total_video_count
+                 ) VALUES(?1,?2,'Work','Work','WORK',1)",
+                params![root.id, root_path.join("Work").to_string_lossy()],
+            )
+            .unwrap();
+        let node_id = connection.last_insert_rowid();
+        drop(connection);
+
+        let original = test_bangumi_subject(300, 2, "Original official title");
+        database
+            .save_confirmed_binding_with_aliases(
+                node_id,
+                &original,
+                &["Remembered fan title".into()],
+            )
+            .unwrap();
+        database.save_confirmed_binding(node_id, &original).unwrap();
+        assert!(database
+            .resolve_confirmed_title_alias(&["Remembered fan title".into()])
+            .unwrap()
+            .is_some());
+
+        let replacement = test_bangumi_subject(301, 2, "Replacement official title");
+        assert_eq!(
+            database
+                .save_rematched_binding_if_unchanged(
+                    node_id,
+                    Some(original.subject_id),
+                    &replacement,
+                )
+                .unwrap(),
+            ConditionalBindingSave::Applied(None)
+        );
+        assert!(database
+            .resolve_confirmed_title_alias(&["Remembered fan title".into()])
+            .unwrap()
+            .is_none());
+
+        database
+            .save_confirmed_binding_with_aliases(
+                node_id,
+                &replacement,
+                &["Replacement fan title".into()],
+            )
+            .unwrap();
+        let invalid = test_bangumi_subject(302, 99, "Invalid type");
+        assert!(database
+            .save_confirmed_binding_with_aliases(node_id, &invalid, &["Must not commit".into()],)
+            .is_err());
+        assert_eq!(
+            database
+                .get_binding(node_id)
+                .unwrap()
+                .unwrap()
+                .provider_subject_id,
+            replacement.subject_id
+        );
+        assert!(database
+            .resolve_confirmed_title_alias(&["Replacement fan title".into()])
+            .unwrap()
+            .is_some());
+
+        database.clear_binding(node_id).unwrap();
+        assert!(database
+            .resolve_confirmed_title_alias(&["Replacement fan title".into()])
+            .unwrap()
+            .is_none());
+
+        database
+            .save_confirmed_binding_with_aliases(
+                node_id,
+                &replacement,
+                &["Cascade fan title".into()],
+            )
+            .unwrap();
+        database
+            .connect()
+            .unwrap()
+            .execute("DELETE FROM nodes WHERE id=?1", [node_id])
+            .unwrap();
+        assert!(database
+            .resolve_confirmed_title_alias(&["Cascade fan title".into()])
+            .unwrap()
+            .is_none());
     }
 
     #[test]

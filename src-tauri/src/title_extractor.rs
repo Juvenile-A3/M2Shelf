@@ -4,6 +4,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::models::BangumiSearchPrefill;
 
+const MAX_CONFIRMED_ALIASES: usize = 32;
+const MAX_CONFIRMED_ALIAS_CHARS: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditionKind {
     Tv,
@@ -31,10 +34,18 @@ pub enum LanguageHint {
 pub struct MatchEvidence {
     pub original_name: String,
     pub primary_title: String,
+    /// Clean title taken from the real folder/file name when a user-edited display name became
+    /// the primary title. Keeping it explicit lets automatic and manual search try the same
+    /// useful local name before the three-query budget is exhausted.
+    pub folder_title: Option<String>,
     pub alternate_titles: Vec<String>,
     pub parent_title: Option<String>,
     pub frequent_file_title: Option<String>,
     pub year: Option<i32>,
+    /// Years written in a folder/display title are deliberate catalogue evidence. A year inferred
+    /// only from release filenames can instead be a remaster/re-encode year, so it remains useful
+    /// for ranking without becoming a hard rejection by itself.
+    pub year_is_strong: bool,
     pub season_number: Option<u16>,
     pub edition_kind: EditionKind,
     pub language_hints: Vec<LanguageHint>,
@@ -90,6 +101,11 @@ pub fn build_match_evidence(
     let media_file_year = dominant_media_file_year(media_file_names);
     let frequent_file_title = ranked_file_titles.first().cloned();
     let local_year = primary_signals.year.or(folder_signals.year);
+    let local_year_is_ambiguous = if primary_signals.year.is_some() {
+        has_multiple_distinct_year_markers(&original_name)
+    } else {
+        has_multiple_distinct_year_markers(folder_name)
+    };
     let file_corrects_title_year = frequent_file_title.as_deref().is_some_and(|file_title| {
         file_title_corrects_title_shaped_year(
             &primary_signals.cleaned_title,
@@ -115,6 +131,11 @@ pub fn build_match_evidence(
             .filter(|value| is_safe_match_query(value) || is_four_digit_numeric_title(value))
             .unwrap_or_else(|| primary_signals.cleaned_title.clone())
     };
+    let folder_title = is_useful_candidate(&folder_signals.cleaned_title)
+        .then(|| folder_signals.cleaned_title.clone())
+        .filter(|value| {
+            normalize_title_for_match(value) != normalize_title_for_match(&primary_title)
+        });
 
     let mut alternate_titles = Vec::new();
     for source in [
@@ -169,10 +190,14 @@ pub fn build_match_evidence(
     MatchEvidence {
         original_name,
         primary_title,
+        folder_title,
         alternate_titles,
         parent_title,
         frequent_file_title,
         year: resolved_year,
+        year_is_strong: local_year.is_some()
+            && !file_corrects_title_year
+            && !local_year_is_ambiguous,
         season_number: primary_signals
             .season_number
             .or(folder_signals.season_number),
@@ -185,6 +210,149 @@ pub fn build_match_evidence(
         removed_noise,
         evidence_quality,
     }
+}
+
+/// Returns bounded local title evidence suitable for a user-confirmed alias observation.
+///
+/// Only the Node's own folder/display/file-derived titles are retained. A parent title is useful
+/// for search context but is deliberately not learned as an alias for every child in that parent.
+/// The caller stores these values only in M²Shelf's database after an explicit manual binding.
+pub fn confirmed_alias_candidates(evidence: &MatchEvidence) -> Vec<String> {
+    let parent_key = evidence
+        .parent_title
+        .as_deref()
+        .map(normalize_title_for_match);
+    let mut aliases = Vec::new();
+    for candidate in std::iter::once(Some(evidence.primary_title.as_str()))
+        .chain(std::iter::once(evidence.folder_title.as_deref()))
+        .chain(std::iter::once(evidence.frequent_file_title.as_deref()))
+        .chain(
+            evidence
+                .alternate_titles
+                .iter()
+                .map(|value| Some(value.as_str())),
+        )
+        .flatten()
+    {
+        if aliases.len() >= MAX_CONFIRMED_ALIASES
+            || !is_useful_candidate(candidate)
+            || confirmed_alias_has_conflicting_qualifier(candidate, evidence)
+        {
+            continue;
+        }
+        let normalized = normalize_title_for_match(candidate);
+        if parent_key
+            .as_ref()
+            .is_some_and(|parent| parent == &normalized)
+            && normalize_title_for_match(&evidence.primary_title) != normalized
+            && evidence
+                .folder_title
+                .as_deref()
+                .is_none_or(|title| normalize_title_for_match(title) != normalized)
+            && evidence
+                .frequent_file_title
+                .as_deref()
+                .is_none_or(|title| normalize_title_for_match(title) != normalized)
+        {
+            continue;
+        }
+        push_confirmed_alias_variants(&mut aliases, candidate, evidence);
+    }
+    aliases.truncate(MAX_CONFIRMED_ALIASES);
+    aliases
+}
+
+/// Returns the exact alias spellings derived from the current Node's primary title. The automatic
+/// matcher uses this subset only to preserve the stricter Container primary-title guard; all other
+/// confirmed candidates remain exact alternate-title evidence.
+pub(crate) fn confirmed_primary_alias_candidates(evidence: &MatchEvidence) -> Vec<String> {
+    let mut aliases = Vec::new();
+    push_confirmed_alias_variants(&mut aliases, &evidence.primary_title, evidence);
+    aliases
+}
+
+fn push_confirmed_alias_variants(
+    aliases: &mut Vec<String>,
+    candidate: &str,
+    evidence: &MatchEvidence,
+) {
+    if aliases.len() >= MAX_CONFIRMED_ALIASES
+        || !is_useful_candidate(candidate)
+        || confirmed_alias_has_conflicting_qualifier(candidate, evidence)
+    {
+        return;
+    }
+    if let Some(qualified) = qualified_confirmed_alias(candidate, evidence) {
+        push_unique(aliases, qualified);
+    }
+    if aliases.len() < MAX_CONFIRMED_ALIASES {
+        if let Some(bounded) = bounded_confirmed_alias(candidate) {
+            push_unique(aliases, bounded);
+        }
+    }
+}
+
+fn confirmed_alias_has_conflicting_qualifier(candidate: &str, evidence: &MatchEvidence) -> bool {
+    let signals = extract_title_signals(candidate);
+    let season_conflicts = evidence
+        .season_number
+        .zip(signals.season_number)
+        .is_some_and(|(expected, actual)| expected != actual);
+    let year_conflicts = evidence.year_is_strong
+        && evidence
+            .year
+            .zip(signals.year)
+            .is_some_and(|(expected, actual)| expected != actual);
+    season_conflicts || year_conflicts
+}
+
+/// Reattaches only structured qualifiers which ordinary provider-query cleanup deliberately
+/// removes. The base still comes from the cleaned Node-owned evidence, so release-group and
+/// encoding noise never becomes a confirmed alias.
+fn qualified_confirmed_alias(candidate: &str, evidence: &MatchEvidence) -> Option<String> {
+    let signals = extract_title_signals(candidate);
+    let mut qualifiers = Vec::with_capacity(2);
+    if let Some(season) = evidence.season_number {
+        qualifiers.push(format!("S{season}"));
+    }
+    if evidence.year_is_strong {
+        if let Some(year) = evidence.year {
+            qualifiers.push(year.to_string());
+        }
+    }
+    if qualifiers.is_empty() {
+        return None;
+    }
+
+    let base = remove_semantic_markers(
+        &signals.cleaned_title,
+        signals.season_number,
+        EditionKind::Unknown,
+    );
+    let suffix = qualifiers.join(" ");
+    let base_limit = MAX_CONFIRMED_ALIAS_CHARS.checked_sub(suffix.chars().count() + 1)?;
+    let base = base
+        .trim()
+        .chars()
+        .take(base_limit)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if !is_useful_candidate(&base) {
+        return None;
+    }
+    bounded_confirmed_alias(&format!("{base} {suffix}"))
+}
+
+fn bounded_confirmed_alias(candidate: &str) -> Option<String> {
+    let bounded = candidate
+        .trim()
+        .chars()
+        .take(MAX_CONFIRMED_ALIAS_CHARS)
+        .collect::<String>();
+    (is_useful_candidate(&bounded)
+        && (is_safe_match_query(&bounded) || is_four_digit_numeric_title(&bounded)))
+    .then_some(bounded)
 }
 
 /// Extracts comparable title, year, season, and edition signals from either a local name or an
@@ -1081,6 +1249,39 @@ fn detect_year(value: &str) -> Option<i32> {
     detected
 }
 
+fn has_multiple_distinct_year_markers(value: &str) -> bool {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut first_year = None;
+    let mut index = 0;
+    while index + 3 < chars.len() {
+        if chars[index..index + 4]
+            .iter()
+            .all(|character| character.is_ascii_digit())
+        {
+            let left_clear = index == 0 || !chars[index - 1].is_ascii_digit();
+            let right_clear = index + 4 == chars.len() || !chars[index + 4].is_ascii_digit();
+            if left_clear && right_clear && !is_resolution_component(&chars, index) {
+                if let Ok(year) = chars[index..index + 4]
+                    .iter()
+                    .collect::<String>()
+                    .parse::<i32>()
+                {
+                    if (1900..=2099).contains(&year) {
+                        if first_year.is_some_and(|first| first != year) {
+                            return true;
+                        }
+                        first_year = Some(year);
+                    }
+                }
+            }
+            index += 4;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
 fn count_year_occurrences(value: &str, year: i32) -> usize {
     let target = year.to_string().chars().collect::<Vec<_>>();
     let characters = value.chars().collect::<Vec<_>>();
@@ -1730,6 +1931,33 @@ mod tests {
             assert_eq!(extract_search_keyword(raw), expected_title, "raw={raw}");
             assert!(is_safe_match_query(&evidence.primary_title), "raw={raw}");
         }
+        assert!(
+            build_match_evidence(
+                "Oppenheimer.2023.1080p.BluRay",
+                "Oppenheimer.2023.1080p.BluRay",
+                None,
+                &[],
+            )
+            .year_is_strong
+        );
+        assert!(
+            !build_match_evidence(
+                "Movie.1999.Remastered.2024.1080p",
+                "Movie.1999.Remastered.2024.1080p",
+                None,
+                &[],
+            )
+            .year_is_strong
+        );
+        assert!(
+            !build_match_evidence(
+                "Blade.Runner.2049.2017.1080p",
+                "Blade.Runner.2049.2017.1080p",
+                None,
+                &[],
+            )
+            .year_is_strong
+        );
     }
 
     #[test]
@@ -1906,6 +2134,80 @@ mod tests {
             .alternate_titles
             .iter()
             .any(|title| title == "A Fan English Translation"));
+    }
+
+    #[test]
+    fn confirmed_aliases_keep_node_titles_but_do_not_learn_parent_context() {
+        let evidence = build_match_evidence(
+            "斉木楠雄のΨ難",
+            "The Disastrous Life of Saiki K.",
+            Some("Anime Collection"),
+            &["Saiki Kusuo no Psi-nan 01.mkv".into()],
+        );
+        let aliases = confirmed_alias_candidates(&evidence);
+        assert!(aliases.iter().any(|alias| {
+            normalize_title_for_match(alias)
+                == normalize_title_for_match("The Disastrous Life of Saiki K.")
+        }));
+        assert!(aliases.iter().any(|alias| alias == "斉木楠雄のΨ難"));
+        assert!(aliases
+            .iter()
+            .any(|alias| alias == "Saiki Kusuo no Psi-nan"));
+        assert!(!aliases.iter().any(|alias| alias == "Anime Collection"));
+    }
+
+    #[test]
+    fn confirmed_aliases_reconstruct_strong_year_qualifiers_end_to_end() {
+        let dune_1984 = build_match_evidence("Dune 1984", "Dune 1984", None, &[]);
+        let dune_2021 = build_match_evidence("Dune 2021", "Dune 2021", None, &[]);
+
+        assert_eq!(dune_1984.primary_title, "Dune");
+        assert_eq!(dune_2021.primary_title, "Dune");
+        assert!(dune_1984.year_is_strong);
+        assert!(dune_2021.year_is_strong);
+
+        let aliases_1984 = confirmed_alias_candidates(&dune_1984);
+        let aliases_2021 = confirmed_alias_candidates(&dune_2021);
+        assert_eq!(aliases_1984.first().map(String::as_str), Some("Dune 1984"));
+        assert_eq!(aliases_2021.first().map(String::as_str), Some("Dune 2021"));
+        assert!(!aliases_1984.iter().any(|alias| alias == "Dune 2021"));
+        assert!(!aliases_2021.iter().any(|alias| alias == "Dune 1984"));
+        assert_ne!(
+            normalize_title_for_match(&aliases_1984[0]),
+            normalize_title_for_match(&aliases_2021[0])
+        );
+        assert!(aliases_1984
+            .iter()
+            .chain(&aliases_2021)
+            .all(|alias| alias.chars().count() <= MAX_CONFIRMED_ALIAS_CHARS));
+    }
+
+    #[test]
+    fn confirmed_aliases_reconstruct_distinct_seasons_end_to_end() {
+        let season_one =
+            build_match_evidence("Example Show Season 1", "Example Show Season 1", None, &[]);
+        let season_two =
+            build_match_evidence("Example Show Season 2", "Example Show Season 2", None, &[]);
+
+        assert_eq!(season_one.season_number, Some(1));
+        assert_eq!(season_two.season_number, Some(2));
+
+        let aliases_one = confirmed_alias_candidates(&season_one);
+        let aliases_two = confirmed_alias_candidates(&season_two);
+        assert_eq!(
+            aliases_one.first().map(String::as_str),
+            Some("Example Show S1")
+        );
+        assert_eq!(
+            aliases_two.first().map(String::as_str),
+            Some("Example Show S2")
+        );
+        assert!(!aliases_one.iter().any(|alias| alias == "Example Show S2"));
+        assert!(!aliases_two.iter().any(|alias| alias == "Example Show S1"));
+        assert_ne!(
+            normalize_title_for_match(&aliases_one[0]),
+            normalize_title_for_match(&aliases_two[0])
+        );
     }
 
     #[test]

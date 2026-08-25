@@ -14,6 +14,7 @@ use reqwest::{
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{cache, db::AppResult, models::BangumiSubject};
 
@@ -256,11 +257,33 @@ fn merge_subject_detail(
     })
 }
 
-const CHINESE_TITLE_LABELS: &[&str] = &["简体中文名", "中文名", "中文"];
-const ENGLISH_TITLE_LABELS: &[&str] = &["英文名", "英语名", "English"];
-const JAPANESE_TITLE_LABELS: &[&str] = &["日文名", "日本語名"];
+const CHINESE_TITLE_LABELS: &[&str] = &["简体中文名", "简体中文标题", "中文名", "中文标题", "中文"];
+const ENGLISH_TITLE_LABELS: &[&str] = &[
+    "英文名",
+    "英语名",
+    "英文标题",
+    "English",
+    "English title",
+    "English name",
+];
+const JAPANESE_TITLE_LABELS: &[&str] =
+    &["日文名", "日文标题", "日本語名", "日本語タイトル", "原文名"];
 const KOREAN_TITLE_LABELS: &[&str] = &["韩文名", "韓文名", "韩语名", "韓語名", "한국어명"];
-const GENERIC_ALIAS_LABELS: &[&str] = &["别名", "別名", "别称", "別稱", "alias", "aliases"];
+const GENERIC_ALIAS_LABELS: &[&str] = &[
+    "别名",
+    "別名",
+    "别称",
+    "別稱",
+    "又名",
+    "其他译名",
+    "其他譯名",
+    "译名",
+    "譯名",
+    "alias",
+    "aliases",
+    "synonym",
+    "synonyms",
+];
 const ROMANIZED_TITLE_LABELS: &[&str] = &[
     "罗马字",
     "羅馬字",
@@ -268,6 +291,8 @@ const ROMANIZED_TITLE_LABELS: &[&str] = &[
     "羅馬音",
     "romaji",
     "romanized",
+    "romanization",
+    "romaji title",
     "原名",
     "原作名",
 ];
@@ -443,8 +468,21 @@ fn first_infobox_value(value: &Value) -> Option<String> {
 }
 
 fn label_matches(value: &str, labels: &[&str]) -> bool {
-    let value = value.trim();
-    labels.iter().any(|label| value.eq_ignore_ascii_case(label))
+    let value = normalize_infobox_label(value);
+    labels
+        .iter()
+        .any(|label| value == normalize_infobox_label(label))
+}
+
+fn normalize_infobox_label(value: &str) -> String {
+    value
+        .nfkc()
+        .collect::<String>()
+        .trim()
+        .trim_end_matches(|character: char| {
+            character.is_whitespace() || matches!(character, ':' | '：')
+        })
+        .to_lowercase()
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -1007,6 +1045,28 @@ mod tests {
             .match_aliases
             .iter()
             .any(|value| value == "明示された日本語名"));
+    }
+
+    #[test]
+    fn infobox_title_labels_accept_nfkc_case_spacing_and_colons() {
+        let items = vec![
+            ApiInfoboxItem {
+                key: " English Title ： ".into(),
+                value: json!("Translated title"),
+            },
+            ApiInfoboxItem {
+                key: "其他譯名:".into(),
+                value: json!(["Alternate one", "Alternate two"]),
+            },
+        ];
+        assert_eq!(
+            extract_infobox_title(&items, ENGLISH_TITLE_LABELS).as_deref(),
+            Some("Translated title")
+        );
+        let aliases = extract_match_aliases(&items);
+        for expected in ["Translated title", "Alternate one", "Alternate two"] {
+            assert!(aliases.iter().any(|alias| alias == expected));
+        }
     }
 
     #[test]

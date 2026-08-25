@@ -1,6 +1,6 @@
 [package]
 name = "m2shelf"
-version = "0.5.10"
+version = "0.5.11"
 description = "A read-only visual browser for local media collections"
 authors = ["森下Undermori"]
 edition = "2021"
@@ -25,8 +25,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "system-proxy"] }
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 semver = "1"

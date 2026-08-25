@@ -497,17 +497,6 @@ pub struct ScanProgress {
     pub auto_match_errors: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CoverMatchReport {
-    pub examined: u64,
-    pub matched: u64,
-    pub pending: u64,
-    pub unmatched: u64,
-    pub errors: u64,
-    pub skipped: u64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanStarted {

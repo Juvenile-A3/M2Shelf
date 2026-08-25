@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     bangumi, cache,
-    db::{AppResult, ConditionalBindingSave, Database},
+    db::{AppResult, ConditionalBindingSave, ConfirmedTitleAliasMatch, Database},
     models::{BangumiSubject, CoverSource, MediaNode, MetadataBinding, NodeType},
     scanner::ScanTarget,
     title_extractor::{self, EditionKind, MatchEvidence},
@@ -23,7 +23,6 @@ const MAX_PARALLEL_DETAIL_FETCHES: usize = 2;
 pub struct AutoMatchReport {
     pub examined: usize,
     pub matched: usize,
-    pub pending: usize,
     pub unmatched: usize,
     pub errors: usize,
 }
@@ -50,9 +49,7 @@ pub struct MatchWeights {
     pub hierarchy_match: i32,
     pub generic_penalty: i32,
     pub automatic_threshold: i32,
-    pub pending_threshold: i32,
-    pub minimum_margin: i32,
-    pub container_minimum_margin: i32,
+    pub direct_threshold: i32,
 }
 
 impl Default for MatchWeights {
@@ -62,8 +59,8 @@ impl Default for MatchWeights {
             // Folder/display/file-derived alternates are structured title evidence, not provider
             // rank. With 42 points, even an exact alternate plus perfect similarity and first
             // provider rank topped out at 77 and could never cross the 82 automatic gate unless
-            // unrelated optional metadata happened to exist. Keep the absolute/margin/conflict
-            // gates, but allow an unambiguous exact alternate to qualify.
+            // unrelated optional metadata happened to exist. Keep the absolute eligibility and
+            // hard-conflict gates, but allow an unambiguous exact alternate to qualify.
             exact_alternate: 50,
             similarity_max: 30,
             year_match: 8,
@@ -75,9 +72,7 @@ impl Default for MatchWeights {
             hierarchy_match: 8,
             generic_penalty: -20,
             automatic_threshold: 82,
-            pending_threshold: 60,
-            minimum_margin: 15,
-            container_minimum_margin: 20,
+            direct_threshold: 60,
         }
     }
 }
@@ -105,7 +100,9 @@ pub struct CandidateScore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchConfidence {
     High,
-    Pending,
+    /// Eligible after final detail enrichment. Unlike the former Pending state, this result is
+    /// written immediately when it has no hard season/year/edition/type conflict.
+    Direct,
     Low,
 }
 
@@ -113,14 +110,21 @@ pub enum MatchConfidence {
 pub struct MatchDecision {
     pub confidence: MatchConfidence,
     pub best: Option<CandidateScore>,
-    pub second_score: Option<i32>,
-    pub score_margin: i32,
 }
 
 #[derive(Debug, Clone)]
 struct RecalledCandidate {
     subject: BangumiSubject,
     official_rank: usize,
+    primary_query_rank: Option<usize>,
+    confirmed_alias_exactness: Option<ConfirmedAliasExactness>,
+    requires_confirmed_detail: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmedAliasExactness {
+    Primary,
+    Alternate,
 }
 
 #[derive(Default)]
@@ -130,6 +134,8 @@ struct MatchRunCache {
     cover_requests_disabled: bool,
     detail_requests_disabled: bool,
     detail_fetches_started: usize,
+    detail_fetches_for_current_node: usize,
+    nodes_remaining_including_current: usize,
 }
 
 enum DetailRequestPlan {
@@ -139,6 +145,11 @@ enum DetailRequestPlan {
 }
 
 impl MatchRunCache {
+    fn begin_node(&mut self, nodes_remaining_including_current: usize) {
+        self.nodes_remaining_including_current = nodes_remaining_including_current;
+        self.detail_fetches_for_current_node = 0;
+    }
+
     fn plan_detail_request(&mut self, subject_id: i64) -> DetailRequestPlan {
         if let Some(result) = self.details.get(&subject_id) {
             return DetailRequestPlan::Cached(Box::new(result.clone()));
@@ -149,7 +160,16 @@ impl MatchRunCache {
         if self.detail_fetches_started >= MAX_DETAIL_FETCHES_PER_RUN {
             return DetailRequestPlan::Exhausted;
         }
+        // Preserve one uncached detail opportunity for each later Node whenever the remaining
+        // run-wide budget can cover it. Earlier ambiguous Nodes may still consume up to their
+        // bounded five candidates, but no longer starve the tail of an ordinary library run.
+        let remaining_budget = MAX_DETAIL_FETCHES_PER_RUN - self.detail_fetches_started;
+        let future_node_reserve = self.nodes_remaining_including_current.saturating_sub(1);
+        if self.detail_fetches_for_current_node > 0 && remaining_budget <= future_node_reserve {
+            return DetailRequestPlan::Exhausted;
+        }
         self.detail_fetches_started += 1;
+        self.detail_fetches_for_current_node += 1;
         DetailRequestPlan::Fetch
     }
 
@@ -236,8 +256,9 @@ where
         report.examined += 1;
         // Publish the active Node before its network work starts, then publish the cumulative
         // outcome immediately after it settles. Previously callers only received this first
-        // snapshot, so live matched/pending/unmatched counters stayed at zero until completion.
+        // snapshot, so live matched/unmatched counters stayed at zero until completion.
         on_progress(index + 1, total, node, report);
+        run_cache.begin_node(total.saturating_sub(index));
 
         let should_stop = match auto_match_node(
             database,
@@ -255,11 +276,6 @@ where
             Ok(AutoMatchNodeResult::MatchedWithCoverError) => {
                 report.matched += 1;
                 report.errors += 1;
-                consecutive_errors = 0;
-                false
-            }
-            Ok(AutoMatchNodeResult::Pending) => {
-                report.pending += 1;
                 consecutive_errors = 0;
                 false
             }
@@ -297,7 +313,6 @@ fn is_provider_search_failure(error: &str) -> bool {
 enum AutoMatchNodeResult {
     Matched,
     MatchedWithCoverError,
-    Pending,
     Unmatched,
     AlreadyBound,
     Cancelled,
@@ -362,25 +377,23 @@ where
         parent_name.as_deref(),
         &media_file_names,
     );
+    let confirmed_alias = database
+        .resolve_confirmed_title_alias(&title_extractor::confirmed_alias_candidates(&evidence))?;
     let decision = match assess_evidence_online(
         &evidence,
         node.node_type == NodeType::Container,
+        confirmed_alias,
         run_cache,
         is_cancelled,
     )? {
         OnlineAssessment::Decision(decision) => *decision,
         OnlineAssessment::Cancelled => return Ok(AutoMatchNodeResult::Cancelled),
     };
-    // Keep the ambiguity diagnostics available to the forthcoming review UI even though this
-    // runner currently persists only the confidence class.
-    let _decision_diagnostics = (decision.second_score, decision.score_margin);
-
     let subject = match decision.confidence {
-        MatchConfidence::High => decision
+        MatchConfidence::High | MatchConfidence::Direct => decision
             .best
             .map(|candidate| candidate.subject)
-            .ok_or_else(|| "高置信度匹配缺少 Bangumi 候选。".to_string())?,
-        MatchConfidence::Pending => return Ok(AutoMatchNodeResult::Pending),
+            .ok_or_else(|| "合格匹配缺少 Bangumi 候选。".to_string())?,
         MatchConfidence::Low => return Ok(AutoMatchNodeResult::Unmatched),
     };
     if is_cancelled() {
@@ -607,46 +620,65 @@ enum OnlineAssessment {
 fn assess_evidence_online<C>(
     evidence: &MatchEvidence,
     is_container: bool,
+    confirmed_alias: Option<ConfirmedTitleAliasMatch>,
     run_cache: &mut MatchRunCache,
     is_cancelled: &C,
 ) -> AppResult<OnlineAssessment>
 where
     C: Fn() -> bool,
 {
+    // A unique alias learned from an explicit manual binding is application-owned evidence for
+    // one exact Subject. It receives first detail priority below, while ordinary bounded search
+    // remains available if that observation is stale, conflicted, or unavailable.
     let queries = match_queries(evidence);
-    if queries.is_empty() {
+    let primary_query_index = primary_query_position(evidence, &queries);
+    if queries.is_empty() && confirmed_alias.is_none() {
         return Ok(OnlineAssessment::Decision(Box::new(MatchDecision {
             confidence: MatchConfidence::Low,
             best: None,
-            second_score: None,
-            score_margin: 0,
         })));
     }
 
+    let has_confirmed_alias = confirmed_alias.is_some();
+    let mut deferred_search_error = None;
     let mut search_results = Vec::<Vec<BangumiSubject>>::with_capacity(queries.len());
     for query in queries {
         if is_cancelled() {
             return Ok(OnlineAssessment::Cancelled);
         }
         let cache_key = title_extractor::normalize_title_for_match(&query);
-        let results = run_cache
+        let result = run_cache
             .searches
             .entry(cache_key)
             .or_insert_with(|| bangumi::search(&query, AUTO_SEARCH_LIMIT))
-            .clone()?;
+            .clone();
+        let results = match result {
+            Ok(results) => results,
+            Err(error) if has_confirmed_alias => {
+                deferred_search_error = Some(error);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         if is_cancelled() {
             return Ok(OnlineAssessment::Cancelled);
         }
         search_results.push(results.into_iter().take(AUTO_SEARCH_LIMIT).collect());
     }
-    let mut recalled = merge_search_results_fair(&search_results);
+    let mut recalled = merge_search_results_fair(&search_results, primary_query_index);
+    let confirmed_subject_id = confirmed_alias.as_ref().map(|alias| alias.subject_id);
+    if let Some(alias) = confirmed_alias {
+        let exactness = confirmed_alias_exactness(evidence, &alias.matched_alias);
+        recall_confirmed_alias(&mut recalled, alias, exactness);
+    }
 
     if recalled.is_empty() {
+        if let Some(error) = deferred_search_error {
+            return Err(error);
+        }
         return Ok(OnlineAssessment::Decision(Box::new(MatchDecision {
             confidence: MatchConfidence::Low,
             best: None,
-            second_score: None,
-            score_margin: 0,
         })));
     }
 
@@ -657,20 +689,14 @@ where
     let weights = MatchWeights::default();
     let mut preliminary = recalled
         .iter()
-        .map(|candidate| {
-            score_candidate(
-                evidence,
-                &candidate.subject,
-                candidate.official_rank,
-                &weights,
-            )
-        })
+        .map(|candidate| score_recalled_candidate(evidence, candidate, &weights))
         .collect::<Vec<_>>();
     sort_scores(&mut preliminary);
     let preliminary_decision = decide_scores(preliminary.clone(), is_container, &weights);
-    let detail_ids = detail_candidate_ids(&preliminary, &preliminary_decision);
+    let detail_ids =
+        detail_candidate_ids(&preliminary, &preliminary_decision, confirmed_subject_id);
     if detail_ids.is_empty() {
-        return Ok(OnlineAssessment::Decision(Box::new(preliminary_decision)));
+        return finish_online_assessment(preliminary_decision, deferred_search_error);
     }
 
     // Reserve each tiny batch against the run-wide budget before starting threads. The cache is
@@ -730,6 +756,7 @@ where
                     .find(|candidate| candidate.subject.subject_id == subject_id)
                 {
                     candidate.subject = subject;
+                    candidate.requires_confirmed_detail = false;
                 }
             }
         }
@@ -738,44 +765,75 @@ where
         }
     }
 
+    // A locally recalled Subject which could not be revalidated from official detail data is
+    // discarded. Search-backed candidates remain usable when optional enrichment fails.
+    discard_unvalidated_confirmed_aliases(&mut recalled);
     let scored = recalled
         .into_iter()
-        .map(|candidate| {
-            score_candidate(
-                evidence,
-                &candidate.subject,
-                candidate.official_rank,
-                &weights,
-            )
-        })
+        .map(|candidate| score_recalled_candidate(evidence, &candidate, &weights))
         .collect::<Vec<_>>();
-    Ok(OnlineAssessment::Decision(Box::new(decide_scores(
-        scored,
-        is_container,
-        &weights,
-    ))))
+    finish_online_assessment(
+        decide_scores(scored, is_container, &weights),
+        deferred_search_error,
+    )
 }
 
-fn detail_candidate_ids(preliminary: &[CandidateScore], decision: &MatchDecision) -> Vec<i64> {
+fn discard_unvalidated_confirmed_aliases(recalled: &mut Vec<RecalledCandidate>) {
+    recalled.retain(|candidate| !candidate.requires_confirmed_detail);
+}
+
+fn finish_online_assessment(
+    decision: MatchDecision,
+    deferred_search_error: Option<String>,
+) -> AppResult<OnlineAssessment> {
+    if decision.confidence == MatchConfidence::Low {
+        if let Some(error) = deferred_search_error {
+            return Err(error);
+        }
+    }
+    Ok(OnlineAssessment::Decision(Box::new(decision)))
+}
+
+fn detail_candidate_ids(
+    preliminary: &[CandidateScore],
+    decision: &MatchDecision,
+    priority_subject_id: Option<i64>,
+) -> Vec<i64> {
+    let mut ids = Vec::new();
+    if let Some(subject_id) = priority_subject_id {
+        ids.push(subject_id);
+    }
     if decision.confidence == MatchConfidence::High {
-        return decision
+        if let Some(best) = decision
             .best
             .as_ref()
             .filter(|best| best.subject.image_url.is_none())
-            .map(|best| vec![best.subject.subject_id])
-            .unwrap_or_default();
+        {
+            if !ids.contains(&best.subject.subject_id) {
+                ids.push(best.subject.subject_id);
+            }
+        }
+        ids.truncate(MAX_DETAIL_ENRICHMENTS);
+        return ids;
     }
-    preliminary
-        .iter()
-        .take(MAX_DETAIL_ENRICHMENTS)
-        .map(|score| score.subject.subject_id)
-        .collect()
+    for score in preliminary {
+        if !ids.contains(&score.subject.subject_id) {
+            ids.push(score.subject.subject_id);
+        }
+        if ids.len() >= MAX_DETAIL_ENRICHMENTS {
+            break;
+        }
+    }
+    ids
 }
 
 /// Merges provider results by rank round instead of allowing the earliest query to fill the
 /// bounded candidate pool first. Query order remains the deterministic tie-breaker within a
 /// rank, while each query gets an equal opportunity to contribute candidates.
-fn merge_search_results_fair(search_results: &[Vec<BangumiSubject>]) -> Vec<RecalledCandidate> {
+fn merge_search_results_fair(
+    search_results: &[Vec<BangumiSubject>],
+    primary_query_index: Option<usize>,
+) -> Vec<RecalledCandidate> {
     let max_rank = search_results
         .iter()
         .map(|results| results.len().min(AUTO_SEARCH_LIMIT))
@@ -785,7 +843,7 @@ fn merge_search_results_fair(search_results: &[Vec<BangumiSubject>]) -> Vec<Reca
     let mut subject_indexes = HashMap::<i64, usize>::new();
 
     'rank_rounds: for rank in 0..max_rank {
-        for results in search_results {
+        for (query_index, results) in search_results.iter().enumerate() {
             let Some(subject) = results.get(rank) else {
                 continue;
             };
@@ -795,12 +853,22 @@ fn merge_search_results_fair(search_results: &[Vec<BangumiSubject>]) -> Vec<Reca
             if let Some(existing_index) = subject_indexes.get(&subject.subject_id).copied() {
                 recalled[existing_index].official_rank =
                     recalled[existing_index].official_rank.min(rank);
+                if primary_query_index == Some(query_index) {
+                    recalled[existing_index].primary_query_rank = Some(
+                        recalled[existing_index]
+                            .primary_query_rank
+                            .map_or(rank, |existing| existing.min(rank)),
+                    );
+                }
                 continue;
             }
             subject_indexes.insert(subject.subject_id, recalled.len());
             recalled.push(RecalledCandidate {
                 subject: subject.clone(),
                 official_rank: rank,
+                primary_query_rank: (primary_query_index == Some(query_index)).then_some(rank),
+                confirmed_alias_exactness: None,
+                requires_confirmed_detail: false,
             });
             if recalled.len() >= MAX_CANDIDATES_PER_NODE {
                 break 'rank_rounds;
@@ -809,6 +877,83 @@ fn merge_search_results_fair(search_results: &[Vec<BangumiSubject>]) -> Vec<Reca
     }
 
     recalled
+}
+
+fn recall_confirmed_alias(
+    recalled: &mut Vec<RecalledCandidate>,
+    alias: ConfirmedTitleAliasMatch,
+    exactness: ConfirmedAliasExactness,
+) {
+    if !bangumi::is_supported_subject_type(alias.subject_type) {
+        return;
+    }
+    if let Some(candidate) = recalled
+        .iter_mut()
+        .find(|candidate| candidate.subject.subject_id == alias.subject_id)
+    {
+        if candidate.subject.subject_type != alias.subject_type {
+            return;
+        }
+        candidate.confirmed_alias_exactness = Some(exactness);
+        return;
+    }
+    recalled.push(RecalledCandidate {
+        subject: BangumiSubject {
+            subject_id: alias.subject_id,
+            title: String::new(),
+            title_cn: None,
+            title_en: None,
+            title_ja: None,
+            title_ko: None,
+            match_aliases: Vec::new(),
+            date: None,
+            image_url: None,
+            summary: None,
+            subject_type: alias.subject_type,
+        },
+        official_rank: usize::MAX,
+        primary_query_rank: None,
+        confirmed_alias_exactness: Some(exactness),
+        requires_confirmed_detail: true,
+    });
+}
+
+fn score_recalled_candidate(
+    evidence: &MatchEvidence,
+    candidate: &RecalledCandidate,
+    weights: &MatchWeights,
+) -> CandidateScore {
+    let mut score = score_candidate(
+        evidence,
+        &candidate.subject,
+        candidate.official_rank,
+        weights,
+    );
+    if let Some(exactness) = candidate.confirmed_alias_exactness {
+        let primary_exact = exactness == ConfirmedAliasExactness::Primary;
+        let alternate_exact = exactness == ConfirmedAliasExactness::Alternate;
+        score.primary_exact |= primary_exact;
+        score.alternate_exact |= alternate_exact;
+        score.similarity_score = score.similarity_score.max(weights.similarity_max);
+        let exact_weight = if primary_exact {
+            weights.exact_primary
+        } else {
+            weights.exact_alternate
+        };
+        score.score = score
+            .score
+            .max((exact_weight + weights.similarity_max).clamp(0, 100));
+    }
+    // Bangumi has already evaluated the exact cleaned primary query here. When its first eligible
+    // result has no hard conflict, preserve that provider signal instead of leaving the item in
+    // the former Pending gap merely because a fan translation is absent from provider aliases.
+    if candidate.primary_query_rank == Some(0)
+        && evidence.evidence_quality >= 40
+        && !title_extractor::is_generic_title(&evidence.primary_title)
+    {
+        score.score = score.score.max(weights.direct_threshold);
+    }
+    score
 }
 
 /// Produces up to three distinct, safe provider queries in evidence-priority order.
@@ -829,6 +974,12 @@ pub fn match_queries(evidence: &MatchEvidence) -> Vec<String> {
     } else {
         push_query(&mut queries, &evidence.primary_title)
     };
+    // Manual search starts from the real folder/file name. When a user-edited display title is
+    // primary, reserve the next slot for that same local source so automatic matching cannot miss
+    // a provider result that is immediately visible in the manual dialog.
+    if let Some(folder_title) = evidence.folder_title.as_deref() {
+        push_query(&mut queries, folder_title);
+    }
     // A folder may use a fan-created English translation that the official provider has never
     // indexed, while episode files or the parent still carry a romanized/original title. Give
     // those independent local sources first access to the two remaining bounded searches.
@@ -869,6 +1020,32 @@ pub fn match_queries(evidence: &MatchEvidence) -> Vec<String> {
     }
     queries.truncate(MAX_QUERIES_PER_NODE);
     queries
+}
+
+fn primary_query_position(evidence: &MatchEvidence, queries: &[String]) -> Option<usize> {
+    let primary = title_extractor::normalize_title_for_match(&evidence.primary_title);
+    if primary.is_empty() {
+        return None;
+    }
+    queries
+        .iter()
+        .position(|query| title_extractor::normalize_title_for_match(query) == primary)
+}
+
+fn confirmed_alias_exactness(
+    evidence: &MatchEvidence,
+    matched_alias: &str,
+) -> ConfirmedAliasExactness {
+    let matched = title_extractor::normalize_title_for_match(matched_alias);
+    if !matched.is_empty()
+        && title_extractor::confirmed_primary_alias_candidates(evidence)
+            .iter()
+            .any(|alias| title_extractor::normalize_title_for_match(alias) == matched)
+    {
+        ConfirmedAliasExactness::Primary
+    } else {
+        ConfirmedAliasExactness::Alternate
+    }
 }
 
 fn push_query(queries: &mut Vec<String>, candidate: &str) -> bool {
@@ -962,8 +1139,14 @@ pub fn score_candidate(
         if local_year == provider_year {
             score += weights.year_match;
         } else if (local_year - provider_year).abs() > 1 {
-            score += weights.year_conflict;
-            strong_conflicts.push(StrongConflict::Year);
+            if evidence.year_is_strong {
+                score += weights.year_conflict;
+                strong_conflicts.push(StrongConflict::Year);
+            } else {
+                // A lone filename year may describe a remaster/re-encode rather than the work.
+                // Keep it as a soft ranking signal but never reject an otherwise matching title.
+                score += weights.year_conflict / 3;
+            }
         }
     }
 
@@ -1071,8 +1254,9 @@ fn trailing_sequel_number(value: &str) -> Option<u16> {
     (number > 1 && number <= 99).then_some(number)
 }
 
-/// Applies absolute score, score-margin, and strong-conflict gates. Containers additionally need
-/// an exact primary title and a wider margin because a series folder often spans many Subjects.
+/// Applies the absolute score and hard-conflict gates. Provider order is the deterministic final
+/// tie-breaker, so a close second result no longer creates an un-actionable Pending state.
+/// Containers still need an exact primary title because a series folder often spans many Subjects.
 pub fn decide_scores(
     mut candidates: Vec<CandidateScore>,
     is_container: bool,
@@ -1080,33 +1264,24 @@ pub fn decide_scores(
 ) -> MatchDecision {
     sort_scores(&mut candidates);
     let best = candidates.first().cloned();
-    let second_score = candidates.get(1).map(|candidate| candidate.score);
-    let score_margin = best
-        .as_ref()
-        .map_or(0, |best| best.score - second_score.unwrap_or(0));
     let confidence = match best.as_ref() {
         Some(best)
-            if best.score >= weights.automatic_threshold
-                && score_margin
-                    >= if is_container {
-                        weights.container_minimum_margin
-                    } else {
-                        weights.minimum_margin
-                    }
-                && best.strong_conflicts.is_empty()
-                && (!is_container || best.primary_exact) =>
+            if best.strong_conflicts.is_empty()
+                && (!is_container || best.primary_exact)
+                && best.score >= weights.automatic_threshold =>
         {
             MatchConfidence::High
         }
-        Some(best) if best.score >= weights.pending_threshold => MatchConfidence::Pending,
+        Some(best)
+            if best.strong_conflicts.is_empty()
+                && (!is_container || best.primary_exact)
+                && best.score >= weights.direct_threshold =>
+        {
+            MatchConfidence::Direct
+        }
         _ => MatchConfidence::Low,
     };
-    MatchDecision {
-        confidence,
-        best,
-        second_score,
-        score_margin,
-    }
+    MatchDecision { confidence, best }
 }
 
 fn sort_scores(scores: &mut [CandidateScore]) {
@@ -1257,6 +1432,28 @@ mod tests {
         title_extractor::build_match_evidence(title, title, None, &[])
     }
 
+    fn score_confirmed_alias_after_detail(
+        evidence: &MatchEvidence,
+        matched_alias: &str,
+        detail_subject: BangumiSubject,
+    ) -> CandidateScore {
+        let exactness = confirmed_alias_exactness(evidence, matched_alias);
+        let mut recalled = Vec::new();
+        recall_confirmed_alias(
+            &mut recalled,
+            ConfirmedTitleAliasMatch {
+                subject_id: detail_subject.subject_id,
+                subject_type: bangumi::SUBJECT_TYPE_ANIME,
+                matched_alias: matched_alias.to_string(),
+            },
+            exactness,
+        );
+        assert!(recalled[0].requires_confirmed_detail);
+        recalled[0].subject = detail_subject;
+        recalled[0].requires_confirmed_detail = false;
+        score_recalled_candidate(evidence, &recalled[0], &MatchWeights::default())
+    }
+
     fn ineligible_progress_node(id: i64) -> MediaNode {
         MediaNode {
             id,
@@ -1334,7 +1531,267 @@ mod tests {
         );
         assert!(exact.score > ranked_first.score);
         assert!(exact.primary_exact);
-        assert!(ranked_first.score < weights.pending_threshold);
+        assert!(ranked_first.score < weights.direct_threshold);
+    }
+
+    #[test]
+    fn first_primary_query_result_binds_directly_without_a_margin_gate() {
+        let evidence = evidence("Fan Translated Name");
+        let weights = MatchWeights::default();
+        let recalled = merge_search_results_fair(
+            &[vec![
+                subject(1, "公式タイトル", None),
+                subject(2, "Another Work", None),
+            ]],
+            Some(0),
+        );
+        let scores = recalled
+            .iter()
+            .map(|candidate| score_recalled_candidate(&evidence, candidate, &weights))
+            .collect::<Vec<_>>();
+        let decision = decide_scores(scores, false, &weights);
+
+        assert_eq!(decision.confidence, MatchConfidence::Direct);
+        assert_eq!(decision.best.unwrap().subject.subject_id, 1);
+    }
+
+    #[test]
+    fn non_primary_fallback_query_never_receives_primary_first_result_promotion() {
+        let evidence =
+            title_extractor::build_match_evidence("Fallback Search Title", "86", None, &[]);
+        assert_eq!(evidence.primary_title, "86");
+        let queries = match_queries(&evidence);
+        assert_eq!(queries, vec!["Fallback Search Title"]);
+        let primary_query_index = primary_query_position(&evidence, &queries);
+        assert_eq!(primary_query_index, None);
+
+        let recalled = merge_search_results_fair(
+            &[vec![subject(1, "Completely Unrelated Work", None)]],
+            primary_query_index,
+        );
+        assert_eq!(recalled[0].primary_query_rank, None);
+        let score = score_recalled_candidate(&evidence, &recalled[0], &MatchWeights::default());
+        assert!(score.score < MatchWeights::default().direct_threshold);
+        assert_eq!(
+            decide_scores(vec![score], false, &MatchWeights::default()).confidence,
+            MatchConfidence::Low
+        );
+    }
+
+    #[test]
+    fn first_primary_query_result_never_overrides_a_season_conflict() {
+        let evidence = evidence("Example Show S2");
+        let weights = MatchWeights::default();
+        let recalled =
+            merge_search_results_fair(&[vec![subject(1, "Example Show", None)]], Some(0));
+        let score = score_recalled_candidate(&evidence, &recalled[0], &weights);
+        let decision = decide_scores(vec![score], false, &weights);
+
+        assert_eq!(decision.confidence, MatchConfidence::Low);
+        assert!(decision
+            .best
+            .unwrap()
+            .strong_conflicts
+            .contains(&StrongConflict::MissingSeason));
+    }
+
+    #[test]
+    fn confirmed_local_alias_recalls_only_its_official_subject_and_requires_detail() {
+        let mut recalled = Vec::new();
+        recall_confirmed_alias(
+            &mut recalled,
+            ConfirmedTitleAliasMatch {
+                subject_id: 477207,
+                subject_type: bangumi::SUBJECT_TYPE_ANIME,
+                matched_alias: "Fan Translated Name".into(),
+            },
+            ConfirmedAliasExactness::Primary,
+        );
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].subject.subject_id, 477207);
+        assert_eq!(recalled[0].subject.title, "");
+        assert!(recalled[0].subject.match_aliases.is_empty());
+        assert!(recalled[0].requires_confirmed_detail);
+        assert_eq!(
+            detail_candidate_ids(
+                &[],
+                &MatchDecision {
+                    confidence: MatchConfidence::Low,
+                    best: None,
+                },
+                Some(477207),
+            ),
+            vec![477207]
+        );
+    }
+
+    #[test]
+    fn failed_confirmed_alias_detail_leaves_search_candidates_available() {
+        let evidence = evidence("Fan Translated Name");
+        let weights = MatchWeights::default();
+        let mut recalled =
+            merge_search_results_fair(&[vec![subject(2, "Fan Translated Name", None)]], Some(0));
+        recall_confirmed_alias(
+            &mut recalled,
+            ConfirmedTitleAliasMatch {
+                subject_id: 1,
+                subject_type: bangumi::SUBJECT_TYPE_ANIME,
+                matched_alias: "Fan Translated Name".into(),
+            },
+            ConfirmedAliasExactness::Primary,
+        );
+
+        discard_unvalidated_confirmed_aliases(&mut recalled);
+        let scores = recalled
+            .iter()
+            .map(|candidate| score_recalled_candidate(&evidence, candidate, &weights))
+            .collect::<Vec<_>>();
+        let decision = decide_scores(scores, false, &weights);
+        assert_eq!(decision.confidence, MatchConfidence::High);
+        assert_eq!(decision.best.unwrap().subject.subject_id, 2);
+    }
+
+    #[test]
+    fn confirmed_alias_exactness_does_not_hide_official_season_conflict() {
+        let evidence = evidence("Example Show S2");
+        let weights = MatchWeights::default();
+        let candidate = RecalledCandidate {
+            subject: subject(1, "Example Show", None),
+            official_rank: 0,
+            primary_query_rank: None,
+            confirmed_alias_exactness: Some(ConfirmedAliasExactness::Primary),
+            requires_confirmed_detail: false,
+        };
+        let score = score_recalled_candidate(&evidence, &candidate, &weights);
+        let decision = decide_scores(vec![score], false, &weights);
+
+        assert_eq!(decision.confidence, MatchConfidence::Low);
+        assert!(decision
+            .best
+            .unwrap()
+            .strong_conflicts
+            .contains(&StrongConflict::MissingSeason));
+    }
+
+    #[test]
+    fn reconstructed_confirmed_alias_survives_detail_but_not_official_hard_conflicts() {
+        let evidence = evidence("Fan Translation Movie Season 2 2021");
+        assert_eq!(evidence.year, Some(2021));
+        assert!(evidence.year_is_strong);
+        assert_eq!(evidence.season_number, Some(2));
+        assert_eq!(evidence.edition_kind, EditionKind::Movie);
+
+        let aliases = title_extractor::confirmed_alias_candidates(&evidence);
+        let matched_alias = aliases.first().expect("qualified primary alias");
+        assert_ne!(
+            title_extractor::normalize_title_for_match(matched_alias),
+            title_extractor::normalize_title_for_match(&evidence.primary_title)
+        );
+        assert_eq!(
+            confirmed_alias_exactness(&evidence, matched_alias),
+            ConfirmedAliasExactness::Primary
+        );
+
+        let mut correct = subject(10, "公式タイトル Movie Season 2", None);
+        correct.date = Some("2021-01-01".into());
+        let correct_score =
+            score_confirmed_alias_after_detail(&evidence, matched_alias, correct.clone());
+        assert!(correct_score.primary_exact);
+        assert!(correct_score.strong_conflicts.is_empty());
+        assert_eq!(
+            decide_scores(vec![correct_score.clone()], false, &MatchWeights::default()).confidence,
+            MatchConfidence::High
+        );
+        assert_eq!(
+            decide_scores(vec![correct_score], true, &MatchWeights::default()).confidence,
+            MatchConfidence::High
+        );
+
+        let mut wrong_year = correct.clone();
+        wrong_year.date = Some("1984-01-01".into());
+        let wrong_year_score =
+            score_confirmed_alias_after_detail(&evidence, matched_alias, wrong_year);
+        assert!(wrong_year_score
+            .strong_conflicts
+            .contains(&StrongConflict::Year));
+        assert_eq!(
+            decide_scores(vec![wrong_year_score], false, &MatchWeights::default()).confidence,
+            MatchConfidence::Low
+        );
+
+        let mut wrong_season = subject(11, "公式タイトル Movie Season 1", None);
+        wrong_season.date = Some("2021-01-01".into());
+        let wrong_season_score =
+            score_confirmed_alias_after_detail(&evidence, matched_alias, wrong_season);
+        assert!(wrong_season_score
+            .strong_conflicts
+            .contains(&StrongConflict::Season));
+        assert_eq!(
+            decide_scores(vec![wrong_season_score], false, &MatchWeights::default()).confidence,
+            MatchConfidence::Low
+        );
+
+        let mut wrong_edition = subject(12, "公式タイトル OVA Season 2", None);
+        wrong_edition.date = Some("2021-01-01".into());
+        let wrong_edition_score =
+            score_confirmed_alias_after_detail(&evidence, matched_alias, wrong_edition);
+        assert!(wrong_edition_score
+            .strong_conflicts
+            .contains(&StrongConflict::Edition));
+        assert_eq!(
+            decide_scores(vec![wrong_edition_score], false, &MatchWeights::default()).confidence,
+            MatchConfidence::Low
+        );
+
+        let mut wrong_type = correct;
+        wrong_type.subject_type = 4;
+        let wrong_type_score =
+            score_confirmed_alias_after_detail(&evidence, matched_alias, wrong_type);
+        assert!(wrong_type_score
+            .strong_conflicts
+            .contains(&StrongConflict::UnsupportedSubjectType));
+        assert_eq!(
+            decide_scores(vec![wrong_type_score], false, &MatchWeights::default()).confidence,
+            MatchConfidence::Low
+        );
+    }
+
+    #[test]
+    fn first_primary_query_result_never_overrides_year_or_edition_conflicts() {
+        let weights = MatchWeights::default();
+        let mut year_evidence = evidence("Dune.2021.1080p");
+        year_evidence.year_is_strong = true;
+        let mut wrong_year = subject(1, "Unrecorded Translation", None);
+        wrong_year.date = Some("1984-01-01".into());
+        let year_candidate = RecalledCandidate {
+            subject: wrong_year,
+            official_rank: 0,
+            primary_query_rank: Some(0),
+            confirmed_alias_exactness: None,
+            requires_confirmed_detail: false,
+        };
+        let year_score = score_recalled_candidate(&year_evidence, &year_candidate, &weights);
+        assert_eq!(
+            decide_scores(vec![year_score], false, &weights).confidence,
+            MatchConfidence::Low
+        );
+
+        let mut edition_evidence = evidence("Unrecorded Translation");
+        edition_evidence.edition_kind = EditionKind::Movie;
+        let edition_candidate = RecalledCandidate {
+            subject: subject(2, "Unrecorded Translation OVA", None),
+            official_rank: 0,
+            primary_query_rank: Some(0),
+            confirmed_alias_exactness: None,
+            requires_confirmed_detail: false,
+        };
+        let edition_score =
+            score_recalled_candidate(&edition_evidence, &edition_candidate, &weights);
+        assert_eq!(
+            decide_scores(vec![edition_score], false, &weights).confidence,
+            MatchConfidence::Low
+        );
     }
 
     #[test]
@@ -1388,11 +1845,11 @@ mod tests {
         let decision = decide_scores(vec![score.clone()], false, &weights);
 
         assert_eq!(decision.confidence, MatchConfidence::High);
-        assert!(detail_candidate_ids(&[score], &decision).is_empty());
+        assert!(detail_candidate_ids(&[score], &decision, None).is_empty());
 
         let mut missing_image = decision.clone();
         missing_image.best.as_mut().unwrap().subject.image_url = None;
-        assert_eq!(detail_candidate_ids(&[], &missing_image), vec![1]);
+        assert_eq!(detail_candidate_ids(&[], &missing_image, None), vec![1]);
     }
 
     #[test]
@@ -1475,7 +1932,7 @@ mod tests {
     fn live_structured_match_accepts_an_official_romanized_alias() {
         let evidence = evidence("Code Geass: Hangyaku no Lelouch");
         let mut cache = MatchRunCache::default();
-        let decision = match assess_evidence_online(&evidence, false, &mut cache, &|| false)
+        let decision = match assess_evidence_online(&evidence, false, None, &mut cache, &|| false)
             .expect("Bangumi live assessment should succeed")
         {
             OnlineAssessment::Decision(decision) => decision,
@@ -1490,7 +1947,7 @@ mod tests {
     fn live_structured_match_accepts_a_high_confidence_live_action_movie() {
         let evidence = evidence("盗梦空间 (2010)");
         let mut cache = MatchRunCache::default();
-        let decision = match assess_evidence_online(&evidence, false, &mut cache, &|| false)
+        let decision = match assess_evidence_online(&evidence, false, None, &mut cache, &|| false)
             .expect("Bangumi live assessment should succeed")
         {
             OnlineAssessment::Decision(decision) => decision,
@@ -1654,14 +2111,60 @@ mod tests {
     }
 
     #[test]
-    fn close_top_two_candidates_are_pending_even_when_both_score_high() {
+    fn ambiguous_release_year_is_only_a_soft_ranking_signal() {
+        let evidence = evidence("Movie.1999.Remastered.2024.1080p");
+        assert_eq!(evidence.year, Some(2024));
+        assert!(!evidence.year_is_strong);
+        let mut original = subject(1, "Movie 1999", None);
+        original.date = Some("1999-01-01".into());
+        let score = score_candidate(&evidence, &original, 0, &MatchWeights::default());
+        assert!(!score.strong_conflicts.contains(&StrongConflict::Year));
+    }
+
+    #[test]
+    fn close_top_two_candidates_bind_the_provider_ranked_first_result() {
         let evidence = evidence("同名作品");
         let weights = MatchWeights::default();
         let first = score_candidate(&evidence, &subject(1, "同名作品", None), 0, &weights);
         let second = score_candidate(&evidence, &subject(2, "同名作品", None), 1, &weights);
         let decision = decide_scores(vec![first, second], false, &weights);
-        assert_eq!(decision.confidence, MatchConfidence::Pending);
-        assert!(decision.score_margin < weights.minimum_margin);
+        assert_eq!(decision.confidence, MatchConfidence::High);
+        assert_eq!(decision.best.unwrap().subject.subject_id, 1);
+    }
+
+    #[test]
+    fn medium_score_without_a_hard_conflict_is_bound_directly() {
+        let weights = MatchWeights::default();
+        let candidate = CandidateScore {
+            subject: subject(7, "Resolved title", None),
+            score: weights.direct_threshold,
+            official_rank: 0,
+            primary_exact: true,
+            alternate_exact: false,
+            similarity_score: 0,
+            strong_conflicts: Vec::new(),
+        };
+        let decision = decide_scores(vec![candidate], false, &weights);
+        assert_eq!(decision.confidence, MatchConfidence::Direct);
+        assert_eq!(decision.best.unwrap().subject.subject_id, 7);
+    }
+
+    #[test]
+    fn direct_threshold_never_overrides_a_hard_conflict() {
+        let weights = MatchWeights::default();
+        let candidate = CandidateScore {
+            subject: subject(8, "Conflicted title", None),
+            score: 100,
+            official_rank: 0,
+            primary_exact: true,
+            alternate_exact: false,
+            similarity_score: 30,
+            strong_conflicts: vec![StrongConflict::Season],
+        };
+        assert_eq!(
+            decide_scores(vec![candidate], false, &weights).confidence,
+            MatchConfidence::Low
+        );
     }
 
     #[test]
@@ -1692,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn container_requires_primary_exact_and_wider_margin() {
+    fn container_still_requires_primary_exact() {
         let weights = MatchWeights::default();
         let alternate_exact = CandidateScore {
             subject: subject(1, "Fate", None),
@@ -1705,8 +2208,22 @@ mod tests {
         };
         assert_eq!(
             decide_scores(vec![alternate_exact], true, &weights).confidence,
-            MatchConfidence::Pending
+            MatchConfidence::Low
         );
+    }
+
+    #[test]
+    fn user_edited_display_name_keeps_the_manual_folder_query_in_budget() {
+        let evidence = title_extractor::build_match_evidence(
+            "斉木楠雄のΨ難",
+            "The Disastrous Life of Saiki K.",
+            Some("Anime"),
+            &["Saiki Kusuo no Psi-nan 01.mkv".into()],
+        );
+        let queries = match_queries(&evidence);
+        assert_eq!(queries[0], "The Disastrous Life of Saiki K");
+        assert_eq!(queries[1], "斉木楠雄のΨ難");
+        assert_eq!(queries[2], "Saiki Kusuo no Psi-nan");
     }
 
     #[test]
@@ -1783,7 +2300,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let recalled = merge_search_results_fair(&search_results);
+        let recalled = merge_search_results_fair(&search_results, Some(0));
         assert_eq!(recalled.len(), MAX_CANDIDATES_PER_NODE);
         assert_eq!(
             recalled
@@ -1815,7 +2332,7 @@ mod tests {
         first_query.push(duplicate.clone());
         let second_query = vec![subject(50, "second first", None), duplicate];
 
-        let recalled = merge_search_results_fair(&[first_query, second_query]);
+        let recalled = merge_search_results_fair(&[first_query, second_query], Some(0));
         let duplicates = recalled
             .iter()
             .filter(|candidate| candidate.subject.subject_id == 99)
@@ -1835,7 +2352,7 @@ mod tests {
         );
         let game = subject_with_type(3, "Game", None, 4);
 
-        let recalled = merge_search_results_fair(&[vec![animation, live_action, game]]);
+        let recalled = merge_search_results_fair(&[vec![animation, live_action, game]], Some(0));
         assert_eq!(
             recalled
                 .iter()
@@ -1864,6 +2381,34 @@ mod tests {
             cache.plan_detail_request(MAX_DETAIL_FETCHES_PER_RUN as i64 + 1),
             DetailRequestPlan::Exhausted
         ));
+    }
+
+    #[test]
+    fn detail_budget_reserves_one_request_for_each_later_node() {
+        let mut cache = MatchRunCache {
+            detail_fetches_started: MAX_DETAIL_FETCHES_PER_RUN - 3,
+            ..MatchRunCache::default()
+        };
+        cache.begin_node(3);
+        assert!(matches!(
+            cache.plan_detail_request(1),
+            DetailRequestPlan::Fetch
+        ));
+        assert!(matches!(
+            cache.plan_detail_request(2),
+            DetailRequestPlan::Exhausted
+        ));
+        cache.begin_node(2);
+        assert!(matches!(
+            cache.plan_detail_request(2),
+            DetailRequestPlan::Fetch
+        ));
+        cache.begin_node(1);
+        assert!(matches!(
+            cache.plan_detail_request(3),
+            DetailRequestPlan::Fetch
+        ));
+        assert_eq!(cache.detail_fetches_started, MAX_DETAIL_FETCHES_PER_RUN);
     }
 
     #[test]

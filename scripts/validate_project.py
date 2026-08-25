@@ -106,6 +106,7 @@ def check_migrations() -> None:
         "0007_favorite_folders.sql",
         "0008_bangumi_subject_type.sql",
         "0009_library_recognition_mode.sql",
+        "0010_confirmed_title_aliases.sql",
     ]
     if [path.name for path in migration_paths] != expected:
         fail(f"expected exactly migrations {expected}, got {[p.name for p in migration_paths]}")
@@ -132,6 +133,7 @@ def check_migrations() -> None:
                 "watch_history",
                 "favorite_folders",
                 "node_favorite_folders",
+                "confirmed_title_aliases",
             }
             missing = required_tables - table_names(connection)
             if missing:
@@ -192,6 +194,14 @@ def check_migrations() -> None:
                     "updated_at",
                 },
                 "node_favorite_folders": {"folder_id", "node_id", "added_at"},
+                "confirmed_title_aliases": {
+                    "normalized_alias",
+                    "original_alias",
+                    "subject_id",
+                    "subject_type",
+                    "source_node_id",
+                    "confirmed_at",
+                },
             }
             for table, expected_columns in required_columns.items():
                 missing_columns = expected_columns - columns(connection, table)
@@ -277,6 +287,12 @@ def check_migrations() -> None:
                 "INSERT INTO node_favorite_folders(folder_id, node_id) VALUES (?, ?)",
                 (favorite_folder_id, node_id),
             )
+            connection.execute(
+                """INSERT INTO confirmed_title_aliases(
+                    normalized_alias, original_alias, subject_id, subject_type, source_node_id
+                ) VALUES (?, ?, ?, ?, ?)""",
+                ("fantranslatedname", "Fan Translated Name", 400602, 2, node_id),
+            )
             localized_titles = connection.execute(
                 """SELECT provider_title_cn, provider_title_en, provider_title_ja,
                           provider_title_ko, provider_subject_type
@@ -337,6 +353,8 @@ def check_migrations() -> None:
                 fail("node cascade did not remove media index rows")
             if connection.execute("SELECT COUNT(*) FROM metadata_bindings").fetchone()[0] != 0:
                 fail("node cascade did not remove binding rows")
+            if connection.execute("SELECT COUNT(*) FROM confirmed_title_aliases").fetchone()[0] != 0:
+                fail("node cascade did not remove confirmed title aliases")
             if connection.execute("SELECT COUNT(*) FROM resource_files").fetchone()[0] != 0:
                 fail("node cascade did not remove resource index rows")
             if connection.execute("SELECT COUNT(*) FROM node_tags").fetchone()[0] != 0:
@@ -522,7 +540,7 @@ def check_migrations() -> None:
         legacy.close()
 
     if len(ERRORS) == error_count_before:
-        passed("SQLite migrations 1-9, library recognition modes, multilingual titles, Bangumi subject types, user tags, watch history, favorites, upgrade preservation, and constraints")
+        passed("SQLite migrations 1-10, library recognition modes, multilingual titles, Bangumi subject types, confirmed aliases, user tags, watch history, favorites, upgrade preservation, and constraints")
 
 
 def extract_rust_commands() -> tuple[set[str], set[str]]:
@@ -890,7 +908,7 @@ def check_extensions_and_product_spec() -> None:
         "源文件只读",
         "附件",
         "Container",
-        "高置信度",
+        "直接门槛",
         "MVP 验收标准",
     )
     if len(spec.encode("utf-8")) < 5_000 or any(token not in spec for token in required_contracts):
@@ -953,6 +971,8 @@ def check_bangumi_contract() -> None:
     auto_match = read("src-tauri/src/auto_match.rs")
     extractor = read("src-tauri/src/title_extractor.rs")
     models = read("src-tauri/src/models.rs")
+    commands = read("src-tauri/src/commands.rs")
+    db = read("src-tauri/src/db.rs")
     required_request_fragments = [
         '"keyword": keyword',
         '"filter": { "type": SUPPORTED_SUBJECT_TYPES',
@@ -987,9 +1007,9 @@ def check_bangumi_contract() -> None:
             "const MAX_DETAIL_ENRICHMENTS: usize = 5",
             "pub struct MatchWeights",
             "automatic_threshold: 82",
-            "pending_threshold: 60",
-            "minimum_margin: 15",
-            "MatchConfidence::Pending",
+            "direct_threshold: 60",
+            "MatchConfidence::Direct",
+            "candidate.primary_query_rank == Some(0)",
             "best.strong_conflicts.is_empty()",
             "save_binding_if_absent",
             "save_rematched_binding_if_unchanged",
@@ -1005,7 +1025,15 @@ def check_bangumi_contract() -> None:
             "pub edition_kind: EditionKind",
             ".nfkc()",
         )
-    ) and "select_first_anime_candidate" not in auto_match
+    ) and all(
+        token not in auto_match
+        for token in (
+            "MatchConfidence::Pending",
+            "minimum_margin",
+            "pending_threshold",
+            "select_first_anime_candidate",
+        )
+    )
     if not confidence_match_contract:
         fail("Bangumi automatic binding lacks the bounded structured-confidence and mutation-guard contract")
 
@@ -1019,14 +1047,16 @@ def check_bangumi_contract() -> None:
             "exact_alternate: 50" in auto_match,
             "official_match_alias_participates_in_exact_title_scoring" in auto_match,
             "live_structured_match_accepts_an_official_romanized_alias" in auto_match,
+            "recall_confirmed_alias" in auto_match,
+            "resolve_confirmed_title_alias" in auto_match,
+            "save_confirmed_binding_with_aliases" in commands,
+            "confirmed_alias_candidates" in extractor,
             "static HTTP_CLIENT: OnceLock<Client>" in source,
         )
     )
     if not alias_match_contract:
         fail("Bangumi automatic matching does not preserve bounded official aliases or reuse its HTTP client")
 
-    commands = read("src-tauri/src/commands.rs")
-    db = read("src-tauri/src/db.rs")
     validation_region = commands[
         commands.find("fn validate_bindable_bangumi_subject") : commands.find("fn library_root_paths")
     ]
@@ -1462,6 +1492,104 @@ def check_brand_release_and_icons() -> None:
     else:
         passed("strict signed manifest, bounded HTTPS transport, and embedded-key helper identity")
 
+    offline_key_manifest = read("tools/offline-key-init/Cargo.toml")
+    offline_key_source = read("tools/offline-key-init/src/main.rs")
+    offline_key_lock = read("tools/offline-key-init/Cargo.lock")
+    offline_key_builder = read("scripts/build_offline_key_init.ps1")
+    offline_key_contract = (
+        'publish = false',
+        'name = "M2ShelfOfflineKeyInit"',
+        'base64 = "=0.22.1"',
+        'ed25519-dalek = { version = "=2.2.0"',
+        'windows-sys = { version = "=0.60.2"',
+        'zeroize = "=1.9.0"',
+        "CryptProtectData",
+        "CryptUnprotectData",
+        "CRYPTPROTECT_UI_FORBIDDEN",
+        "Zeroizing::new(signing_key.to_bytes())",
+        "Zeroizing::new(ciphertext.to_vec())",
+        "drop(recovered)",
+        "seed.zeroize()",
+        "struct DpapiOutput",
+        "wipe_before_free",
+        "slice::from_raw_parts_mut",
+        "LocalFree(self.blob.pbData.cast())",
+        "MoveFileExW",
+        "MOVEFILE_WRITE_THROUGH",
+        "GetVolumePathNameW",
+        "GetDriveTypeW",
+        "DRIVE_FIXED",
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        ".create_new(true)",
+        "validate_existing_path_chain",
+        "validate_destination_still_new",
+        "validate_windows_path_component",
+        "is_reserved_dos_device_name",
+        "MAX_DPAPI_CIPHERTEXT_LEN",
+        "validate_dpapi_ciphertext",
+        "validate_commit_preconditions",
+        "verify_committed_directory",
+        "commit_verified_directory",
+        "reject_source_repository",
+        "cleanup_exact_staging(path: &Path) -> Result<(), String>",
+        "CurrentUser-DPAPI",
+    )
+    offline_key_forbidden = (
+        "M2SHELF_UPDATE_PRIVATE_KEY={",
+        "BASE64_STANDARD.encode(seed",
+        "CRYPTPROTECT_LOCAL_MACHINE",
+        "MOVEFILE_REPLACE_EXISTING",
+        "remove_dir_all",
+    )
+    if '"keygen"' in updater_cli or "production-capable private key" in updater_cli:
+        fail("distributed updater must not expose a production-key generator")
+    elif any(
+        token not in offline_key_manifest + offline_key_source for token in offline_key_contract
+    ):
+        fail("offline production-key initializer lacks pinned dependencies or fail-closed DPAPI handling")
+    elif any(token in offline_key_source for token in offline_key_forbidden):
+        fail("offline production-key initializer may expose, weaken, overwrite, or broadly delete key material")
+    elif 'name = "m2shelf-offline-key-init"' not in offline_key_lock:
+        fail("offline production-key initializer must have an independent checked-in Cargo lockfile")
+    elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", offline_key_source + offline_key_manifest):
+        fail("offline production-key initializer contains a literal user-profile path")
+    else:
+        passed("non-distributed offline DPAPI key initializer with no stdout private-key path")
+
+    offline_key_builder_contract = (
+        "CARGO_ENCODED_RUSTFLAGS",
+        "--remap-path-prefix=",
+        "cargo fmt --manifest-path $manifestPath -- --check",
+        "cargo test --manifest-path $manifestPath --locked",
+        "cargo clippy --manifest-path $manifestPath --all-targets --locked -- -D warnings",
+        "cargo build --manifest-path $manifestPath --release --locked --bin M2ShelfOfflineKeyInit",
+        "distribution directory already exists; refusing to overwrite it",
+        "distribution directory appeared during the build; refusing to overwrite it",
+        "[System.IO.File]::Copy($sourceItem.FullName, $output, $false)",
+        "[System.IO.FileMode]::CreateNew",
+        "Assert-X64Pe -Path",
+        "Assert-NoPrivateBuildPath -Path",
+        '"bundle\\offline-key-init-v$version"',
+        "Get-FileHash -LiteralPath $outputItem.FullName -Algorithm SHA256",
+        "Existing offline key initializer checksum is not a plain file.",
+    )
+    if any(token not in offline_key_builder for token in offline_key_builder_contract):
+        fail("offline key initializer builder lacks locked x64, path-remapping, privacy, or checksum guards")
+    elif any(
+        token in offline_key_builder
+        for token in (
+            "M2SHELF_UPDATE_PRIVATE_KEY",
+            "production-seed.dpapi",
+            " --confirm ",
+            " init ",
+            "Copy-Item -LiteralPath $sourceItem.FullName -Destination $output -Force",
+            "[System.IO.Directory]::CreateDirectory($outputDirectory)",
+        )
+    ):
+        fail("offline key initializer builder must compile only and never access or create key material")
+    else:
+        passed("offline key initializer build is locked, x64, privacy-remapped, and compile-only")
+
     expected_portable_payload = [
         "M2Shelf.exe",
         "M2ShelfUpdater.exe",
@@ -1665,6 +1793,8 @@ def check_brand_release_and_icons() -> None:
         "build_portable.ps1 -SkipBuild",
         "permissions:",
         "contents: read",
+        "id-token: write",
+        "attestations: write",
         "persist-credentials: false",
         'git rev-parse --verify "$tag^{commit}"',
         "points to a different commit; refusing to attach this build",
@@ -1673,6 +1803,12 @@ def check_brand_release_and_icons() -> None:
         'repository = "${{ github.repository }}"',
         '"commit_sha=$headCommit" >> $env:GITHUB_OUTPUT',
         'commitSha = "${{ steps.release.outputs.commit_sha }}"',
+        "Attest unsigned release candidates",
+        "if: ${{ github.ref_type == 'tag' }}",
+        "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1",
+        "subject-path: |",
+        "bundle/M2Shelf-Portable-${{ steps.release.outputs.version }}-x64.zip",
+        "bundle/M2Shelf-Setup-${{ steps.release.outputs.version }}-x64.exe",
         "actions/upload-artifact@",
         "if-no-files-found: error",
         "retention-days: 14",
@@ -1701,7 +1837,9 @@ def check_brand_release_and_icons() -> None:
     elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", release_workflow):
         fail("Windows GitHub Release workflow contains a literal user-profile path")
     else:
-        passed("read-only Windows CI produces an unsigned provenance-bound candidate without secrets")
+        passed(
+            "read-only Windows CI produces an attested unsigned provenance-bound candidate without secrets"
+        )
 
     offline_publisher = read("scripts/publish_signed_release.ps1")
     offline_publisher_contract = (
@@ -1812,7 +1950,16 @@ def check_brand_release_and_icons() -> None:
         "Remove-Item -LiteralPath $stableInstaller -Force",
         "[System.IO.File]::WriteAllText(",
     )
-    if any(token not in release_builder for token in release_contract):
+    release_surfaces = (
+        release_builder
+        + portable
+        + read(".github/workflows/windows-release.yml")
+        + read("src-tauri/tauri.conf.json")
+        + read("src-tauri/Cargo.toml")
+    )
+    if "M2ShelfOfflineKeyInit" in release_surfaces:
+        fail("offline production-key initializer must never enter CI, NSIS, Portable, or the main crate")
+    elif any(token not in release_builder for token in release_contract):
         fail("public Windows release builder lacks path remapping, x64 identity, or stable NSIS output guards")
     elif not (
         release_builder.find("Push-Location $repoRoot")
@@ -2961,9 +3108,13 @@ def main() -> int:
         ("src-tauri/src/update.rs", 10_000),
         ("src-tauri/src/portable_update.rs", 10_000),
         ("src-tauri/src/bin/m2shelf_updater.rs", 2_000),
+        ("tools/offline-key-init/Cargo.toml", 500),
+        ("tools/offline-key-init/Cargo.lock", 2_000),
+        ("tools/offline-key-init/src/main.rs", 8_000),
         ("src/lib/api.ts", 1_000),
         ("src/components/TagManagerDialog.tsx", 2_000),
         ("scripts/build_portable.ps1", 1_000),
+        ("scripts/build_offline_key_init.ps1", 3_000),
         ("scripts/build_windows_release.ps1", 1_000),
         ("scripts/generate_update_manifest.ps1", 3_000),
         ("scripts/sign_update_offline.ps1", 3_000),
