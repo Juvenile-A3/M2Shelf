@@ -185,7 +185,7 @@ pub fn run_auto_match<F, C>(
     is_cancelled: C,
 ) -> AutoMatchReport
 where
-    F: FnMut(usize, usize, &MediaNode),
+    F: FnMut(usize, usize, &MediaNode, AutoMatchReport),
     C: Fn() -> bool,
 {
     let candidates = match candidates_in_targets(database, targets) {
@@ -221,7 +221,7 @@ pub fn run_match_nodes<F, C>(
     is_cancelled: C,
 ) -> AutoMatchReport
 where
-    F: FnMut(usize, usize, &MediaNode),
+    F: FnMut(usize, usize, &MediaNode, AutoMatchReport),
     C: Fn() -> bool,
 {
     let total = nodes.len();
@@ -234,9 +234,12 @@ where
             break;
         }
         report.examined += 1;
-        on_progress(index + 1, total, node);
+        // Publish the active Node before its network work starts, then publish the cumulative
+        // outcome immediately after it settles. Previously callers only received this first
+        // snapshot, so live matched/pending/unmatched counters stayed at zero until completion.
+        on_progress(index + 1, total, node, report);
 
-        match auto_match_node(
+        let should_stop = match auto_match_node(
             database,
             node,
             cache_root,
@@ -247,31 +250,40 @@ where
             Ok(AutoMatchNodeResult::Matched) => {
                 report.matched += 1;
                 consecutive_errors = 0;
+                false
             }
             Ok(AutoMatchNodeResult::MatchedWithCoverError) => {
                 report.matched += 1;
                 report.errors += 1;
                 consecutive_errors = 0;
+                false
             }
             Ok(AutoMatchNodeResult::Pending) => {
                 report.pending += 1;
                 consecutive_errors = 0;
+                false
             }
             Ok(AutoMatchNodeResult::Unmatched) => {
                 report.unmatched += 1;
                 consecutive_errors = 0;
+                false
             }
-            Ok(AutoMatchNodeResult::AlreadyBound) => consecutive_errors = 0,
-            Ok(AutoMatchNodeResult::Cancelled) => break,
+            Ok(AutoMatchNodeResult::AlreadyBound) => {
+                consecutive_errors = 0;
+                false
+            }
+            Ok(AutoMatchNodeResult::Cancelled) => true,
             Err(error) => {
                 report.errors += 1;
                 consecutive_errors += 1;
                 // One provider-wide search failure is enough to stop this run's online phase;
                 // retrying every remaining Node would multiply the same offline/429 delay.
-                if is_provider_search_failure(&error) || consecutive_errors >= 3 {
-                    break;
-                }
+                is_provider_search_failure(&error) || consecutive_errors >= 3
             }
+        };
+        on_progress(index + 1, total, node, report);
+        if should_stop {
+            break;
         }
     }
     report
@@ -1204,6 +1216,65 @@ mod tests {
 
     fn evidence(title: &str) -> MatchEvidence {
         title_extractor::build_match_evidence(title, title, None, &[])
+    }
+
+    fn ineligible_progress_node(id: i64) -> MediaNode {
+        MediaNode {
+            id,
+            library_root_id: 1,
+            parent_node_id: Some(1),
+            absolute_path: format!("C:\\media\\node-{id}"),
+            folder_name: format!("node-{id}"),
+            display_name: format!("node-{id}"),
+            node_type: NodeType::Mixed,
+            manual_type_override: false,
+            cover_source: CoverSource::Placeholder,
+            cover_cache_path: None,
+            direct_video_count: 0,
+            child_media_branch_count: 0,
+            total_video_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_seen_at: String::new(),
+            binding: None,
+            user_tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn match_progress_reports_cumulative_outcome_after_each_node() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let database = Database::new(temp.path().join("progress.db"));
+        let nodes = vec![ineligible_progress_node(2), ineligible_progress_node(3)];
+        let mut snapshots = Vec::new();
+
+        let report = run_match_nodes(
+            &database,
+            &nodes,
+            Err("unused cache"),
+            MatchWriteMode::IfAbsent,
+            |current, total, node, report| {
+                snapshots.push((current, total, node.id, report));
+            },
+            || false,
+        );
+
+        assert_eq!(report.examined, 2);
+        assert_eq!(report.unmatched, 2);
+        assert_eq!(snapshots.len(), 4);
+        assert_eq!(snapshots[0].0, 1);
+        assert_eq!(snapshots[0].1, 2);
+        assert_eq!(snapshots[0].2, 2);
+        assert_eq!(snapshots[0].3.examined, 1);
+        assert_eq!(snapshots[0].3.unmatched, 0);
+        assert_eq!(snapshots[1].3.examined, 1);
+        assert_eq!(snapshots[1].3.unmatched, 1);
+        assert_eq!(snapshots[2].0, 2);
+        assert_eq!(snapshots[2].2, 3);
+        assert_eq!(snapshots[2].3.examined, 2);
+        assert_eq!(snapshots[2].3.unmatched, 1);
+        assert_eq!(snapshots[3].3.examined, 2);
+        assert_eq!(snapshots[3].3.unmatched, 2);
     }
 
     #[test]

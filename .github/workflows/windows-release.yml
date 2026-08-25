@@ -42,7 +42,7 @@ jobs:
       - name: Select Rust 1.88
         shell: pwsh
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.88.0
 
       - name: Install frontend dependencies

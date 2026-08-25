@@ -116,8 +116,8 @@ pub fn run_scan_with_auto_match(
                         .as_ref()
                         .map(PathBuf::as_path)
                         .map_err(String::as_str),
-                    |current, total, node| {
-                        update_auto_match_progress(app, control, current, total, node)
+                    |current, total, node, report| {
+                        update_auto_match_progress(app, control, current, total, node, report)
                     },
                     || control.cancel.load(Ordering::Relaxed),
                 )
@@ -202,7 +202,9 @@ pub fn run_existing_content_match(
                 .map(PathBuf::as_path)
                 .map_err(String::as_str),
             write_mode,
-            |current, total, node| update_auto_match_progress(app, control, current, total, node),
+            |current, total, node, report| {
+                update_auto_match_progress(app, control, current, total, node, report)
+            },
             || control.cancel.load(Ordering::Relaxed),
         )
     }))
@@ -246,6 +248,7 @@ fn update_auto_match_progress(
     current: usize,
     total: usize,
     node: &crate::models::MediaNode,
+    report: auto_match::AutoMatchReport,
 ) {
     let snapshot = {
         let mut progress = control
@@ -256,6 +259,10 @@ fn update_auto_match_progress(
         progress.phase = ScanPhase::AutoMatching;
         progress.auto_match_current = current as u64;
         progress.auto_match_total = total as u64;
+        progress.auto_match_matched = report.matched as u64;
+        progress.auto_match_pending = report.pending as u64;
+        progress.auto_match_unmatched = report.unmatched as u64;
+        progress.auto_match_errors = report.errors as u64;
         progress.message = Some(format!("正在自动匹配封面与标题（{current}/{total}）…"));
         progress.clone()
     };
@@ -1716,6 +1723,76 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
+
+    #[test]
+    fn auto_match_progress_snapshot_includes_live_outcome_counts() {
+        let control = ScanControl {
+            scan_id: "progress".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(ScanProgress {
+                scan_id: "progress".into(),
+                root_id: 1,
+                current_path: String::new(),
+                folders_scanned: 0,
+                videos_found: 0,
+                status: ScanStatus::Running,
+                errors: 0,
+                message: None,
+                phase: ScanPhase::Scanning,
+                auto_match_current: 0,
+                auto_match_total: 19,
+                auto_match_matched: 0,
+                auto_match_pending: 0,
+                auto_match_unmatched: 0,
+                auto_match_errors: 0,
+            })),
+        };
+        let node = crate::models::MediaNode {
+            id: 13,
+            library_root_id: 1,
+            parent_node_id: Some(1),
+            absolute_path: r"C:\media\current".into(),
+            folder_name: "current".into(),
+            display_name: "current".into(),
+            node_type: NodeType::AutoWork,
+            manual_type_override: false,
+            cover_source: crate::models::CoverSource::Placeholder,
+            cover_cache_path: None,
+            direct_video_count: 1,
+            child_media_branch_count: 0,
+            total_video_count: 1,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_seen_at: String::new(),
+            binding: None,
+            user_tags: Vec::new(),
+        };
+
+        update_auto_match_progress(
+            None,
+            &control,
+            13,
+            19,
+            &node,
+            auto_match::AutoMatchReport {
+                examined: 13,
+                matched: 4,
+                pending: 3,
+                unmatched: 5,
+                errors: 1,
+            },
+        );
+
+        let progress = control.progress();
+        assert_eq!(progress.current_path, node.absolute_path);
+        assert_eq!(progress.phase, ScanPhase::AutoMatching);
+        assert_eq!(progress.auto_match_current, 13);
+        assert_eq!(progress.auto_match_total, 19);
+        assert_eq!(progress.auto_match_matched, 4);
+        assert_eq!(progress.auto_match_pending, 3);
+        assert_eq!(progress.auto_match_unmatched, 5);
+        assert_eq!(progress.auto_match_errors, 1);
+    }
 
     #[test]
     fn conservative_classification_matches_product_rules() {

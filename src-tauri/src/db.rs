@@ -2391,9 +2391,8 @@ fn favorite_folder_write_error(error: rusqlite::Error) -> String {
 
 fn media_columns(alias: &str) -> String {
     format!(
-        "{0}.id,{0}.node_id,{0}.absolute_path,{0}.file_name,{0}.extension,{0}.file_size,
-         {0}.modified_at,{0}.duration_ms,{0}.width,{0}.height,{0}.codec,{0}.last_seen_at",
-        alias
+        "{alias}.id,{alias}.node_id,{alias}.absolute_path,{alias}.file_name,{alias}.extension,{alias}.file_size,
+         {alias}.modified_at,{alias}.duration_ms,{alias}.width,{alias}.height,{alias}.codec,{alias}.last_seen_at"
     )
 }
 
@@ -2432,9 +2431,8 @@ fn list_media_conn(connection: &Connection, node_id: i64) -> AppResult<Vec<Media
 
 fn resource_columns(alias: &str) -> String {
     format!(
-        "{0}.id,{0}.node_id,{0}.absolute_path,{0}.file_name,{0}.extension,{0}.file_size,
-         {0}.modified_at,{0}.resource_type,{0}.last_seen_at",
-        alias
+        "{alias}.id,{alias}.node_id,{alias}.absolute_path,{alias}.file_name,{alias}.extension,{alias}.file_size,
+         {alias}.modified_at,{alias}.resource_type,{alias}.last_seen_at"
     )
 }
 

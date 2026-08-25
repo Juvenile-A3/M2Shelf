@@ -565,8 +565,8 @@ img { display: block; }
 .about-grid button svg { width: 13px; }
 .about-author-links { display: grid; justify-items: start; gap: 8px; padding-block: 8px; }
 .created-by { margin: 17px 0 0; color: #7e8683; font-size: var(--text-small); }
-.update-preferences { margin: 16px 0 12px; border-top: 1px solid var(--border-normal); }
-.update-auto-check, .update-manual-check { min-height: 58px; padding: 11px 2px; border-bottom: 1px solid var(--border-normal); }
+.update-preferences { margin: 16px 0 12px; }
+.settings-switch-row, .update-manual-check { min-height: 58px; padding: 11px 2px; border-bottom: 1px solid var(--border-normal); }
 .update-manual-check > span { min-width: 0; }
 .update-manual-check .button { flex: 0 0 auto; }
 .update-manual-check .is-busy svg, .update-actions .is-busy svg { animation: spin 1.15s linear infinite; }

@@ -90,6 +90,15 @@ pub fn build_match_evidence(
     };
 
     let mut alternate_titles = Vec::new();
+    for source in [
+        &primary_signals.cleaned_title,
+        &folder_signals.cleaned_title,
+        &display_signals.cleaned_title,
+    ] {
+        for candidate in extract_parallel_title_candidates(source) {
+            push_unique(&mut alternate_titles, candidate);
+        }
+    }
     for candidate in [
         primary_signals.series_title.clone(),
         folder_signals.cleaned_title,
@@ -279,7 +288,8 @@ fn extract_keyword_with_mode(raw_name: &str, preserve_semantics: bool) -> (Strin
         raw_name
     };
     let without_extension = strip_known_extension(source.trim());
-    let normalized_separators = normalize_release_separators(without_extension);
+    let normalized_brackets = normalize_release_brackets(without_extension);
+    let normalized_separators = normalize_release_separators(&normalized_brackets);
     let mut output = String::with_capacity(normalized_separators.len());
     let mut removed_noise = Vec::new();
     let characters = normalized_separators.chars().collect::<Vec<_>>();
@@ -288,13 +298,22 @@ fn extract_keyword_with_mode(raw_name: &str, preserve_semantics: bool) -> (Strin
 
     while index < characters.len() {
         if characters[index] == '[' {
-            if let Some(relative_end) = characters[index + 1..]
-                .iter()
-                .position(|character| *character == ']')
-            {
-                let end = index + relative_end + 1;
+            if let Some(end) = find_matching_square_bracket(&characters, index) {
                 let group = characters[index + 1..end].iter().collect::<String>();
                 let group = group.trim();
+                if group.contains('[') {
+                    let (nested_title, nested_noise) =
+                        extract_keyword_with_mode(group, preserve_semantics);
+                    removed_noise.extend(nested_noise);
+                    if !nested_title.trim().is_empty() {
+                        push_separated(&mut output, &nested_title);
+                        visible_text_seen = true;
+                    } else if !group.is_empty() {
+                        removed_noise.push(group.to_string());
+                    }
+                    index = end + 1;
+                    continue;
+                }
                 let release_prefix = !visible_text_seen
                     && (looks_like_release_group(group)
                         || (looks_like_contextual_release_identity(group)
@@ -322,6 +341,26 @@ fn extract_keyword_with_mode(raw_name: &str, preserve_semantics: bool) -> (Strin
     (cleaned, removed_noise)
 }
 
+fn find_matching_square_bracket(characters: &[char], start: usize) -> Option<usize> {
+    if characters.get(start) != Some(&'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, character) in characters.iter().enumerate().skip(start) {
+        match character {
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Scene-style movie and television releases commonly use periods as word separators, for
 /// example `The.Sword.of.Doom.1966.1080p`. Scoring ignores punctuation, but sending the whole
 /// dotted value as one token prevents the year and encode noise from being removed first. Only
@@ -344,6 +383,21 @@ fn normalize_release_separators(value: &str) -> String {
             } else {
                 character
             }
+        })
+        .collect()
+}
+
+/// Chinese movie release names frequently use full-width square brackets for the publishing
+/// site, HDR/audio variants, and subtitle labels. Normalize only square-bracket variants here so
+/// they pass through the same bounded group classifier as ordinary square brackets; quotation
+/// marks such as 「...」 remain untouched because they can be part of a real title.
+fn normalize_release_brackets(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '【' | '［' | '〔' => '[',
+            '】' | '］' | '〕' => ']',
+            _ => character,
         })
         .collect()
 }
@@ -388,6 +442,11 @@ fn looks_like_release_group(value: &str) -> bool {
         || lower.contains("字幕")
         || lower.contains("压制")
         || lower.contains("壓制")
+        || lower.contains("发布")
+        || lower.contains("發佈")
+        || lower.contains("發布")
+        || lower.contains("www ")
+        || lower.starts_with("www.")
         || (lower.contains('&')
             && lower
                 .chars()
@@ -461,13 +520,9 @@ fn has_following_title_candidate(characters: &[char], mut index: usize) -> bool 
             return false;
         }
         if characters[index] == '[' {
-            let Some(relative_end) = characters[index + 1..]
-                .iter()
-                .position(|character| *character == ']')
-            else {
+            let Some(end) = find_matching_square_bracket(characters, index) else {
                 return false;
             };
-            let end = index + relative_end + 1;
             let group = characters[index + 1..end].iter().collect::<String>();
             if !group.trim().is_empty()
                 && !looks_like_release_group(&group)
@@ -496,19 +551,16 @@ fn has_following_title_candidate(characters: &[char], mut index: usize) -> bool 
 
 fn extract_embedded_title_candidates(raw_name: &str) -> Vec<String> {
     let source = strip_known_extension(raw_name.trim());
-    let characters = source.chars().collect::<Vec<_>>();
+    let normalized_brackets = normalize_release_brackets(source);
+    let characters = normalized_brackets.chars().collect::<Vec<_>>();
     let mut candidates = Vec::new();
     let mut index = 0;
     let mut visible_text_seen = false;
     while index < characters.len() {
         if characters[index] == '[' {
-            let Some(relative_end) = characters[index + 1..]
-                .iter()
-                .position(|character| *character == ']')
-            else {
+            let Some(end) = find_matching_square_bracket(&characters, index) else {
                 break;
             };
-            let end = index + relative_end + 1;
             let group = characters[index + 1..end].iter().collect::<String>();
             let contextual_release = !visible_text_seen
                 && (looks_like_release_group(&group)
@@ -529,9 +581,83 @@ fn extract_embedded_title_candidates(raw_name: &str) -> Vec<String> {
     candidates
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleScriptFamily {
+    Latin,
+    EastAsian,
+}
+
+/// A common movie release carries the official/localized CJK title directly beside an English
+/// title, for example 了不起的盖茨比The Great Gatsby. Searching that concatenation fails even
+/// though Bangumi indexes each title independently. Preserve the combined value as primary
+/// evidence, but also expose each script run as an alternate title for the existing bounded
+/// three-query recall and unchanged confidence scorer.
+fn extract_parallel_title_candidates(value: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut buffer = String::new();
+    let mut active_family = None;
+    let mut saw_latin = false;
+    let mut saw_east_asian = false;
+
+    for character in value.chars() {
+        let family = title_script_family(character);
+        match family {
+            Some(TitleScriptFamily::Latin) => saw_latin = true,
+            Some(TitleScriptFamily::EastAsian) => saw_east_asian = true,
+            None => {}
+        }
+        if let (Some(active), Some(next)) = (active_family, family) {
+            if active != next {
+                push_parallel_title_candidate(&mut candidates, &buffer);
+                buffer.clear();
+                active_family = Some(next);
+            }
+        } else if active_family.is_none() && family.is_some() {
+            active_family = family;
+        }
+        buffer.push(character);
+    }
+    push_parallel_title_candidate(&mut candidates, &buffer);
+
+    if saw_latin && saw_east_asian {
+        candidates
+    } else {
+        Vec::new()
+    }
+}
+
+fn title_script_family(character: char) -> Option<TitleScriptFamily> {
+    if character.is_ascii_alphabetic() {
+        return Some(TitleScriptFamily::Latin);
+    }
+    let code = character as u32;
+    ((0x3400..=0x9fff).contains(&code)
+        || (0x3040..=0x30ff).contains(&code)
+        || (0x31f0..=0x31ff).contains(&code)
+        || (0xac00..=0xd7af).contains(&code))
+    .then_some(TitleScriptFamily::EastAsian)
+}
+
+fn push_parallel_title_candidate(candidates: &mut Vec<String>, value: &str) {
+    let candidate = value
+        .trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '-' | '_' | '.' | '·' | '|' | ':' | '/' | '[' | ']' | '(' | ')'
+                )
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if is_safe_match_query(&candidate) {
+        push_unique(candidates, candidate);
+    }
+}
+
 fn is_technical_group(value: &str) -> bool {
     let trimmed = value.trim();
-    if trimmed.is_empty() || is_crc(trimmed) {
+    if trimmed.is_empty() || is_crc(trimmed) || looks_like_technical_phrase_group(trimmed) {
         return true;
     }
     let atoms = trimmed
@@ -542,6 +668,41 @@ fn is_technical_group(value: &str) -> bool {
         .filter(|atom| !atom.is_empty())
         .collect::<Vec<_>>();
     !atoms.is_empty() && atoms.iter().all(|atom| is_technical_atom(atom))
+}
+
+/// Some release metadata is a natural-language phrase rather than a sequence of codec atoms.
+/// Keep this deliberately scoped to bracket groups; these phrases should never remove matching
+/// words from an unbracketed title.
+fn looks_like_technical_phrase_group(value: &str) -> bool {
+    let lower = value.nfkc().collect::<String>().to_lowercase();
+    [
+        "字幕",
+        "中字",
+        "简繁",
+        "簡繁",
+        "内封",
+        "內封",
+        "内嵌",
+        "內嵌",
+        "配音",
+        "国语",
+        "國語",
+        "粤语",
+        "粵語",
+        "双语",
+        "雙語",
+        "杜比视界",
+        "杜比視界",
+        "双版本",
+        "雙版本",
+        "原盘",
+        "原盤",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || ["subbed", "dubbed", "multi-sub", "multisub"]
+            .iter()
+            .any(|marker| lower.contains(marker))
 }
 
 fn is_semantic_group(value: &str) -> bool {
@@ -1158,6 +1319,19 @@ pub fn is_generic_title(value: &str) -> bool {
             | "动画"
             | "anime"
             | "animation"
+            | "movie"
+            | "movies"
+            | "film"
+            | "films"
+            | "the"
+            | "电影"
+            | "電影"
+            | "影视"
+            | "影視"
+            | "电视剧"
+            | "電視劇"
+            | "剧场版"
+            | "劇場版"
             | "media"
             | "video"
             | "videos"
@@ -1334,6 +1508,39 @@ mod tests {
             assert_eq!(extract_search_keyword(raw), expected_title, "raw={raw}");
             assert!(is_safe_match_query(&evidence.primary_title), "raw={raw}");
         }
+    }
+
+    #[test]
+    fn full_width_movie_release_metadata_yields_independent_bilingual_titles() {
+        let raw = "【高清影视之家发布 www.HDBTHD.com】【了不起的盖茨比[HDR+杜比视界双版本][中文字幕]The.Great.Gatsby.2013.1080p.BluRay.x265.10bit】.mkv";
+        let evidence = build_match_evidence(raw, raw, Some("电影"), &[]);
+
+        assert_eq!(evidence.year, Some(2013));
+        assert!(evidence
+            .alternate_titles
+            .iter()
+            .any(|title| title == "了不起的盖茨比"));
+        assert!(evidence
+            .alternate_titles
+            .iter()
+            .any(|title| title == "The Great Gatsby"));
+        assert!(!evidence.primary_title.to_lowercase().contains("hdbthd"));
+        assert!(!evidence.primary_title.to_lowercase().contains("hdr"));
+        assert!(!evidence.primary_title.contains("字幕"));
+        assert_eq!(evidence.parent_title, None);
+        assert!(evidence.evidence_quality >= 70);
+        let queries = crate::auto_match::match_queries(&evidence);
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[1], "了不起的盖茨比");
+        assert_eq!(queries[2], "The Great Gatsby");
+    }
+
+    #[test]
+    fn full_width_brackets_do_not_remove_a_real_bracketed_movie_title() {
+        assert_eq!(
+            extract_search_keyword("【无名之辈】.2018.1080p.BluRay.x265"),
+            "无名之辈"
+        );
     }
 
     #[test]
