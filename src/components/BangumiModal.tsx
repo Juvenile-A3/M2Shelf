@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { BangumiSearchPrefill, BangumiSubject, MediaNode, MetadataBinding } from "../types/media";
 import { api } from "../lib/api";
 import { cleanBangumiKeyword, errorMessage, nodeDisplayTitle } from "../lib/format";
@@ -23,85 +23,129 @@ export function BangumiModal({ node, onClose, onBound }: BangumiModalProps) {
   const [errorKind, setErrorKind] = useState<"search" | "bind">("search");
   const [prefill, setPrefill] = useState<BangumiSearchPrefill | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const requestGenerationRef = useRef(0);
+  const activeNodeIdRef = useRef<number | null>(null);
+
+  const requestIsCurrent = useCallback((generation: number, nodeId: number) => (
+    requestGenerationRef.current === generation && activeNodeIdRef.current === nodeId
+  ), []);
+
+  const close = useCallback(() => {
+    requestGenerationRef.current += 1;
+    activeNodeIdRef.current = null;
+    setLoading(false);
+    setBindingId(null);
+    onClose();
+  }, [onClose]);
+
+  const updateKeyword = useCallback((value: string) => {
+    requestGenerationRef.current += 1;
+    setKeyword(value);
+    setResults([]);
+    setError(null);
+    setSearched(false);
+    setLoading(false);
+  }, []);
 
   useEffect(() => {
-    if (!node) return;
-    let active = true;
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
+    const nodeId = node?.id ?? null;
+    activeNodeIdRef.current = nodeId;
     setResults([]);
     setError(null);
     setSearched(false);
     setPrefill(null);
+    setLoading(false);
+    setBindingId(null);
+    setKeyword("");
+    if (!node || nodeId == null) return;
     setKeyword(cleanBangumiKeyword(node.displayName || node.folderName));
     void api.bangumiPrefill(node.id).then((value) => {
-      if (!active) return;
+      if (!requestIsCurrent(generation, nodeId)) return;
       setPrefill(value);
       setKeyword(value.extractedName || value.originalName);
     }).catch(() => undefined);
-    requestAnimationFrame(() => inputRef.current?.focus());
-    return () => { active = false; };
-  }, [node]);
+    const animationFrame = requestAnimationFrame(() => {
+      if (requestIsCurrent(generation, nodeId)) inputRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(animationFrame);
+  }, [node?.id, requestIsCurrent]);
 
   useEffect(() => {
     if (!node) return;
-    const key = (event: KeyboardEvent) => event.key === "Escape" && onClose();
+    const key = (event: KeyboardEvent) => event.key === "Escape" && close();
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [node, onClose]);
+  }, [close, node]);
 
   if (!node) return null;
 
   const search = async (event?: React.FormEvent) => {
     event?.preventDefault();
     const query = keyword.trim();
-    if (!query || loading) return;
+    if (!query || loading || bindingId !== null) return;
+    const nodeId = node.id;
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
     setLoading(true);
     setSearched(true);
     setError(null);
     setErrorKind("search");
     try {
-      setResults(await api.searchBangumi(query));
+      const nextResults = await api.searchBangumi(query);
+      if (!requestIsCurrent(generation, nodeId)) return;
+      setResults(nextResults);
     } catch (caught) {
+      if (!requestIsCurrent(generation, nodeId)) return;
       setError(errorMessage(caught));
       setResults([]);
     } finally {
-      setLoading(false);
+      if (requestIsCurrent(generation, nodeId)) setLoading(false);
     }
   };
 
   const bind = async (subject: BangumiSubject) => {
+    if (bindingId !== null || loading) return;
+    const nodeId = node.id;
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
     setBindingId(subject.subjectId);
     setError(null);
     setErrorKind("bind");
     try {
-      const binding = await api.bindBangumi(node.id, subject);
+      const binding = await api.bindBangumi(nodeId, subject);
+      if (!requestIsCurrent(generation, nodeId)) return;
       await onBound(binding);
-      onClose();
+      if (!requestIsCurrent(generation, nodeId)) return;
+      close();
     } catch (caught) {
+      if (!requestIsCurrent(generation, nodeId)) return;
       setError(errorMessage(caught));
     } finally {
-      setBindingId(null);
+      if (requestIsCurrent(generation, nodeId)) setBindingId(null);
     }
   };
 
   return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()} role="presentation">
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()} role="presentation">
       <section className="bangumi-modal" role="dialog" aria-modal="true" aria-labelledby="bangumi-title">
         <header className="modal-header">
           <span className="modal-heading-icon"><Icon name="bangumi" /></span>
           <div><p className="eyebrow">{t("bangumi.manualMatch")}</p><h2 id="bangumi-title">{t("bangumi.modalTitle")}</h2><p>{t("bangumi.modalDescription", { name: nodeDisplayTitle(node) })}</p></div>
-          <button className="modal-close" aria-label={t("common.close")} onClick={onClose} type="button"><Icon name="close" /></button>
+          <button className="modal-close" aria-label={t("common.close")} onClick={close} type="button"><Icon name="close" /></button>
         </header>
 
         {prefill && <div className="bangumi-keyword-context">
           <div><span>{t("bangumi.originalName")}</span><strong title={prefill.originalName}>{prefill.originalName}</strong></div>
-          <div><span>{t("bangumi.extractedName")}</span><button onClick={() => setKeyword(prefill.extractedName)} type="button">{prefill.extractedName || t("bangumi.noExtracted")}</button></div>
-          {prefill.candidates.length > 1 && <div className="keyword-candidates"><span>{t("bangumi.otherCandidates")}</span><p>{prefill.candidates.filter((candidate) => candidate !== prefill.extractedName).map((candidate) => <button key={candidate} onClick={() => setKeyword(candidate)} type="button">{candidate}</button>)}</p></div>}
+          <div><span>{t("bangumi.extractedName")}</span><button disabled={bindingId !== null} onClick={() => updateKeyword(prefill.extractedName)} type="button">{prefill.extractedName || t("bangumi.noExtracted")}</button></div>
+          {prefill.candidates.length > 1 && <div className="keyword-candidates"><span>{t("bangumi.otherCandidates")}</span><p>{prefill.candidates.filter((candidate) => candidate !== prefill.extractedName).map((candidate) => <button disabled={bindingId !== null} key={candidate} onClick={() => updateKeyword(candidate)} type="button">{candidate}</button>)}</p></div>}
         </div>}
         <form className="bangumi-search" onSubmit={search}>
           <Icon name="search" />
-          <input ref={inputRef} aria-label={t("bangumi.keywordAria")} onChange={(event) => setKeyword(event.target.value)} placeholder={t("bangumi.keywordPlaceholder")} value={keyword} />
-          {keyword && <button className="clear-input" aria-label={t("common.clear")} onClick={() => setKeyword("")} type="button"><Icon name="close" /></button>}
-          <button className="button primary" disabled={!keyword.trim() || loading} type="submit">{loading ? t("common.searching") : t("common.search")}</button>
+          <input ref={inputRef} aria-label={t("bangumi.keywordAria")} disabled={bindingId !== null} onChange={(event) => updateKeyword(event.target.value)} placeholder={t("bangumi.keywordPlaceholder")} value={keyword} />
+          {keyword && <button className="clear-input" aria-label={t("common.clear")} disabled={bindingId !== null} onClick={() => updateKeyword("")} type="button"><Icon name="close" /></button>}
+          <button className="button primary" disabled={!keyword.trim() || loading || bindingId !== null} type="submit">{loading ? t("common.searching") : t("common.search")}</button>
         </form>
 
         {error && <div className="inline-error"><Icon name="warning" /><span><strong>{t(errorKind === "search" ? "bangumi.searchFailed" : "bangumi.saveFailed")}</strong><small>{error}</small></span>{errorKind === "search" && <button onClick={() => void search()} type="button">{t("common.retry")}</button>}</div>}

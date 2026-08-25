@@ -1,14 +1,23 @@
 [package]
 name = "m2shelf"
-version = "0.5.7"
+version = "0.5.8"
 description = "A read-only visual browser for local media collections"
 authors = ["森下Undermori"]
 edition = "2021"
 rust-version = "1.88"
+autobins = false
 
 [lib]
 name = "m2shelf_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "m2shelf"
+path = "src/main.rs"
+
+[[bin]]
+name = "M2ShelfUpdater"
+path = "src/bin/m2shelf_updater.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -16,19 +25,27 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "system-proxy"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",

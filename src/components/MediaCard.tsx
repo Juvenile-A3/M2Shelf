@@ -3,8 +3,9 @@ import type { MediaNode, ViewMode } from "../types/media";
 import { canBindBangumi, formatDate, nodeDisplayTitle } from "../lib/format";
 import { Icon } from "./Icon";
 import { useCoverDataUrl } from "../hooks/useCoverDataUrl";
+import { usePosterViewportLifecycle } from "../hooks/usePosterViewportLifecycle";
 import { useI18n } from "../lib/i18n";
-import { shouldContainPosterArtwork } from "../lib/poster";
+import { PosterImage } from "./PosterImage";
 
 interface MediaCardProps {
   node: MediaNode;
@@ -23,24 +24,14 @@ interface MediaCardProps {
 function MediaCardComponent({ node, viewMode, onOpen, onMenu, onBangumi, onRetryCover, coverRevision, watchedAt, editMode = false, selected = false, onSelect }: MediaCardProps) {
   const { t } = useI18n();
   const cardRef = useRef<HTMLElement>(null);
-  const [coverRequested, setCoverRequested] = useState(false);
-  const { coverUrl: cover, coverFailed: coverReadFailed, coverLoading } = useCoverDataUrl(node, coverRevision, coverRequested);
+  const hasCachedCover = Boolean(node.coverCachePath ?? node.binding?.coverCachePath);
+  const { coverRequested, coverVisible } = usePosterViewportLifecycle(cardRef, node.id, {
+    activationMarginPx: 1_000,
+    retentionEnabled: hasCachedCover,
+    retentionMarginPx: 1_800,
+  });
+  const { coverCacheKey, coverUrl: cover, coverFailed: coverReadFailed, coverLoading } = useCoverDataUrl(node, coverRevision, coverRequested);
   const [imageFailed, setImageFailed] = useState(false);
-  useEffect(() => {
-    setCoverRequested(false);
-    const card = cardRef.current;
-    if (!card || typeof IntersectionObserver === "undefined") {
-      setCoverRequested(true);
-      return;
-    }
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      setCoverRequested(true);
-      observer.disconnect();
-    }, { rootMargin: "700px 0px" });
-    observer.observe(card);
-    return () => observer.disconnect();
-  }, [node.id]);
   useEffect(() => setImageFailed(false), [cover]);
   const videos = node.totalVideoCount ?? node.directVideoCount ?? 0;
   const container = node.nodeType === "CONTAINER" || node.nodeType === "MIXED";
@@ -62,7 +53,7 @@ function MediaCardComponent({ node, viewMode, onOpen, onMenu, onBangumi, onRetry
     >
       <button aria-pressed={editMode ? selected : undefined} className="media-card-open" onClick={() => editMode ? onSelect?.(node) : onOpen(node)} type="button">
         <span className={`cover-frame ${cover ? "has-cover" : ""} ${container ? "is-container" : ""}`}>
-          {cover && !coverFailed ? <img alt={t("card.coverAlt", { title })} decoding="async" onError={() => setImageFailed(true)} onLoad={(event) => event.currentTarget.classList.toggle("is-wide-artwork", shouldContainPosterArtwork(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight))} src={cover} /> : (
+          {cover && !coverFailed ? <PosterImage active={coverVisible} alt={t("card.coverAlt", { title })} cacheKey={coverCacheKey} onError={() => setImageFailed(true)} src={cover} /> : (
             <span className="cover-placeholder">
               <span className="cover-art"><Icon name={container ? "folder-open" : "work"} /></span>
               <small>{coverError ? t("card.coverFailed") : container ? t("card.resourceContainer") : t("card.noCover")}</small>

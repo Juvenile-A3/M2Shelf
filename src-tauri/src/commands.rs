@@ -15,9 +15,10 @@ use crate::{
     models::{
         AllResourcesResult, AppBootstrap, AppSettings, BangumiSearchPrefill, BangumiSubject,
         BatchMutationResult, BrowseResult, CacheStats, CollectionSort, CollectionSortPreferences,
-        CollectionSortScope, CoverSource, FavoriteFolder, LibraryRoot, MediaFile, MediaNode,
-        MetadataBinding, NodeDetail, NodeType, PlayerTestResult, RebuildResult,
-        RecentlyWatchedEntry, ScanPhase, ScanProgress, ScanStarted, ScanStatus, SearchHit, UserTag,
+        CollectionSortScope, CoverSource, FavoriteFolder, LibraryRecognitionMode, LibraryRoot,
+        MediaFile, MediaNode, MetadataBinding, NodeDetail, NodeType, PlayerTestResult,
+        RebuildResult, RecentlyWatchedEntry, ScanPhase, ScanProgress, ScanStarted, ScanStatus,
+        SearchHit, UpdateCheckResult, UpdateDistribution, UpdateDownloadStatus, UserTag,
         UserTagMembership,
     },
     player,
@@ -70,6 +71,13 @@ fn validate_bangumi_subject_payload(subject: &BangumiSubject) -> AppResult<()> {
         return Err("Bangumi 别名数据过多或过长。".into());
     }
     Ok(())
+}
+
+fn validate_bindable_bangumi_subject(subject: &BangumiSubject) -> AppResult<()> {
+    if subject.subject_id <= 0 || !bangumi::is_supported_subject_type(subject.subject_type) {
+        return Err("只能绑定有效的 Bangumi 动画或真人影视条目。".into());
+    }
+    validate_bangumi_subject_payload(subject)
 }
 
 fn library_root_paths(state: &AppState) -> AppResult<Vec<PathBuf>> {
@@ -127,7 +135,12 @@ fn remove_cached_file_if_unreferenced(
 }
 
 #[tauri::command]
-pub fn get_app_bootstrap() -> AppBootstrap {
+pub fn get_app_bootstrap(state: State<'_, AppState>) -> AppBootstrap {
+    let update_recovery_notice = state
+        .update_recovery_notice
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     AppBootstrap {
         name: "M²Shelf",
         version: env!("CARGO_PKG_VERSION"),
@@ -136,23 +149,183 @@ pub fn get_app_bootstrap() -> AppBootstrap {
         architecture: display_architecture(),
         website_url: BILIBILI_URL,
         x_url: X_URL,
+        update_recovery_notice,
     }
+}
+
+#[tauri::command]
+pub fn acknowledge_update_recovery_notice(
+    notice: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    ensure_update_cache_outside_library_roots(&state)?;
+    if notice != "ROLLED_BACK" && notice != "RECOVERY_REQUIRED" {
+        return Err("更新恢复通知类型无效。".into());
+    }
+    let mut pending = state
+        .update_recovery_notice
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pending.as_deref() != Some(notice.as_str()) {
+        return Err("更新恢复通知已发生变化，请重新启动应用后确认。".into());
+    }
+    // Clear the durable marker first. If that fails, keep the in-memory copy so the warning stays
+    // visible and can be acknowledged again instead of being silently lost.
+    crate::portable_update::clear_rollback_notice(state.update_manager.cache_dir())?;
+    *pending = None;
+    Ok(())
 }
 
 /// The main window is created hidden so restoring its persisted size and preparing the themed
 /// React shell never expose the configured fallback frame. The frontend calls this once after its
 /// startup settings have been applied.
 #[tauri::command]
-pub fn show_main_window(app: AppHandle) -> AppResult<()> {
+pub fn show_main_window(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "找不到主窗口。".to_owned())?;
-    window
-        .show()
-        .map_err(|error| format!("无法显示主窗口：{error}"))?;
+    if let Err(error) = crate::portable_update::mark_running_update_healthy(
+        state.update_manager.cache_dir(),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        // During a Portable update the helper must be able to trust this receipt. Keep the new
+        // process hidden and terminate it immediately on failure so rollback completes before a
+        // user can change application-owned metadata through the uncommitted version.
+        app.exit(1);
+        return Err(error);
+    }
+    if let Err(error) = window.show() {
+        // A Portable helper may already have observed the health marker above. Exiting inside its
+        // survival grace makes the transaction fail closed and preserves rollback material.
+        app.exit(1);
+        return Err(format!("无法显示主窗口：{error}"));
+    }
     // Match normal desktop startup behavior without making focus a prerequisite for visibility.
     let _ = window.set_focus();
     Ok(())
+}
+
+#[tauri::command]
+pub async fn check_for_update(state: State<'_, AppState>) -> AppResult<UpdateCheckResult> {
+    ensure_update_cache_outside_library_roots(&state)?;
+    let manager = state.update_manager.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let distribution = crate::portable_update::detect_distribution()?;
+        manager.check(distribution)
+    })
+    .await
+    .map_err(|error| format!("更新检查任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn download_update(
+    version: String,
+    state: State<'_, AppState>,
+) -> AppResult<UpdateDownloadStatus> {
+    let library_roots = ensure_update_cache_outside_library_roots(&state)?;
+    let manager = state.update_manager.clone();
+    tauri::async_runtime::spawn_blocking(move || manager.download(&version, &library_roots))
+        .await
+        .map_err(|error| format!("更新下载任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub fn get_update_download_status(state: State<'_, AppState>) -> UpdateDownloadStatus {
+    state.update_manager.status()
+}
+
+#[tauri::command]
+pub fn install_downloaded_update(
+    version: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let library_roots = ensure_update_cache_outside_library_roots(&state)?;
+    let _update_operation = state.update_manager.begin_operation()?;
+    let _scan_lifecycle = lock_scan_lifecycle(&state);
+    ensure_no_active_scan(&state)?;
+    crate::update::ensure_newer_version(env!("CARGO_PKG_VERSION"), &version)?;
+    let downloaded = state.update_manager.downloaded(&version)?;
+    crate::update::validate_existing_update_subdirectory(
+        state.update_manager.cache_dir(),
+        &[version.as_str()],
+        &library_roots,
+    )?;
+    crate::update::ensure_safe_update_file(
+        &downloaded.path,
+        state.update_manager.cache_dir(),
+        &library_roots,
+        "更新包",
+    )?;
+    let _verified_artifact = match crate::update::lock_and_verify_file_against_manifest(
+        &downloaded.path,
+        &downloaded.checked.version,
+        downloaded.checked.platform,
+        downloaded.checked.asset.size,
+        &downloaded.checked.asset.sha256,
+        &downloaded.checked.asset.signature,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            state.update_manager.fail(Some(&version), &error);
+            return Err(error);
+        }
+    };
+    if let Some(size) = state.window_size.get() {
+        state.database.save_window_size(size)?;
+    }
+    state.update_manager.set_applying(&version);
+
+    match downloaded.checked.distribution {
+        UpdateDistribution::Portable => {
+            state
+                .update_exit_in_progress
+                .store(true, std::sync::atomic::Ordering::Release);
+            let prepared = crate::portable_update::prepare_portable_update(
+                &downloaded,
+                &state.database,
+                state.update_manager.cache_dir(),
+            )
+            .and_then(|mut prepared| {
+                crate::portable_update::launch_prepared_helper(&mut prepared)?;
+                Ok(prepared)
+            });
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    state
+                        .update_exit_in_progress
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    state.update_manager.fail(Some(&version), &error);
+                    return Err(error);
+                }
+            };
+            app.exit(0);
+            // `app.exit` is asynchronous. Leak this one-shot guard so SQLite's write reservation
+            // survives command return and is released only when Windows tears down the process.
+            std::mem::forget(prepared);
+            Ok(())
+        }
+        UpdateDistribution::Nsis => {
+            state
+                .update_exit_in_progress
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Err(error) = std::process::Command::new(&downloaded.path)
+                .args(["/P", "/UPDATE", "/R", "/ARGS"])
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| format!("无法启动 NSIS 更新安装包：{error}"))
+            {
+                state
+                    .update_exit_in_progress
+                    .store(false, std::sync::atomic::Ordering::Release);
+                state.update_manager.fail(Some(&version), &error);
+                return Err(error);
+            }
+            app.exit(0);
+            Ok(())
+        }
+    }
 }
 
 fn display_architecture() -> &'static str {
@@ -173,6 +346,7 @@ pub fn list_library_roots(state: State<'_, AppState>) -> AppResult<Vec<LibraryRo
 pub fn add_library_root(
     path: String,
     display_name: Option<String>,
+    recognition_mode: LibraryRecognitionMode,
     state: State<'_, AppState>,
 ) -> AppResult<LibraryRoot> {
     // Reject duplicate, ancestor and descendant roots before any other setup. `add_root` repeats
@@ -182,11 +356,19 @@ pub fn add_library_root(
     if cache::paths_overlap(&canonical, &active_cache) {
         return Err("媒体资源库不能等于、包含封面缓存目录，或位于封面缓存目录内。".into());
     }
-    state.database.add_root(&canonical, display_name)
+    validate_new_library_root_update_boundary(
+        &canonical,
+        state.update_manager.cache_dir(),
+        library_root_paths(&state)?,
+    )?;
+    state
+        .database
+        .add_root_with_mode(&canonical, display_name, recognition_mode)
 }
 
 #[tauri::command]
 pub fn remove_library_root(root_id: i64, state: State<'_, AppState>) -> AppResult<()> {
+    let _scan_lifecycle = lock_scan_lifecycle(&state);
     ensure_no_active_scan(&state)?;
     state.database.remove_root(root_id)
 }
@@ -352,6 +534,7 @@ pub fn match_existing_content(
     rematch_existing: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<ScanStarted> {
+    let _scan_lifecycle = lock_scan_lifecycle(&state);
     ensure_no_active_scan(&state)?;
     let rematch_existing = rematch_existing.unwrap_or(false);
     let selection_missing = match node_ids.as_ref() {
@@ -409,9 +592,11 @@ pub fn match_existing_content(
     } else {
         auto_match::MatchWriteMode::IfAbsent
     };
+    let worker_activity = ScanWorkerActivity::start(Arc::clone(&state.scan_worker_active));
     if let Err(error) = std::thread::Builder::new()
         .name("m2shelf-existing-match".into())
         .spawn(move || {
+            let _worker_activity = worker_activity;
             scanner::run_existing_content_match(
                 Some(&app),
                 &database,
@@ -611,10 +796,7 @@ pub async fn bind_bangumi(
     subject: BangumiSubject,
     state: State<'_, AppState>,
 ) -> AppResult<MetadataBinding> {
-    if subject.subject_id <= 0 || subject.subject_type != 2 {
-        return Err("只能绑定有效的 Bangumi 动画条目。".into());
-    }
-    validate_bangumi_subject_payload(&subject)?;
+    validate_bindable_bangumi_subject(&subject)?;
     let database = state.database.clone();
     let node = database.get_node(node_id)?;
     if !node.can_bind_bangumi() {
@@ -689,7 +871,7 @@ pub async fn retry_bangumi_cover(
         date: binding.provider_date,
         image_url: binding.provider_image_url,
         summary: None,
-        subject_type: 2,
+        subject_type: binding.provider_subject_type,
     };
     let database = state.database.clone();
     let fallback_subject = subject.clone();
@@ -889,6 +1071,7 @@ pub fn update_settings(
     settings: AppSettings,
     state: State<'_, AppState>,
 ) -> AppResult<AppSettings> {
+    settings.validate_path_lengths()?;
     if !matches!(
         settings.language.as_str(),
         "zh-CN" | "en-US" | "ja-JP" | "ko-KR"
@@ -912,7 +1095,15 @@ pub async fn test_mpv(
     state: State<'_, AppState>,
 ) -> AppResult<PlayerTestResult> {
     let selected = match path {
-        Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+        Some(path) if !path.trim().is_empty() => {
+            if path.chars().count() > crate::models::MAX_SETTINGS_PATH_CHARS {
+                return Err(format!(
+                    "播放器路径不能超过 {} 个字符。",
+                    crate::models::MAX_SETTINGS_PATH_CHARS
+                ));
+            }
+            PathBuf::from(path)
+        }
         _ => state
             .database
             .get_settings(&state.default_cover_cache_dir)?
@@ -1011,6 +1202,7 @@ pub fn get_cache_stats(state: State<'_, AppState>) -> AppResult<CacheStats> {
 
 #[tauri::command]
 pub fn clear_cover_cache(state: State<'_, AppState>) -> AppResult<CacheStats> {
+    let _scan_lifecycle = lock_scan_lifecycle(&state);
     ensure_no_active_scan(&state)?;
     let cache_clear = cache::begin_cover_cache_clear();
     let cache_root = active_cover_cache_directory(&state)?;
@@ -1038,6 +1230,7 @@ fn start_scan_internal(
     root_id: Option<i64>,
     node_id: Option<i64>,
 ) -> AppResult<ScanStarted> {
+    let _scan_lifecycle = lock_scan_lifecycle(state);
     ensure_no_active_scan(state)?;
     if root_id.is_none() && node_id.is_some() {
         return Err("扫描指定目录时必须同时提供资源库 ID。".into());
@@ -1062,11 +1255,19 @@ fn start_scan_internal(
             if node.library_root_id != root.id {
                 return Err("目录节点不属于该资源库。".into());
             }
-            targets.push(ScanTarget {
-                root,
-                path: PathBuf::from(&node.absolute_path),
-                parent_node_id: node.parent_node_id,
-            });
+            if matches!(root.recognition_mode, LibraryRecognitionMode::VideoFile) {
+                targets.push(ScanTarget {
+                    path: PathBuf::from(&root.path),
+                    root,
+                    parent_node_id: None,
+                });
+            } else {
+                targets.push(ScanTarget {
+                    root,
+                    path: PathBuf::from(&node.absolute_path),
+                    parent_node_id: node.parent_node_id,
+                });
+            }
         } else {
             targets.push(ScanTarget {
                 path: PathBuf::from(&root.path),
@@ -1120,9 +1321,11 @@ fn start_scan_internal(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(control.clone());
     let database = state.database.clone();
+    let worker_activity = ScanWorkerActivity::start(Arc::clone(&state.scan_worker_active));
     if let Err(error) = std::thread::Builder::new()
         .name("m2shelf-scan".into())
         .spawn(move || {
+            let _worker_activity = worker_activity;
             scanner::run_scan_with_auto_match(
                 Some(&app),
                 &database,
@@ -1144,6 +1347,12 @@ fn start_scan_internal(
 }
 
 fn ensure_no_active_scan(state: &AppState) -> AppResult<()> {
+    if state.update_exit_in_progress.load(Ordering::Acquire) {
+        return Err("应用正在退出以完成更新，不能开始新的资源操作。".into());
+    }
+    if state.scan_worker_active.load(Ordering::Acquire) {
+        return Err("已有扫描正在运行；请等待完成或先停止扫描。".into());
+    }
     let guard = state
         .active_scan
         .lock()
@@ -1156,6 +1365,54 @@ fn ensure_no_active_scan(state: &AppState) -> AppResult<()> {
     } else {
         Ok(())
     }
+}
+
+fn lock_scan_lifecycle(state: &AppState) -> std::sync::MutexGuard<'_, ()> {
+    state
+        .scan_lifecycle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct ScanWorkerActivity(Arc<AtomicBool>);
+
+impl ScanWorkerActivity {
+    fn start(active: Arc<AtomicBool>) -> Self {
+        active.store(true, Ordering::Release);
+        Self(active)
+    }
+}
+
+impl Drop for ScanWorkerActivity {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn ensure_update_cache_outside_library_roots(state: &AppState) -> AppResult<Vec<PathBuf>> {
+    let roots = library_root_paths(state)?;
+    let update_cache = state.update_manager.cache_dir();
+    crate::update::ensure_safe_update_cache(update_cache, &roots)?;
+    Ok(roots)
+}
+
+fn validate_new_library_root_update_boundary(
+    candidate: &Path,
+    update_cache: &Path,
+    mut existing_roots: Vec<PathBuf>,
+) -> AppResult<()> {
+    if cache::paths_overlap_checked(candidate, update_cache)? {
+        return Err("媒体资源库不能等于、包含应用更新缓存，或位于更新缓存目录内。".into());
+    }
+    match std::fs::symlink_metadata(update_cache) {
+        Ok(_) => {
+            existing_roots.push(candidate.to_path_buf());
+            crate::update::validate_existing_update_cache(update_cache, &existing_roots)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法检查应用更新缓存：{error}")),
+    }
+    Ok(())
 }
 
 pub fn cancel_scan_on_exit(app: &AppHandle) {
@@ -1175,6 +1432,44 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use tempfile::TempDir;
+
+    #[test]
+    fn scan_worker_activity_stays_set_until_the_worker_scope_ends() {
+        let active = Arc::new(AtomicBool::new(false));
+        {
+            let _worker = ScanWorkerActivity::start(Arc::clone(&active));
+            assert!(active.load(Ordering::Acquire));
+        }
+        assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn adding_a_root_that_contains_a_missing_update_cache_is_read_only() {
+        let temp = TempDir::new().unwrap();
+        let candidate = temp.path().join("library");
+        std::fs::create_dir(&candidate).unwrap();
+        let sentinel = candidate.join("sentinel.bin");
+        std::fs::write(&sentinel, b"must remain unchanged").unwrap();
+        let update_cache = candidate.join("application-data").join("updates");
+        let entries_before = std::fs::read_dir(&candidate)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+
+        assert!(
+            validate_new_library_root_update_boundary(&candidate, &update_cache, Vec::new())
+                .is_err()
+        );
+
+        let entries_after = std::fs::read_dir(&candidate)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries_after, entries_before);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"must remain unchanged");
+        assert!(!update_cache.exists());
+        assert!(!candidate.join("application-data").exists());
+    }
 
     #[test]
     fn about_link_allowlist_rejects_lookalikes_and_other_schemes() {
@@ -1225,11 +1520,37 @@ mod tests {
             subject_type: 2,
         };
         assert!(validate_bangumi_subject_payload(&subject).is_ok());
+        assert!(validate_bindable_bangumi_subject(&subject).is_ok());
+        subject.subject_type = bangumi::SUBJECT_TYPE_LIVE_ACTION;
+        assert!(validate_bindable_bangumi_subject(&subject).is_ok());
+        subject.subject_type = 4;
+        assert!(validate_bindable_bangumi_subject(&subject).is_err());
+        subject.subject_type = bangumi::SUBJECT_TYPE_ANIME;
         subject.title = "x".repeat(MAX_BINDING_TITLE_CHARS + 1);
         assert!(validate_bangumi_subject_payload(&subject).is_err());
         subject.title = "Title".into();
         subject.image_url = Some("x".repeat(MAX_BINDING_URL_CHARS + 1));
         assert!(validate_bangumi_subject_payload(&subject).is_err());
+    }
+
+    #[test]
+    fn settings_paths_are_bounded_before_filesystem_validation_or_persistence() {
+        let mut settings = AppSettings {
+            mpv_path: Some("C:\\Player\\player.exe".into()),
+            default_view_mode: crate::models::ViewMode::Grid,
+            video_extensions: vec!["mkv".into()],
+            bangumi_search_enabled: true,
+            cover_cache_directory: "C:\\M2Shelf\\covers".into(),
+            language: "zh-CN".into(),
+            theme: "system".into(),
+            auto_check_updates: true,
+        };
+        assert!(settings.validate_path_lengths().is_ok());
+        settings.mpv_path = Some("x".repeat(crate::models::MAX_SETTINGS_PATH_CHARS + 1));
+        assert!(settings.validate_path_lengths().is_err());
+        settings.mpv_path = None;
+        settings.cover_cache_directory = "x".repeat(crate::models::MAX_SETTINGS_PATH_CHARS + 1);
+        assert!(settings.validate_path_lengths().is_err());
     }
 
     #[test]

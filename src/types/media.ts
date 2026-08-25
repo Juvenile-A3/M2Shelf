@@ -9,6 +9,7 @@ export type CoverSource = "BANGUMI" | "MANUAL" | "PLACEHOLDER";
 export type ViewMode = "grid" | "list";
 export type CollectionSort = "title-asc" | "title-desc" | "added-desc" | "added-asc";
 export type CollectionSortScope = "all" | "browse" | "favorites";
+export type LibraryRecognitionMode = "FOLDER" | "VIDEO_FILE";
 export interface CollectionSortPreferences {
   all: CollectionSort;
   browse: CollectionSort;
@@ -17,6 +18,9 @@ export interface CollectionSortPreferences {
 export type AppLanguage = "zh-CN" | "en-US" | "ja-JP" | "ko-KR";
 export type AppTheme = "system" | "light" | "dark";
 export type ScanStatus = "IDLE" | "RUNNING" | "CANCELLING" | "COMPLETED" | "CANCELLED" | "FAILED";
+export type UpdatePhase = "IDLE" | "CHECKING" | "DOWNLOADING" | "READY" | "APPLYING" | "FAILED";
+export type UpdateDistribution = "PORTABLE" | "NSIS";
+export type UpdateRecoveryNotice = "ROLLED_BACK" | "RECOVERY_REQUIRED";
 export type ResourceType =
   | "DOCUMENT"
   | "IMAGE"
@@ -33,6 +37,7 @@ export interface LibraryRoot {
   displayName: string;
   createdAt: string;
   lastScanAt: string | null;
+  recognitionMode: LibraryRecognitionMode;
   nodeCount?: number;
   mediaCount?: number;
 }
@@ -42,6 +47,7 @@ export interface MetadataBinding {
   nodeId: number;
   provider: "BANGUMI";
   providerSubjectId: number;
+  providerSubjectType: 2 | 6;
   providerTitle: string;
   providerTitleCn: string | null;
   providerTitleEn: string | null;
@@ -202,9 +208,35 @@ export interface AppSettings {
   defaultViewMode: "GRID" | "LIST";
   videoExtensions: string[];
   bangumiSearchEnabled: boolean;
+  autoCheckUpdates: boolean;
   language: AppLanguage;
   theme: AppTheme;
   coverCacheDirectory: string;
+}
+
+export interface AvailableUpdate {
+  version: string;
+  publishedAt: string;
+  releaseNotes: Record<AppLanguage, string>;
+  fileName: string;
+  downloadSize: number;
+  sha256: string;
+}
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  distribution: UpdateDistribution;
+  checkedAt: string;
+  update: AvailableUpdate | null;
+}
+
+export interface UpdateDownloadStatus {
+  phase: UpdatePhase;
+  version?: string | null;
+  downloadedBytes: number;
+  totalBytes?: number | null;
+  error?: string | null;
+  canInstall: boolean;
 }
 
 export interface CacheStats {
@@ -221,6 +253,7 @@ export interface AppBootstrap {
   architecture: string;
   websiteUrl: string;
   xUrl: string;
+  updateRecoveryNotice: UpdateRecoveryNotice | null;
 }
 
 export interface BangumiSearchPrefill {

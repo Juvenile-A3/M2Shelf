@@ -15,7 +15,10 @@ use tauri::{AppHandle, Emitter};
 use crate::{
     auto_match,
     db::{AppResult, Database},
-    models::{LibraryRoot, NodeType, ResourceType, ScanPhase, ScanProgress, ScanStatus},
+    models::{
+        LibraryRecognitionMode, LibraryRoot, NodeType, ResourceType, ScanPhase, ScanProgress,
+        ScanStatus,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -330,20 +333,37 @@ fn run_scan_inner(
             progress.root_id = target.root.id;
             progress.current_path = target.path.to_string_lossy().into_owned();
         }
-        scan_directory(
-            app,
-            &connection,
-            target.root.id,
-            &target.path,
-            &canonical_target,
-            &canonical_root,
-            target.parent_node_id,
-            control,
-            extensions,
-            token,
-            &mut visited,
-        )?;
-        if target.parent_node_id.is_some() {
+        if matches!(
+            target.root.recognition_mode,
+            LibraryRecognitionMode::VideoFile
+        ) {
+            scan_video_file_library(
+                app,
+                &connection,
+                &target.root,
+                &canonical_root,
+                control,
+                extensions,
+                token,
+            )?;
+        } else {
+            scan_directory(
+                app,
+                &connection,
+                target.root.id,
+                &target.path,
+                &canonical_target,
+                &canonical_root,
+                target.parent_node_id,
+                control,
+                extensions,
+                token,
+                &mut visited,
+            )?;
+        }
+        if target.parent_node_id.is_some()
+            && matches!(target.root.recognition_mode, LibraryRecognitionMode::Folder)
+        {
             let scanned_node_id = connection
                 .query_row(
                     "SELECT id FROM nodes WHERE library_root_id=?1 AND absolute_path=?2 COLLATE NOCASE",
@@ -351,10 +371,323 @@ fn run_scan_inner(
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(|error| error.to_string())?;
-            refresh_ancestors(&connection, Some(scanned_node_id))?;
+            refresh_ancestors(&connection, Some(scanned_node_id), &canonical_root)?;
         }
     }
     Ok(())
+}
+
+/// File recognition deliberately flattens videos beneath the hidden Library Root node. Each
+/// source video therefore becomes one stable card and one independent metadata binding while the
+/// source tree remains untouched. Folder recognition continues through `scan_directory` above.
+fn scan_video_file_library(
+    app: Option<&AppHandle>,
+    connection: &Connection,
+    root: &LibraryRoot,
+    canonical_root: &Path,
+    control: &ScanControl,
+    extensions: &HashSet<String>,
+    token: &str,
+) -> Result<(), ScanAbort> {
+    let logical_root = PathBuf::from(&root.path);
+    let root_name = logical_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&root.display_name);
+    let hidden_root_id = upsert_node(
+        connection,
+        root.id,
+        None,
+        &logical_root.to_string_lossy(),
+        root_name,
+        token,
+    )?;
+
+    let errors_before = control.progress().errors;
+    let mut pending = vec![ScanEntryPath {
+        logical: logical_root.clone(),
+        filesystem: canonical_root.to_path_buf(),
+    }];
+    let mut visited = HashSet::new();
+    let mut work_count = 0_i64;
+    let mut video_count = 0_i64;
+
+    while let Some(directory) = pending.pop() {
+        check_cancel(control)?;
+        let canonical_directory =
+            match canonicalize_within_library_root(&directory.filesystem, canonical_root) {
+                Ok(path) if path.is_dir() => path,
+                Ok(_) => {
+                    update_progress(app, control, &directory.logical, |progress| {
+                        progress.errors += 1;
+                        progress.message = Some(format!(
+                            "扫描路径不是目录，已跳过：{}",
+                            directory.logical.display()
+                        ));
+                    });
+                    continue;
+                }
+                Err(message) => {
+                    update_progress(app, control, &directory.logical, |progress| {
+                        progress.errors += 1;
+                        progress.message = Some(message);
+                    });
+                    continue;
+                }
+            };
+        if !visited.insert(canonical_directory.clone()) {
+            continue;
+        }
+        update_progress(app, control, &directory.logical, |progress| {
+            progress.folders_scanned += 1
+        });
+        let entries = match fs::read_dir(&canonical_directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                update_progress(app, control, &directory.logical, |progress| {
+                    progress.errors += 1;
+                    progress.message =
+                        Some(format!("无法读取 {}：{error}", directory.logical.display()));
+                });
+                continue;
+            }
+        };
+
+        let mut bdmv = None;
+        for entry_result in entries {
+            check_cancel(control)?;
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    update_progress(app, control, &directory.logical, |progress| {
+                        progress.errors += 1;
+                        progress.message = Some(format!("读取目录项失败：{error}"));
+                    });
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    update_progress(app, control, &directory.logical, |progress| {
+                        progress.errors += 1;
+                        progress.message = Some(format!("读取文件类型失败：{error}"));
+                    });
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let logical = directory.logical.join(entry.file_name());
+            let filesystem = entry.path();
+            if file_type.is_dir() {
+                let child = ScanEntryPath {
+                    logical,
+                    filesystem,
+                };
+                if file_name_eq(&child.logical, "BDMV") {
+                    bdmv = Some(child);
+                } else {
+                    pending.push(child);
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let canonical_file =
+                match canonical_file_within_library_root(&filesystem, canonical_root) {
+                    Ok(path) => path,
+                    Err(message) => {
+                        update_progress(app, control, &logical, |progress| {
+                            progress.errors += 1;
+                            progress.message = Some(message);
+                        });
+                        continue;
+                    }
+                };
+            if is_video(&logical, extensions) {
+                let title = logical
+                    .file_stem()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| logical.to_string_lossy().into_owned());
+                let node_id = upsert_node(
+                    connection,
+                    root.id,
+                    Some(hidden_root_id),
+                    &logical.to_string_lossy(),
+                    &title,
+                    token,
+                )?;
+                if let Err(error) =
+                    index_media_file(connection, node_id, &logical, &canonical_file, token)
+                {
+                    update_progress(app, control, &logical, |progress| {
+                        progress.errors += 1;
+                        progress.message = Some(error);
+                    });
+                    continue;
+                }
+                connection
+                    .execute(
+                        "UPDATE nodes SET
+                            node_type=CASE WHEN manual_type_override=1 THEN node_type ELSE 'AUTO_WORK' END,
+                            direct_video_count=1,child_media_branch_count=0,total_video_count=1,
+                            last_seen_at=?1,updated_at=CURRENT_TIMESTAMP
+                         WHERE id=?2",
+                        params![token, node_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                work_count += 1;
+                video_count += 1;
+                update_progress(app, control, &logical, |progress| {
+                    progress.videos_found += 1
+                });
+            } else if let Err(error) =
+                index_resource_file(connection, hidden_root_id, &logical, &canonical_file, token)
+            {
+                update_progress(app, control, &logical, |progress| {
+                    progress.errors += 1;
+                    progress.message = Some(error);
+                });
+            }
+        }
+
+        if let Some(bdmv) = bdmv {
+            match index_flat_bdmv_work(
+                app,
+                connection,
+                root.id,
+                hidden_root_id,
+                &directory.logical,
+                &bdmv,
+                canonical_root,
+                control,
+                extensions,
+                token,
+            )? {
+                Some(indexed_videos) => {
+                    work_count += 1;
+                    video_count += indexed_videos;
+                }
+                None => pending.push(bdmv),
+            }
+        }
+    }
+
+    let complete = control.progress().errors == errors_before;
+    if complete {
+        connection
+            .execute(
+                "DELETE FROM media_files WHERE node_id=?1 AND last_seen_at<>?2",
+                params![hidden_root_id, token],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM resource_files WHERE node_id=?1 AND last_seen_at<>?2",
+                params![hidden_root_id, token],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM nodes WHERE parent_node_id=?1 AND last_seen_at<>?2",
+                params![hidden_root_id, token],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute(
+            "UPDATE nodes SET
+                node_type=CASE WHEN manual_type_override=1 THEN node_type ELSE 'CONTAINER' END,
+                direct_video_count=0,child_media_branch_count=?1,total_video_count=?2,
+                last_seen_at=?3,updated_at=CURRENT_TIMESTAMP
+             WHERE id=?4",
+            params![work_count, video_count, token, hidden_root_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_flat_bdmv_work(
+    app: Option<&AppHandle>,
+    connection: &Connection,
+    root_id: i64,
+    hidden_root_id: i64,
+    containing_directory: &Path,
+    bdmv: &ScanEntryPath,
+    canonical_root: &Path,
+    control: &ScanControl,
+    extensions: &HashSet<String>,
+    token: &str,
+) -> Result<Option<i64>, ScanAbort> {
+    let Some(streams) = bdmv_stream_entries(bdmv, canonical_root).map_err(ScanAbort::Failed)?
+    else {
+        return Ok(None);
+    };
+    let title = containing_directory
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| containing_directory.to_string_lossy().into_owned());
+    let node_id = upsert_node(
+        connection,
+        root_id,
+        Some(hidden_root_id),
+        &bdmv.logical.to_string_lossy(),
+        &title,
+        token,
+    )?;
+    let mut indexed = 0_i64;
+    for stream in streams {
+        check_cancel(control)?;
+        let canonical_file = canonical_file_within_library_root(&stream.filesystem, canonical_root)
+            .map_err(ScanAbort::Failed)?;
+        index_media_file(connection, node_id, &stream.logical, &canonical_file, token)?;
+        indexed += 1;
+        update_progress(app, control, &stream.logical, |progress| {
+            progress.videos_found += 1
+        });
+    }
+    let resources_complete = index_transparent_bdmv_resources(
+        app,
+        connection,
+        node_id,
+        bdmv,
+        canonical_root,
+        control,
+        extensions,
+        token,
+    )?;
+    if resources_complete {
+        connection
+            .execute(
+                "DELETE FROM media_files WHERE node_id=?1 AND last_seen_at<>?2",
+                params![node_id, token],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "DELETE FROM resource_files WHERE node_id=?1 AND last_seen_at<>?2",
+                params![node_id, token],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute(
+            "UPDATE nodes SET
+                node_type=CASE WHEN manual_type_override=1 THEN node_type ELSE 'AUTO_WORK' END,
+                direct_video_count=?1,child_media_branch_count=0,total_video_count=?1,
+                last_seen_at=?2,updated_at=CURRENT_TIMESTAMP
+             WHERE id=?3",
+            params![indexed, token, node_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(Some(indexed))
 }
 
 fn bdmv_stream_entries(
@@ -825,7 +1158,11 @@ fn upsert_node(
         .map_err(|error| ScanAbort::Failed(format!("读取目录索引失败：{error}")))
 }
 
-fn refresh_ancestors(connection: &Connection, mut node_id: Option<i64>) -> Result<(), ScanAbort> {
+fn refresh_ancestors(
+    connection: &Connection,
+    mut node_id: Option<i64>,
+    canonical_root: &Path,
+) -> Result<(), ScanAbort> {
     while let Some(id) = node_id {
         let (path, direct_videos, parent_id) = connection
             .query_row(
@@ -845,7 +1182,7 @@ fn refresh_ancestors(connection: &Connection, mut node_id: Option<i64>) -> Resul
             direct_videos,
             child_summary.branch_count,
             child_summary.supplementary_branch_count,
-            has_typical_bdmv(Path::new(&path)),
+            has_typical_bdmv(Path::new(&path), canonical_root),
             false,
         );
         connection
@@ -1154,29 +1491,48 @@ fn file_name_eq(path: &Path, expected: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
-fn find_stream_directory(bdmv: &Path) -> Option<PathBuf> {
-    fs::read_dir(bdmv).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) && file_name_eq(&path, "STREAM") {
-            Some(path)
-        } else {
-            None
-        }
-    })
+fn find_stream_directory(bdmv: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    let canonical_bdmv = canonicalize_within_library_root(bdmv, canonical_root).ok()?;
+    if !canonical_bdmv.is_dir() {
+        return None;
+    }
+    fs::read_dir(canonical_bdmv)
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() || !file_type.is_dir() || !file_name_eq(&path, "STREAM") {
+                return None;
+            }
+            let canonical = canonicalize_within_library_root(&path, canonical_root).ok()?;
+            canonical.is_dir().then_some(canonical)
+        })
 }
 
-pub fn has_typical_bdmv(path: &Path) -> bool {
-    fs::read_dir(path)
+pub fn has_typical_bdmv(path: &Path, library_root: &Path) -> bool {
+    let Ok(canonical_root) = fs::canonicalize(library_root) else {
+        return false;
+    };
+    let Ok(canonical_path) = canonicalize_within_library_root(path, &canonical_root) else {
+        return false;
+    };
+    if !canonical_path.is_dir() {
+        return false;
+    }
+    fs::read_dir(canonical_path)
         .ok()
         .and_then(|entries| {
             entries.flatten().find_map(|entry| {
                 let candidate = entry.path();
-                if entry.file_type().is_ok_and(|kind| kind.is_dir())
-                    && file_name_eq(&candidate, "BDMV")
+                let file_type = entry.file_type().ok()?;
+                if file_type.is_symlink()
+                    || !file_type.is_dir()
+                    || !file_name_eq(&candidate, "BDMV")
                 {
-                    find_stream_directory(&candidate)
-                } else {
                     None
+                } else {
+                    find_stream_directory(&candidate, &canonical_root)
                 }
             })
         })
@@ -1698,6 +2054,69 @@ mod tests {
     }
 
     #[test]
+    fn video_file_mode_flattens_each_video_into_an_independent_work() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("逐文件媒体库");
+        let nested = root_path.join("子目录 [字幕组]");
+        let bdmv_stream = root_path.join("蓝光电影").join("BDMV").join("STREAM");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&bdmv_stream).unwrap();
+        let first = root_path.join("命运石之门 01.mkv");
+        let second = nested.join("Steins;Gate 02.mp4");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+        fs::write(root_path.join("说明.txt"), b"attachment").unwrap();
+        fs::write(bdmv_stream.join("00000.m2ts"), b"stream one").unwrap();
+        fs::write(bdmv_stream.join("00001.m2ts"), b"stream two").unwrap();
+
+        let database = Database::new(temp.path().join("test.db"));
+        database.migrate().unwrap();
+        let root = database
+            .add_root_with_mode(&root_path, None, LibraryRecognitionMode::VideoFile)
+            .unwrap();
+        database.start_scan_run("file-mode", root.id).unwrap();
+        let control = scan_control("file-mode", &root);
+        run_scan(
+            None,
+            &database,
+            vec![ScanTarget {
+                root: root.clone(),
+                path: root_path.clone(),
+                parent_node_id: None,
+            }],
+            &control,
+            &crate::db::default_video_extensions(),
+        );
+
+        assert_eq!(control.progress().status, ScanStatus::Completed);
+        assert_eq!(control.progress().videos_found, 4);
+        let all = database.list_all_resources().unwrap();
+        assert_eq!(all.total_count, 3);
+        assert!(all.nodes.iter().all(|node| node.parent_node_id.is_some()));
+        assert!(all
+            .nodes
+            .iter()
+            .all(|node| node.node_type == NodeType::AutoWork));
+        let first_node = all
+            .nodes
+            .iter()
+            .find(|node| node.folder_name == "命运石之门 01")
+            .unwrap();
+        assert_eq!(first_node.absolute_path, first.to_string_lossy());
+        assert_eq!(database.list_media(first_node.id).unwrap().len(), 1);
+        let bdmv_node = all
+            .nodes
+            .iter()
+            .find(|node| node.folder_name == "蓝光电影")
+            .unwrap();
+        assert_eq!(database.list_media(bdmv_node.id).unwrap().len(), 2);
+
+        let hidden = database.hidden_root_node_id(&root).unwrap().unwrap();
+        assert_eq!(database.list_resources(hidden).unwrap().len(), 1);
+        assert_eq!(fs::read(&first).unwrap(), b"one");
+    }
+
+    #[test]
     fn canonical_boundary_rejects_a_sibling_with_the_same_text_prefix() {
         let temp = TempDir::new().unwrap();
         let root_path = temp.path().join("Media");
@@ -1710,6 +2129,22 @@ mod tests {
         assert!(canonicalize_within_library_root(&child, &canonical_root).is_ok());
         let error = canonicalize_within_library_root(&prefix_sibling, &canonical_root).unwrap_err();
         assert!(error.contains("超出资源库根目录"), "{error}");
+    }
+
+    #[test]
+    fn bdmv_detection_never_reads_a_complete_structure_outside_the_library_root() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("Library");
+        let inside = root_path.join("Inside");
+        let outside = temp.path().join("Library-Outside");
+        fs::create_dir_all(inside.join("BDMV").join("STREAM")).unwrap();
+        fs::create_dir_all(outside.join("BDMV").join("STREAM")).unwrap();
+
+        assert!(has_typical_bdmv(&inside, &root_path));
+        assert!(
+            !has_typical_bdmv(&outside, &root_path),
+            "BDMV probing must canonicalize before enumerating outside a Library Root"
+        );
     }
 
     #[test]

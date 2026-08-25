@@ -279,9 +279,10 @@ fn extract_keyword_with_mode(raw_name: &str, preserve_semantics: bool) -> (Strin
         raw_name
     };
     let without_extension = strip_known_extension(source.trim());
-    let mut output = String::with_capacity(without_extension.len());
+    let normalized_separators = normalize_release_separators(without_extension);
+    let mut output = String::with_capacity(normalized_separators.len());
     let mut removed_noise = Vec::new();
-    let characters = without_extension.chars().collect::<Vec<_>>();
+    let characters = normalized_separators.chars().collect::<Vec<_>>();
     let mut index = 0;
     let mut visible_text_seen = false;
 
@@ -319,6 +320,32 @@ fn extract_keyword_with_mode(raw_name: &str, preserve_semantics: bool) -> (Strin
     let (cleaned, word_noise) = remove_technical_words(&output, preserve_semantics);
     removed_noise.extend(word_noise);
     (cleaned, removed_noise)
+}
+
+/// Scene-style movie and television releases commonly use periods as word separators, for
+/// example `The.Sword.of.Doom.1966.1080p`. Scoring ignores punctuation, but sending the whole
+/// dotted value as one token prevents the year and encode noise from being removed first. Only
+/// normalize a multi-period name when one segment is recognizable release metadata, preserving
+/// ordinary dotted titles that do not look like a release name.
+fn normalize_release_separators(value: &str) -> String {
+    let parts = value.split('.').collect::<Vec<_>>();
+    let normalize_periods = parts.len() >= 3
+        && parts.iter().any(|part| {
+            let part = part.trim();
+            detect_year(part).is_some()
+                || (is_technical_atom(part)
+                    && !part.chars().all(|character| character.is_ascii_digit()))
+        });
+    value
+        .chars()
+        .map(|character| {
+            if character == '_' || (normalize_periods && character == '.') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn strip_known_extension(value: &str) -> &str {
@@ -1270,6 +1297,48 @@ mod tests {
         assert!(evidence.primary_title.contains("Made in Abyss"));
         assert!(evidence.removed_noise.iter().any(|value| value == "1080p"));
         assert_eq!(evidence.parent_title.as_deref(), Some("Made in Abyss"));
+    }
+
+    #[test]
+    fn structured_evidence_extracts_a_common_live_action_movie_release_name() {
+        let evidence = build_match_evidence(
+            "[YTS] Oppenheimer (2023) [1080p][BluRay][x264]",
+            "[YTS] Oppenheimer (2023) [1080p][BluRay][x264]",
+            None,
+            &["Oppenheimer.2023.1080p.BluRay.x264.mkv".into()],
+        );
+        assert_eq!(evidence.primary_title, "Oppenheimer");
+        assert_eq!(evidence.year, Some(2023));
+        assert!(is_safe_match_query(&evidence.primary_title));
+    }
+
+    #[test]
+    fn dotted_scene_movie_names_become_clean_structured_queries() {
+        let cases = [
+            (
+                "The.Sword.of.Doom.1966.1080p.BluRay.x264",
+                "The Sword of Doom",
+                1966,
+            ),
+            ("WolfWalkers.2020.1080p.BluRay.x265", "WolfWalkers", 2020),
+            (
+                "The.Empire.of.Corpses.2015.1080p.BDRip.HEVC",
+                "The Empire of Corpses",
+                2015,
+            ),
+        ];
+        for (raw, expected_title, expected_year) in cases {
+            let evidence = build_match_evidence(raw, raw, None, &[]);
+            assert_eq!(evidence.primary_title, expected_title, "raw={raw}");
+            assert_eq!(evidence.year, Some(expected_year), "raw={raw}");
+            assert_eq!(extract_search_keyword(raw), expected_title, "raw={raw}");
+            assert!(is_safe_match_query(&evidence.primary_title), "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn meaningful_dotted_title_without_release_metadata_is_preserved() {
+        assert_eq!(extract_search_keyword("K.O.2"), "K.O.2");
     }
 
     #[test]

@@ -2,7 +2,7 @@ import type { ReactNode, SVGProps } from "react";
 
 export type IconName =
   | "archive" | "arrow-left" | "bangumi" | "check" | "chevron" | "clock"
-  | "close" | "database" | "edit" | "external" | "file" | "folder"
+  | "close" | "database" | "download" | "edit" | "external" | "file" | "folder"
   | "folder-open" | "grid" | "image" | "info" | "list" | "more"
   | "play" | "plus" | "refresh" | "search" | "settings" | "shield"
   | "stop" | "trash" | "warning" | "work" | "audio" | "subtitle" | "font"
@@ -21,6 +21,7 @@ const paths: Record<IconName, ReactNode> = {
   clock: <><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.4 2"/></>,
   close: <path d="m6 6 12 12M18 6 6 18"/>,
   database: <><ellipse cx="12" cy="5.5" rx="7.5" ry="3"/><path d="M4.5 5.5v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6M4.5 11.5v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/></>,
+  download: <><path d="M12 3v12m0 0 5-5m-5 5-5-5"/><path d="M5 20h14"/></>,
   edit: <><path d="M4 20h4l11-11-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/></>,
   external: <><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v6H5V6h6"/></>,
   file: <><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h5"/></>,

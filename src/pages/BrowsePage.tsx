@@ -103,7 +103,6 @@ export function BrowsePage({ data, currentNode, loading, viewMode, onViewMode, f
         {nodes.length > 0 && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">{t("browse.children")}</p><h2>{t("browse.continue")}</h2></div><span>{t("browse.nodeCount", { count: nodes.length })}</span></div><PosterGrid nodes={nodes} viewMode={viewMode} onOpen={onOpenNode} onMenu={onMenu} onBangumi={onBangumi} onRetryCover={onRetryCover} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} onSelect={onToggleSelection} /></section>}
         {resourceFiles.length > 0 && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">{t("browse.otherResources")}</p><h2>{t("browse.nonVideoFiles")}</h2></div><span>{t("browse.fileCount", { count: resourceFiles.length })}</span></div><OtherResourceList files={resourceFiles} folders={[]} onOpenFile={onOpenResource} onRevealFile={onRevealResource} onOpenFolder={onOpenNode} onFolderMenu={onMenu} /></section>}
         {nodes.length === 0 && mediaFiles.length === 0 && resourceFiles.length === 0 && <EmptyState compact icon={hasActiveFilter ? "search" : "folder"} title={hasActiveFilter ? t("browse.noMatch") : t("browse.empty")} description={hasActiveFilter ? t("browse.noMatchDescription") : t("browse.emptyFolderDescription")} />}
-        {mediaFiles.length > 0 && <p className="double-click-hint"><Icon name="info" />{t("browse.playHint")}</p>}
       </div>
     </section>
   );

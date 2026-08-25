@@ -3,15 +3,16 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread,
     time::Duration,
 };
 
 use reqwest::{
     blocking::Client,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-    Url,
+    header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER},
+    StatusCode, Url,
 };
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use crate::{cache, db::AppResult, models::BangumiSubject};
@@ -24,11 +25,52 @@ const USER_AGENT: &str = concat!(
     " (Windows; https://space.bilibili.com/2903441)"
 );
 const MAX_COVER_DOWNLOAD_BYTES: u64 = 15 * 1024 * 1024;
+const MAX_SEARCH_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_DETAIL_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SEARCH_KEYWORD_CHARS: usize = 200;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(350);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_MATCH_ALIASES: usize = 32;
+pub const SUBJECT_TYPE_ANIME: i64 = 2;
+pub const SUBJECT_TYPE_LIVE_ACTION: i64 = 6;
+const SUPPORTED_SUBJECT_TYPES: [i64; 2] = [SUBJECT_TYPE_ANIME, SUBJECT_TYPE_LIVE_ACTION];
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+#[derive(Debug)]
+enum ProviderRequestError {
+    Transport(reqwest::Error),
+    Http {
+        status: StatusCode,
+        retry_after: Option<Duration>,
+    },
+    ResponseTooLarge {
+        limit: u64,
+    },
+    Read(std::io::Error),
+    Decode(serde_json::Error),
+}
+
+impl ProviderRequestError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(error) => should_retry(error),
+            Self::Http { status, .. } => is_retryable_status(*status),
+            Self::ResponseTooLarge { .. } | Self::Read(_) | Self::Decode(_) => false,
+        }
+    }
+
+    fn retry_delay(&self) -> Duration {
+        match self {
+            Self::Http {
+                retry_after: Some(delay),
+                ..
+            } => (*delay).min(MAX_RETRY_DELAY),
+            _ => DEFAULT_RETRY_DELAY,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
@@ -113,10 +155,16 @@ pub fn search(keyword: &str, limit: usize) -> AppResult<Vec<BangumiSubject>> {
     Ok(response
         .data
         .into_iter()
-        // Subject type 2 is anime. Keep a defensive filter even when the API honors it.
-        .filter(|subject| subject.subject_type == 2)
+        // Type 2 is animation and type 6 is live action. Keep a defensive filter even when the
+        // API honors the multi-value filter so unrelated books/music/games never enter matching.
+        .filter(|subject| is_supported_subject_type(subject.subject_type))
+        .take(limit.clamp(1, 50))
         .map(api_subject_to_model)
         .collect())
+}
+
+pub fn is_supported_subject_type(subject_type: i64) -> bool {
+    SUPPORTED_SUBJECT_TYPES.contains(&subject_type)
 }
 
 fn api_subject_to_model(subject: ApiSubject) -> BangumiSubject {
@@ -146,8 +194,8 @@ fn api_subject_to_model(subject: ApiSubject) -> BangumiSubject {
 }
 
 pub fn enrich_subject(subject: &BangumiSubject) -> AppResult<BangumiSubject> {
-    if subject.subject_id <= 0 || subject.subject_type != 2 {
-        return Err("只能读取有效的 Bangumi 动画条目。".into());
+    if subject.subject_id <= 0 || !is_supported_subject_type(subject.subject_type) {
+        return Err("只能读取有效的 Bangumi 动画或真人影视条目。".into());
     }
     let client = client()?;
     let detail = detail_with_retry(&client, subject.subject_id)?;
@@ -158,8 +206,11 @@ fn merge_subject_detail(
     subject: &BangumiSubject,
     detail: ApiSubjectDetail,
 ) -> AppResult<BangumiSubject> {
-    if detail.id != subject.subject_id || detail.subject_type != 2 {
-        return Err("Bangumi 条目详情与所选动画不匹配。".into());
+    if detail.id != subject.subject_id
+        || detail.subject_type != subject.subject_type
+        || !is_supported_subject_type(detail.subject_type)
+    {
+        return Err("Bangumi 条目详情与所选作品不匹配。".into());
     }
 
     let mut match_aliases = subject.match_aliases.clone();
@@ -306,16 +357,12 @@ fn detail_with_retry(client: &Client, subject_id: i64) -> AppResult<ApiSubjectDe
     let endpoint = format!("{SUBJECT_DETAIL_URL}/{subject_id}");
     let mut failures = Vec::new();
     for attempt in 0..2 {
-        match client
-            .get(&endpoint)
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.json::<ApiSubjectDetail>())
-        {
+        match detail_endpoint(client, &endpoint) {
             Ok(detail) => return Ok(detail),
             Err(error) => {
-                failures.push(endpoint_failure_label(&endpoint, &error));
-                if attempt == 0 && should_retry(&error) {
+                failures.push(provider_endpoint_failure_label(&endpoint, &error));
+                if attempt == 0 && error.is_retryable() {
+                    thread::sleep(error.retry_delay());
                     continue;
                 }
                 break;
@@ -326,6 +373,14 @@ fn detail_with_retry(client: &Client, subject_id: i64) -> AppResult<ApiSubjectDe
         "读取 Bangumi 条目详情失败：{}。将保留搜索结果中的条目信息。",
         failures.join("；")
     ))
+}
+
+fn detail_endpoint(
+    client: &Client,
+    endpoint: &str,
+) -> Result<ApiSubjectDetail, ProviderRequestError> {
+    let response = checked_response(client.get(endpoint).send())?;
+    decode_bounded_json(response, MAX_DETAIL_RESPONSE_BYTES)
 }
 
 fn preferred_image(images: ApiImages) -> Option<String> {
@@ -403,8 +458,9 @@ fn search_with_retry(client: &Client, keyword: &str, limit: usize) -> AppResult<
         match search_endpoint(client, SEARCH_URL, keyword, limit) {
             Ok(response) => return Ok(response),
             Err(error) => {
-                failures.push(endpoint_failure_label(SEARCH_URL, &error));
-                if attempt == 0 && should_retry(&error) {
+                failures.push(provider_endpoint_failure_label(SEARCH_URL, &error));
+                if attempt == 0 && error.is_retryable() {
+                    thread::sleep(error.retry_delay());
                     continue;
                 }
                 break;
@@ -423,26 +479,157 @@ fn search_endpoint(
     endpoint: &str,
     keyword: &str,
     limit: usize,
-) -> Result<SearchResponse, reqwest::Error> {
-    client
-        .post(endpoint)
-        .query(&[("limit", limit.clamp(1, 50)), ("offset", 0_usize)])
-        .json(&json!({
-            "keyword": keyword,
-            "sort": "match",
-            "filter": { "type": [2], "nsfw": false }
-        }))
-        .send()?
-        .error_for_status()?
-        .json::<SearchResponse>()
+) -> Result<SearchResponse, ProviderRequestError> {
+    let response = checked_response(
+        client
+            .post(endpoint)
+            .query(&[("limit", limit.clamp(1, 50)), ("offset", 0_usize)])
+            .json(&search_request_body(keyword))
+            .send(),
+    )?;
+    decode_bounded_json(response, MAX_SEARCH_RESPONSE_BYTES)
+}
+
+fn search_request_body(keyword: &str) -> Value {
+    json!({
+        "keyword": keyword,
+        "sort": "match",
+        "filter": { "type": SUPPORTED_SUBJECT_TYPES, "nsfw": false }
+    })
+}
+
+fn checked_response(
+    response: Result<reqwest::blocking::Response, reqwest::Error>,
+) -> Result<reqwest::blocking::Response, ProviderRequestError> {
+    let response = response.map_err(ProviderRequestError::Transport)?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    Err(ProviderRequestError::Http {
+        status,
+        retry_after: parse_retry_after(response.headers().get(RETRY_AFTER)),
+    })
+}
+
+fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    value?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn decode_bounded_json<T>(
+    response: reqwest::blocking::Response,
+    limit: u64,
+) -> Result<T, ProviderRequestError>
+where
+    T: DeserializeOwned,
+{
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(ProviderRequestError::ResponseTooLarge { limit });
+    }
+    decode_bounded_json_reader(response, limit)
+}
+
+fn decode_bounded_json_reader<T, R>(reader: R, limit: u64) -> Result<T, ProviderRequestError>
+where
+    T: DeserializeOwned,
+    R: Read,
+{
+    let initial_capacity = usize::try_from(limit.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ProviderRequestError::Read)?;
+    if bytes.len() as u64 > limit {
+        return Err(ProviderRequestError::ResponseTooLarge { limit });
+    }
+    serde_json::from_slice(&bytes).map_err(ProviderRequestError::Decode)
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 fn should_retry(error: &reqwest::Error) -> bool {
-    error.is_connect()
-        || error.is_timeout()
-        || error
-            .status()
-            .is_some_and(|status| status.is_server_error())
+    error.is_connect() || error.is_timeout() || error.status().is_some_and(is_retryable_status)
+}
+
+fn reqwest_retry_delay(_error: &reqwest::Error) -> Duration {
+    // error_for_status does not retain Retry-After headers in a usable response. Search/detail
+    // use ProviderRequestError above and honor a numeric Retry-After up to two seconds; cover
+    // retries use this short bounded fallback.
+    DEFAULT_RETRY_DELAY
+}
+
+fn provider_endpoint_failure_label(endpoint: &str, error: &ProviderRequestError) -> String {
+    let host = Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "未知地址".into());
+    match error {
+        ProviderRequestError::Transport(error) => endpoint_failure_label(endpoint, error),
+        ProviderRequestError::Http { status, .. } => {
+            format!("{host} 返回 HTTP {}", status.as_u16())
+        }
+        ProviderRequestError::ResponseTooLarge { limit } => {
+            format!("{host} 响应超过 {} MiB 安全限制", limit / (1024 * 1024))
+        }
+        ProviderRequestError::Read(error) => {
+            format!("{host} 响应读取失败（{error}）")
+        }
+        ProviderRequestError::Decode(error) => {
+            format!("{host} 响应格式无效（{error}）")
+        }
+    }
+}
+
+/// Detail enrichment is optional search evidence. A transport outage, a throttled provider, or a
+/// server-wide failure should stop multiplying the same delay across hundreds of Subjects, while
+/// an individual stale Subject (404) or malformed record must not disable unrelated details.
+pub(crate) fn is_provider_wide_detail_error(error: &str) -> bool {
+    is_provider_wide_network_error(error)
+}
+
+/// Cover downloads share a CDN and otherwise run once per newly bound Node. Stop the rest of the
+/// run after transport/rate-limit/server failures, but keep 404, a missing image, and malformed
+/// content local to that one Subject.
+pub(crate) fn is_provider_wide_cover_error(error: &str) -> bool {
+    is_provider_wide_network_error(error) || error.contains("读取 Bangumi 封面失败")
+}
+
+fn is_provider_wide_network_error(error: &str) -> bool {
+    if [
+        "无法初始化 Bangumi 网络客户端",
+        "连接超时",
+        "无法连接",
+        "请求失败",
+        "响应读取失败",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+    {
+        return true;
+    }
+    error
+        .split("返回 HTTP ")
+        .nth(1)
+        .map(|suffix| {
+            suffix
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(|status| status == 429 || (500..=599).contains(&status))
 }
 
 fn endpoint_failure_label(endpoint: &str, error: &reqwest::Error) -> String {
@@ -551,17 +738,22 @@ pub fn download_cover(
         drop(temporary_file);
         return Err(format!("校验封面缓存失败：{error}"));
     }
-    let mut signature = [0_u8; 12];
-    let signature_length = match temporary_file.read(&mut signature) {
-        Ok(length) => length,
-        Err(error) => {
-            drop(temporary_file);
-            return Err(format!("校验封面缓存失败：{error}"));
-        }
-    };
-    if !valid_image_signature(&content_type, &signature[..signature_length]) {
+    let mut bytes = Vec::with_capacity(copied as usize);
+    if let Err(error) = temporary_file.read_to_end(&mut bytes) {
+        drop(temporary_file);
+        return Err(format!("校验封面缓存失败：{error}"));
+    }
+    if !valid_image_signature(&content_type, &bytes) {
         drop(temporary_file);
         return Err("Bangumi 封面内容与图片格式不匹配。".into());
+    }
+    if let Err(error) = cache::validate_cover_payload(&bytes) {
+        drop(temporary_file);
+        return Err(format!("Bangumi 封面未通过安全校验：{error}"));
+    }
+    if let Err(error) = temporary_file.seek(SeekFrom::Start(0)) {
+        drop(temporary_file);
+        return Err(format!("校验封面缓存失败：{error}"));
     }
     drop(temporary_file);
     pending_file
@@ -585,6 +777,7 @@ fn download_response_with_retry(
             Err(error) => {
                 failures.push(endpoint_failure_label(image_url, &error));
                 if attempt == 0 && should_retry(&error) {
+                    thread::sleep(reqwest_retry_delay(&error));
                     continue;
                 }
                 break;
@@ -618,6 +811,90 @@ mod tests {
     fn search_rejects_oversized_keywords_before_network_access() {
         let error = search(&"x".repeat(MAX_SEARCH_KEYWORD_CHARS + 1), 20).unwrap_err();
         assert!(error.contains("不能超过"));
+    }
+
+    #[test]
+    fn bounded_json_reader_rejects_oversized_or_invalid_responses() {
+        let parsed: Value =
+            decode_bounded_json_reader(std::io::Cursor::new(br#"{"ok":true}"#), 64).unwrap();
+        assert_eq!(parsed["ok"], true);
+
+        let oversized =
+            decode_bounded_json_reader::<Value, _>(std::io::Cursor::new(vec![b' '; 65]), 64)
+                .unwrap_err();
+        assert!(matches!(
+            oversized,
+            ProviderRequestError::ResponseTooLarge { limit: 64 }
+        ));
+
+        let invalid =
+            decode_bounded_json_reader::<Value, _>(std::io::Cursor::new(b"{"), 64).unwrap_err();
+        assert!(matches!(invalid, ProviderRequestError::Decode(_)));
+    }
+
+    #[test]
+    fn retry_policy_handles_rate_limits_with_a_bounded_delay() {
+        let rate_limited = ProviderRequestError::Http {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(Duration::from_secs(60)),
+        };
+        assert!(rate_limited.is_retryable());
+        assert_eq!(rate_limited.retry_delay(), MAX_RETRY_DELAY);
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+
+        let one_second = HeaderValue::from_static("1");
+        assert_eq!(
+            parse_retry_after(Some(&one_second)),
+            Some(Duration::from_secs(1))
+        );
+        let invalid = HeaderValue::from_static("not-a-delay");
+        assert_eq!(parse_retry_after(Some(&invalid)), None);
+    }
+
+    #[test]
+    fn detail_circuit_breaker_only_classifies_provider_wide_failures() {
+        for error in [
+            "读取 Bangumi 条目详情失败：api.bgm.tv 连接超时。",
+            "读取 Bangumi 条目详情失败：api.bgm.tv 无法连接。",
+            "读取 Bangumi 条目详情失败：api.bgm.tv 返回 HTTP 429。",
+            "读取 Bangumi 条目详情失败：api.bgm.tv 返回 HTTP 503。",
+        ] {
+            assert!(is_provider_wide_detail_error(error), "error={error}");
+        }
+        assert!(!is_provider_wide_detail_error("api.bgm.tv 返回 HTTP 404"));
+        assert!(!is_provider_wide_detail_error("api.bgm.tv 响应格式无效"));
+    }
+
+    #[test]
+    fn cover_circuit_breaker_only_classifies_provider_wide_failures() {
+        for error in [
+            "下载 Bangumi 封面失败：lain.bgm.tv 连接超时。",
+            "下载 Bangumi 封面失败：lain.bgm.tv 无法连接。",
+            "下载 Bangumi 封面失败：lain.bgm.tv 返回 HTTP 429。",
+            "下载 Bangumi 封面失败：lain.bgm.tv 返回 HTTP 502。",
+            "读取 Bangumi 封面失败：连接被重置",
+        ] {
+            assert!(is_provider_wide_cover_error(error), "error={error}");
+        }
+        for error in [
+            "lain.bgm.tv 返回 HTTP 404",
+            "Bangumi 封面响应不是支持的图片格式。",
+            "Bangumi 封面未通过安全校验：封面图片尺寸过大。",
+        ] {
+            assert!(!is_provider_wide_cover_error(error), "error={error}");
+        }
+    }
+
+    #[test]
+    fn search_requests_only_animation_and_live_action_subjects() {
+        let body = search_request_body("奥本海默");
+        assert_eq!(body["filter"]["type"], json!([2, 6]));
+        assert!(is_supported_subject_type(SUBJECT_TYPE_ANIME));
+        assert!(is_supported_subject_type(SUBJECT_TYPE_LIVE_ACTION));
+        for unsupported in [1, 3, 4, 5, 7] {
+            assert!(!is_supported_subject_type(unsupported));
+        }
     }
 
     #[test]
@@ -770,14 +1047,74 @@ mod tests {
     }
 
     #[test]
+    fn subject_detail_preserves_live_action_type_and_rejects_type_switches() {
+        let search_subject = BangumiSubject {
+            subject_id: 451975,
+            title: "Oppenheimer".into(),
+            title_cn: Some("奥本海默".into()),
+            title_en: None,
+            title_ja: None,
+            title_ko: None,
+            match_aliases: Vec::new(),
+            date: Some("2023-07-21".into()),
+            image_url: None,
+            summary: None,
+            subject_type: SUBJECT_TYPE_LIVE_ACTION,
+        };
+        let detail: ApiSubjectDetail = serde_json::from_str(
+            r#"{
+                "id": 451975,
+                "type": 6,
+                "name": "Oppenheimer",
+                "name_cn": "奥本海默",
+                "date": "2023-07-21",
+                "summary": "summary",
+                "images": null,
+                "infobox": []
+            }"#,
+        )
+        .unwrap();
+        let merged = merge_subject_detail(&search_subject, detail).unwrap();
+        assert_eq!(merged.subject_type, SUBJECT_TYPE_LIVE_ACTION);
+
+        let wrong_type_detail: ApiSubjectDetail = serde_json::from_str(
+            r#"{
+                "id": 451975,
+                "type": 2,
+                "name": "Oppenheimer",
+                "name_cn": null,
+                "date": null,
+                "summary": null,
+                "images": null,
+                "infobox": []
+            }"#,
+        )
+        .unwrap();
+        assert!(merge_subject_detail(&search_subject, wrong_type_detail).is_err());
+    }
+
+    #[test]
     #[ignore = "requires external network access"]
-    fn live_search_returns_anime_results() {
+    fn live_search_returns_supported_subject_results() {
         let results = search("葬送的芙莉莲", 3).expect("Bangumi live search should succeed");
         assert!(!results.is_empty());
-        assert!(results.iter().all(|subject| subject.subject_type == 2));
+        assert!(results
+            .iter()
+            .all(|subject| is_supported_subject_type(subject.subject_type)));
         assert!(results
             .iter()
             .any(|subject| !subject.match_aliases.is_empty()));
+    }
+
+    #[test]
+    #[ignore = "requires external network access"]
+    fn live_search_returns_a_live_action_movie() {
+        let results = search("盗梦空间", 10).expect("Bangumi live search should succeed");
+        assert!(results.iter().any(|subject| {
+            subject.subject_id == 24057
+                && subject.subject_type == SUBJECT_TYPE_LIVE_ACTION
+                && subject.image_url.is_some()
+        }));
     }
 
     #[test]

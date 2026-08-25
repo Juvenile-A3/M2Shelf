@@ -135,6 +135,29 @@ pub struct CollectionSortPreferences {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LibraryRecognitionMode {
+    Folder,
+    VideoFile,
+}
+
+impl LibraryRecognitionMode {
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            Self::Folder => "FOLDER",
+            Self::VideoFile => "VIDEO_FILE",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "VIDEO_FILE" => Self::VideoFile,
+            _ => Self::Folder,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryRoot {
     pub id: i64,
@@ -142,6 +165,7 @@ pub struct LibraryRoot {
     pub display_name: String,
     pub created_at: String,
     pub last_scan_at: Option<String>,
+    pub recognition_mode: LibraryRecognitionMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +179,7 @@ pub struct MetadataBinding {
     pub node_id: i64,
     pub provider: String,
     pub provider_subject_id: i64,
+    pub provider_subject_type: i64,
     pub provider_title: String,
     pub provider_title_cn: Option<String>,
     pub provider_title_en: Option<String>,
@@ -319,6 +344,7 @@ pub struct AppBootstrap {
     pub architecture: &'static str,
     pub website_url: &'static str,
     pub x_url: &'static str,
+    pub update_recovery_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +528,30 @@ pub struct AppSettings {
     pub language: String,
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+}
+
+pub const MAX_SETTINGS_PATH_CHARS: usize = 32_767;
+
+impl AppSettings {
+    pub fn validate_path_lengths(&self) -> Result<(), String> {
+        if self
+            .mpv_path
+            .as_deref()
+            .is_some_and(|path| path.chars().count() > MAX_SETTINGS_PATH_CHARS)
+        {
+            return Err(format!(
+                "播放器路径不能超过 {MAX_SETTINGS_PATH_CHARS} 个字符。"
+            ));
+        }
+        if self.cover_cache_directory.chars().count() > MAX_SETTINGS_PATH_CHARS {
+            return Err(format!(
+                "封面缓存目录不能超过 {MAX_SETTINGS_PATH_CHARS} 个字符。"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Application-owned logical dimensions for the main window. This is intentionally separate
@@ -520,6 +570,72 @@ fn default_language() -> String {
 
 fn default_theme() -> String {
     "system".into()
+}
+
+fn default_auto_check_updates() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableUpdate {
+    pub version: String,
+    pub published_at: String,
+    pub release_notes: std::collections::BTreeMap<String, String>,
+    pub file_name: String,
+    pub download_size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub distribution: UpdateDistribution,
+    pub checked_at: String,
+    pub update: Option<AvailableUpdate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDownloadStatus {
+    pub phase: UpdatePhase,
+    pub version: Option<String>,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub error: Option<String>,
+    pub can_install: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UpdateDistribution {
+    Portable,
+    Nsis,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UpdatePhase {
+    Idle,
+    Checking,
+    Downloading,
+    Ready,
+    Applying,
+    Failed,
+}
+
+impl Default for UpdateDownloadStatus {
+    fn default() -> Self {
+        Self {
+            phase: UpdatePhase::Idle,
+            version: None,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            error: None,
+            can_install: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -34,6 +34,7 @@ secrets.json
 *.sqlite3-*
 *.pem
 *.key
+*.dpapi
 *.pfx
 *.p12
 *.tsbuildinfo

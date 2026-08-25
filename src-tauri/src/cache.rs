@@ -156,23 +156,26 @@ pub fn validate_cache_location(
 }
 
 pub fn paths_overlap(left: &Path, right: &Path) -> bool {
-    let Ok(left) = resolve_for_comparison(left) else {
-        return false;
-    };
-    let Ok(right) = resolve_for_comparison(right) else {
-        return false;
-    };
-    paths_overlap_resolved(&left, &right)
+    paths_overlap_checked(left, right).unwrap_or(false)
+}
+
+/// Security-sensitive callers must not treat an unresolvable path as non-overlapping. Keep the
+/// historical boolean wrapper for presentation/cache ownership checks, and expose this fail-closed
+/// variant for updater and source-read-only boundaries.
+pub(crate) fn paths_overlap_checked(left: &Path, right: &Path) -> AppResult<bool> {
+    let left = resolve_for_comparison(left)?;
+    let right = resolve_for_comparison(right)?;
+    Ok(paths_overlap_resolved(&left, &right))
 }
 
 pub fn is_equal_or_within(candidate: &Path, root: &Path) -> bool {
-    let Ok(candidate) = resolve_for_comparison(candidate) else {
-        return false;
-    };
-    let Ok(root) = resolve_for_comparison(root) else {
-        return false;
-    };
-    path_starts_with(&candidate, &root)
+    is_equal_or_within_checked(candidate, root).unwrap_or(false)
+}
+
+pub(crate) fn is_equal_or_within_checked(candidate: &Path, root: &Path) -> AppResult<bool> {
+    let candidate = resolve_for_comparison(candidate)?;
+    let root = resolve_for_comparison(root)?;
+    Ok(path_starts_with(&candidate, &root))
 }
 
 fn paths_overlap_resolved(left: &Path, right: &Path) -> bool {
@@ -205,7 +208,7 @@ fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
     }
 }
 
-fn resolve_for_comparison(path: &Path) -> AppResult<PathBuf> {
+pub(crate) fn resolve_for_comparison(path: &Path) -> AppResult<PathBuf> {
     if !path.is_absolute() {
         return Err("路径必须是绝对路径。".into());
     }
@@ -340,6 +343,19 @@ fn validate_manual_cover(bytes: &[u8], expected_format: CoverFormat) -> AppResul
     if detected_format != expected_format {
         return Err("封面文件扩展名与实际图片格式不一致。".into());
     }
+    validate_cover_dimensions(bytes, detected_format)
+}
+
+/// Validates application-cached cover bytes before they are committed or decoded by the WebView.
+/// This catches tiny compressed files with maliciously large declared dimensions without loading
+/// their pixel buffer.
+pub(crate) fn validate_cover_payload(bytes: &[u8]) -> AppResult<()> {
+    let detected_format = detect_cover_format(bytes)
+        .ok_or_else(|| "封面不是支持的 JPG、PNG 或 WEBP 图片。".to_string())?;
+    validate_cover_dimensions(bytes, detected_format)
+}
+
+fn validate_cover_dimensions(bytes: &[u8], detected_format: CoverFormat) -> AppResult<()> {
     let (width, height) = image_dimensions(bytes, detected_format)?;
     if width == 0 || height == 0 {
         return Err("封面图片尺寸无效。".into());
@@ -661,6 +677,7 @@ pub fn cover_data_url(
     if bytes.len() as u64 > MAX_COVER_BYTES {
         return Err("封面缓存超过 15 MiB 安全限制。".into());
     }
+    validate_cover_payload(&bytes)?;
     let mime = image_mime(&bytes)
         .ok_or_else(|| "封面缓存不是支持的 JPG、PNG 或 WEBP 图片。".to_string())?;
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
@@ -919,10 +936,22 @@ mod tests {
     fn cover_data_url_uses_content_signature() {
         let temp = TempDir::new().unwrap();
         let cover = temp.path().join("cover.bin");
-        fs::write(&cover, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        fs::write(&cover, png_fixture(600, 900)).unwrap();
         let cache_operation = begin_cover_cache_operation();
         let data_url = cover_data_url(&cache_operation, &cover).unwrap();
         assert!(data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn cover_data_url_rejects_abnormal_cached_pixel_dimensions() {
+        let temp = TempDir::new().unwrap();
+        let cover = temp.path().join("oversized.png");
+        fs::write(&cover, png_fixture(20_000, 20_000)).unwrap();
+        let cache_operation = begin_cover_cache_operation();
+
+        let error = cover_data_url(&cache_operation, &cover).unwrap_err();
+
+        assert!(error.contains("尺寸过大"));
     }
 
     #[test]

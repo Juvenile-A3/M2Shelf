@@ -3,10 +3,12 @@ import type { SearchHit } from "../types/media";
 import { EmptyState } from "../components/EmptyState";
 import { Icon } from "../components/Icon";
 import { LoadingState } from "../components/LoadingState";
+import { PosterImage } from "../components/PosterImage";
 import { api } from "../lib/api";
 import { compactPath, errorMessage, formatBytes, nodeDisplayTitle, nodeTypeLabel } from "../lib/format";
 import { useI18n } from "../lib/i18n";
 import { useCoverDataUrl } from "../hooks/useCoverDataUrl";
+import { usePosterViewportLifecycle } from "../hooks/usePosterViewportLifecycle";
 
 interface SearchPageProps {
   initialQuery?: string;
@@ -20,7 +22,18 @@ interface SearchPageProps {
 
 function SearchResult({ hit, index, coverRevision, onOpen }: { hit: SearchHit; index: number; coverRevision: number; onOpen: (hit: SearchHit) => void }) {
   const { t } = useI18n();
-  const { coverUrl, coverFailed: coverReadFailed } = useCoverDataUrl(hit.node, coverRevision);
+  const resultRef = useRef<HTMLButtonElement>(null);
+  const hasCachedCover = Boolean(hit.node.coverCachePath ?? hit.node.binding?.coverCachePath);
+  const { coverRequested, coverVisible } = usePosterViewportLifecycle(
+    resultRef,
+    `${hit.node.id}:${hit.mediaFile?.id ?? ""}`,
+    {
+      activationMarginPx: 800,
+      retentionEnabled: hasCachedCover,
+      retentionMarginPx: 1_400,
+    },
+  );
+  const { coverCacheKey, coverUrl, coverFailed: coverReadFailed } = useCoverDataUrl(hit.node, coverRevision, coverRequested);
   const [imageFailed, setImageFailed] = useState(false);
   const title = hit.mediaFile?.fileName ?? nodeDisplayTitle(hit.node);
   const nodeTitle = nodeDisplayTitle(hit.node);
@@ -30,10 +43,10 @@ function SearchResult({ hit, index, coverRevision, onOpen }: { hit: SearchHit; i
   useEffect(() => setImageFailed(false), [coverUrl]);
 
   return (
-    <button className="search-hit" key={`${hit.kind}-${hit.mediaFile?.id ?? hit.node.id}-${index}`} onClick={() => onOpen(hit)} type="button">
+    <button className="search-hit" key={`${hit.kind}-${hit.mediaFile?.id ?? hit.node.id}-${index}`} onClick={() => onOpen(hit)} ref={resultRef} type="button">
       <span className={`search-hit-cover ${coverUrl && !coverFailed ? "has-cover" : "is-placeholder"} ${coverFailed ? "is-failed" : ""}`}>
         {coverUrl && !coverFailed
-          ? <img alt={t("card.coverAlt", { title: nodeTitle })} onError={() => setImageFailed(true)} src={coverUrl} />
+          ? <PosterImage active={coverVisible} alt={t("card.coverAlt", { title: nodeTitle })} cacheKey={coverCacheKey} onError={() => setImageFailed(true)} src={coverUrl} />
           : <Icon name={placeholderIcon} />}
       </span>
       <span className="search-hit-copy"><small>{hit.kind === "MEDIA_FILE" ? t("search.videoFile") : nodeTypeLabel(hit.node.nodeType)}</small><strong>{title}</strong><em>{compactPath(hit.mediaFile?.absolutePath ?? hit.node.absolutePath, 96)}</em></span>

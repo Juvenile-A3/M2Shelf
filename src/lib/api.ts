@@ -15,6 +15,7 @@ import type {
   CollectionSortScope,
   FavoriteFolder,
   LibraryRoot,
+  LibraryRecognitionMode,
   MediaNode,
   MetadataBinding,
   NodeDetail,
@@ -26,6 +27,9 @@ import type {
   SearchHit,
   UserTag,
   UserTagMembership,
+  UpdateCheckResult,
+  UpdateDownloadStatus,
+  UpdateRecoveryNotice,
 } from "../types/media";
 import { translateActive } from "./i18n";
 
@@ -92,6 +96,11 @@ const commandErrorKeys = {
   list_favorite_folder_nodes: "error.favoritesFailed",
   batch_add_nodes_to_favorite: "error.favoritesFailed",
   batch_remove_nodes_from_favorite: "error.favoritesFailed",
+  check_for_update: "error.updateCheckFailed",
+  download_update: "error.updateDownloadFailed",
+  get_update_download_status: "error.updateDownloadFailed",
+  install_downloaded_update: "error.updateInstallFailed",
+  acknowledge_update_recovery_notice: "error.updateRecoveryAcknowledgeFailed",
 } as const;
 
 function commandErrorMessage(command: string): string {
@@ -114,9 +123,12 @@ export const desktopAvailable = isTauri();
 
 export const api = {
   bootstrap: () => call<AppBootstrap>("get_app_bootstrap"),
+  acknowledgeUpdateRecoveryNotice: (notice: UpdateRecoveryNotice) =>
+    call<void>("acknowledge_update_recovery_notice", { notice }),
   showMainWindow: () => call<void>("show_main_window"),
   listRoots: () => call<LibraryRoot[]>("list_library_roots"),
-  addRoot: (path: string) => call<LibraryRoot>("add_library_root", { path, displayName: null }),
+  addRoot: (path: string, recognitionMode: LibraryRecognitionMode) =>
+    call<LibraryRoot>("add_library_root", { path, displayName: null, recognitionMode }),
   removeRoot: (rootId: number) => call<void>("remove_library_root", { rootId }),
   renameRoot: (rootId: number, displayName: string) =>
     call<LibraryRoot>("update_library_root_name", { rootId, displayName }),
@@ -205,6 +217,13 @@ export const api = {
     call<BatchMutationResult>("batch_add_nodes_to_favorite", { folderId, nodeIds }),
   batchRemoveNodesFromFavorite: (folderId: number, nodeIds: number[]) =>
     call<BatchMutationResult>("batch_remove_nodes_from_favorite", { folderId, nodeIds }),
+  checkForUpdate: () => call<UpdateCheckResult>("check_for_update"),
+  downloadUpdate: (version: string) =>
+    call<UpdateDownloadStatus>("download_update", { version }),
+  getUpdateDownloadStatus: () =>
+    call<UpdateDownloadStatus>("get_update_download_status"),
+  installDownloadedUpdate: (version: string) =>
+    call<void>("install_downloaded_update", { version }),
 };
 
 export async function chooseDirectory(): Promise<string | null> {

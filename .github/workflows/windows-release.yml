@@ -1,0 +1,164 @@
+name: Windows release candidate
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-candidate:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Select Rust 1.88
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: npm ci
+
+      - name: Run frontend and repository quality gates
+        shell: pwsh
+        run: |
+          npm run typecheck
+          npm run build
+          npm run validate
+
+      - name: Run Rust quality gates
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Verify release tag and candidate commit
+        id: release
+        shell: pwsh
+        run: |
+          $config = Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $version = [string]$config.version
+          $tag = "v$version"
+          git fetch --force --tags
+          if ($LASTEXITCODE -ne 0) { throw "Could not refresh repository tags." }
+          $headCommit = (& git rev-parse HEAD).Trim()
+          $tagCommitOutput = @(& git rev-parse --verify "$tag^{commit}" 2>$null)
+          $tagExists = $LASTEXITCODE -eq 0
+          if ($tagExists) {
+            $tagCommit = ($tagCommitOutput -join "").Trim()
+            if ($tagCommit -cne $headCommit) {
+              throw "Existing tag $tag points to a different commit; refusing to attach this build."
+            }
+          }
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -cne $tag) {
+            throw "The pushed tag must exactly match the repository version ($tag)."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "commit_sha=$headCommit" >> $env:GITHUB_OUTPUT
+
+      - name: Build updater helper and NSIS application with path remapping
+        shell: pwsh
+        run: ./scripts/build_windows_release.ps1 -Bundles nsis
+
+      - name: Build Portable archive
+        shell: pwsh
+        run: ./scripts/build_portable.ps1 -SkipBuild -Architecture x64 -UpdaterPath src-tauri/target/release/M2ShelfUpdater.exe
+
+      - name: Prepare stable NSIS asset name
+        id: assets
+        shell: pwsh
+        run: |
+          $version = "${{ steps.release.outputs.version }}"
+          $source = Get-ChildItem -LiteralPath src-tauri/target/release/bundle/nsis -File |
+            Where-Object { $_.Name -like "*_$($version)_x64-setup.exe" } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (-not $source) { throw "Fresh NSIS installer was not found." }
+          $destination = Join-Path (Resolve-Path bundle) "M2Shelf-Setup-$version-x64.exe"
+          $portable = Join-Path (Resolve-Path bundle) "M2Shelf-Portable-$version-x64.zip"
+          Copy-Item -LiteralPath $source.FullName -Destination $destination
+          $installerHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          $portableHash = (Get-FileHash -LiteralPath $portable -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            "$destination.sha256",
+            "$installerHash  $([System.IO.Path]::GetFileName($destination))`r`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $provenance = [ordered]@{
+            schemaVersion = 1
+            repository = "${{ github.repository }}"
+            version = $version
+            tag = "${{ steps.release.outputs.tag }}"
+            commitSha = "${{ steps.release.outputs.commit_sha }}"
+            sourceRef = "${{ github.ref }}"
+            runId = "${{ github.run_id }}"
+            runAttempt = "${{ github.run_attempt }}"
+            tagExists = [System.Convert]::ToBoolean("${{ steps.release.outputs.tag_exists }}")
+            artifacts = [ordered]@{
+              portable = [ordered]@{
+                fileName = [System.IO.Path]::GetFileName($portable)
+                size = [uint64](Get-Item -LiteralPath $portable).Length
+                sha256 = $portableHash
+              }
+              nsis = [ordered]@{
+                fileName = [System.IO.Path]::GetFileName($destination)
+                size = [uint64](Get-Item -LiteralPath $destination).Length
+                sha256 = $installerHash
+              }
+            }
+          } | ConvertTo-Json -Depth 6
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Resolve-Path bundle) "candidate-provenance.json"),
+            "$provenance`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          "installer=$destination" >> $env:GITHUB_OUTPUT
+          "portable=$portable" >> $env:GITHUB_OUTPUT
+
+      # Deliberately do not sign or publish here. The production Ed25519 private key is kept
+      # offline so a compromised GitHub account/workflow cannot extract the update trust root.
+      - name: Upload offline-signing candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: M2Shelf-${{ steps.release.outputs.version }}-windows-x64-unsigned-candidate
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            bundle/M2Shelf-Portable-${{ steps.release.outputs.version }}-x64.zip
+            bundle/M2Shelf-Portable-${{ steps.release.outputs.version }}-x64.zip.sha256
+            bundle/M2Shelf-Setup-${{ steps.release.outputs.version }}-x64.exe
+            bundle/M2Shelf-Setup-${{ steps.release.outputs.version }}-x64.exe.sha256
+            bundle/candidate-provenance.json

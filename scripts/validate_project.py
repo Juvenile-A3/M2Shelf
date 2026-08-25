@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import hashlib
 import re
@@ -102,6 +104,8 @@ def check_migrations() -> None:
         "0005_user_tags.sql",
         "0006_watch_history.sql",
         "0007_favorite_folders.sql",
+        "0008_bangumi_subject_type.sql",
+        "0009_library_recognition_mode.sql",
     ]
     if [path.name for path in migration_paths] != expected:
         fail(f"expected exactly migrations {expected}, got {[p.name for p in migration_paths]}")
@@ -134,6 +138,7 @@ def check_migrations() -> None:
                 fail(f"migration schema missing tables: {sorted(missing)}")
 
             required_columns = {
+                "library_roots": {"recognition_mode"},
                 "nodes": {
                     "parent_node_id",
                     "node_type",
@@ -157,6 +162,7 @@ def check_migrations() -> None:
                     "node_id",
                     "provider",
                     "provider_subject_id",
+                    "provider_subject_type",
                     "provider_title",
                     "provider_title_cn",
                     "provider_title_en",
@@ -273,7 +279,7 @@ def check_migrations() -> None:
             )
             localized_titles = connection.execute(
                 """SELECT provider_title_cn, provider_title_en, provider_title_ja,
-                          provider_title_ko
+                          provider_title_ko, provider_subject_type
                    FROM metadata_bindings WHERE node_id = ?""",
                 (node_id,),
             ).fetchone()
@@ -282,8 +288,23 @@ def check_migrations() -> None:
                 "Frieren: Beyond Journey's End",
                 "葬送のフリーレン",
                 "장송의 프리렌",
+                2,
             ):
                 fail("multilingual Bangumi title columns do not round-trip")
+
+            connection.execute(
+                "UPDATE metadata_bindings SET provider_subject_type=6 WHERE node_id=?",
+                (node_id,),
+            )
+            try:
+                connection.execute(
+                    "UPDATE metadata_bindings SET provider_subject_type=4 WHERE node_id=?",
+                    (node_id,),
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                fail("Bangumi subject type CHECK accepts an unsupported Subject type")
 
             try:
                 connection.execute(
@@ -384,7 +405,37 @@ def check_migrations() -> None:
     if 'include_str!("../migrations/0007_favorite_folders.sql")' not in database_source:
         fail("Rust migration runner does not register 0007_favorite_folders.sql")
 
-    # Exercise a real v3 -> v7 upgrade with existing curation data, not only a fresh schema.
+    migration8 = read("src-tauri/migrations/0008_bangumi_subject_type.sql")
+    if not all(
+        token in migration8
+        for token in (
+            "ADD COLUMN provider_subject_type",
+            "DEFAULT 2",
+            "provider_subject_type IN (2, 6)",
+        )
+    ):
+        fail("migration 0008 does not persist only Bangumi animation/live-action subject types")
+    if re.search(r"\b(?:DROP|DELETE|TRUNCATE)\b", migration8, re.IGNORECASE):
+        fail("migration 0008 must remain additive and non-destructive")
+    if 'include_str!("../migrations/0008_bangumi_subject_type.sql")' not in database_source:
+        fail("Rust migration runner does not register 0008_bangumi_subject_type.sql")
+
+    migration9 = read("src-tauri/migrations/0009_library_recognition_mode.sql")
+    if not all(
+        token in migration9
+        for token in (
+            "ADD COLUMN recognition_mode",
+            "DEFAULT 'FOLDER'",
+            "recognition_mode IN ('FOLDER', 'VIDEO_FILE')",
+        )
+    ):
+        fail("migration 0009 does not persist the two supported library recognition modes")
+    if re.search(r"\b(?:DROP|DELETE|TRUNCATE)\b", migration9, re.IGNORECASE):
+        fail("migration 0009 must remain additive and non-destructive")
+    if 'include_str!("../migrations/0009_library_recognition_mode.sql")' not in database_source:
+        fail("Rust migration runner does not register 0009_library_recognition_mode.sql")
+
+    # Exercise a real v3 -> v9 upgrade with existing curation data, not only a fresh schema.
     legacy = sqlite3.connect(":memory:")
     try:
         legacy.execute("PRAGMA foreign_keys = ON")
@@ -448,22 +499,30 @@ def check_migrations() -> None:
             "INSERT INTO node_favorite_folders(folder_id, node_id) VALUES (1, ?)",
             (legacy_node,),
         )
-        preserved_after_v7 = legacy.execute(
+        legacy.executescript(migration8)
+        legacy.executescript(migration9)
+        preserved_after_v8 = legacy.execute(
             """SELECT n.display_name, n.manual_type_override, b.provider_subject_id,
+                      b.provider_subject_type,
                       (SELECT COUNT(*) FROM node_tags WHERE node_id=n.id),
                       (SELECT COUNT(*) FROM watch_history WHERE node_id=n.id),
                       (SELECT COUNT(*) FROM node_favorite_folders WHERE node_id=n.id)
                FROM nodes n JOIN metadata_bindings b ON b.node_id=n.id"""
         ).fetchone()
-        if preserved_after_v7 != ("Curated title", 1, 400602, 1, 1, 1):
-            fail("migrations 0005-0007 do not preserve existing curation and bindings")
+        if preserved_after_v8 != ("Curated title", 1, 400602, 2, 1, 1, 1):
+            fail("migrations 0005-0009 do not preserve existing curation and bindings")
+        recognition_mode = legacy.execute(
+            "SELECT recognition_mode FROM library_roots WHERE id=?", (legacy_root,)
+        ).fetchone()[0]
+        if recognition_mode != "FOLDER":
+            fail("migration 0009 does not preserve old roots with FOLDER recognition")
     except sqlite3.Error as error:
-        fail(f"v3 to v7 migration compatibility check failed: {error}")
+        fail(f"v3 to v9 migration compatibility check failed: {error}")
     finally:
         legacy.close()
 
     if len(ERRORS) == error_count_before:
-        passed("SQLite migrations 1-7, multilingual titles, user tags, watch history, favorites, upgrade preservation, and constraints")
+        passed("SQLite migrations 1-9, library recognition modes, multilingual titles, Bangumi subject types, user tags, watch history, favorites, upgrade preservation, and constraints")
 
 
 def extract_rust_commands() -> tuple[set[str], set[str]]:
@@ -510,7 +569,12 @@ def check_command_contract() -> None:
 
 
 def strip_rust_tests(source: str) -> str:
-    marker = re.search(r"#\[cfg\([^\]]*\btest\b[^\]]*\)\]", source)
+    # A few modules expose small test-only helpers before later production functions.
+    # Stop only at the actual trailing test module; stopping at the first cfg(test)
+    # would silently exclude production updater/scanner code from safety checks.
+    marker = re.search(
+        r"#\[cfg\([^\]]*\btest\b[^\]]*\)\]\s*mod\s+tests\s*\{", source
+    )
     return source if marker is None else source[: marker.start()]
 
 
@@ -532,11 +596,22 @@ def check_source_safety() -> None:
     destructive = re.compile(
         r"(?:fs|std::fs|tokio::fs)::(?:remove_file|remove_dir|remove_dir_all|rename|write|copy|create|OpenOptions)\b"
     )
+    filesystem_mutation_modules = {
+        "cache.rs",
+        "bangumi.rs",
+        "lib.rs",
+        # Update downloads are confined to the application-owned update cache.
+        "update.rs",
+        # Portable replacement is performed by the native helper after validating a
+        # Rust-owned, path-bound request.  The structural checks below keep these two
+        # exceptions from becoming a general source-media mutation escape hatch.
+        "portable_update.rs",
+    }
     for name, source in production.items():
         hits = destructive.findall(source)
         if not hits:
             continue
-        if name not in {"cache.rs", "bangumi.rs", "lib.rs"}:
+        if name not in filesystem_mutation_modules:
             fail(f"filesystem mutation outside app cache/bootstrap modules: {name}: {hits}")
 
     cache_source = production.get("cache.rs", "")
@@ -590,6 +665,132 @@ def check_source_safety() -> None:
     else:
         passed("cover cache clear barrier and same-directory atomic cover replacement")
 
+    update_source = production.get("update.rs", "")
+    app_bootstrap_source = production.get("lib.rs", "")
+    update_cache_mutation_ok = all(
+        (
+            'let update_cache_dir = app_data_dir.join("updates");'
+            in app_bootstrap_source,
+            "update::UpdateManager::new(update_cache_dir)" in app_bootstrap_source,
+            "portable_update::cleanup_completed_transactions(" in app_bootstrap_source,
+            "&update_cache_dir," in app_bootstrap_source,
+            "cache_dir: PathBuf" in update_source,
+            "let version_dir = ensure_safe_update_subdirectory(" in update_source,
+            "fn ensure_plain_update_directory(path: &Path, create: bool)" in update_source,
+            "fs::create_dir(path)" in update_source,
+            "Uuid::new_v4()" in update_source,
+            '".{}.{}.partial"' in update_source,
+            "cleanup_owned_partial_downloads(&version_dir, &checked.asset.file_name)"
+            in update_source,
+            "downloaded > checked.asset.size || downloaded > MAX_ARTIFACT_BYTES"
+            in update_source,
+            "downloaded != checked.asset.size" in update_source,
+            "output" in update_source and ".sync_all()" in update_source,
+            "verify_asset_digest_and_signature(" in update_source,
+            "fs::rename(&partial, &destination)" in update_source,
+            "entries.flatten().take(64)" in update_source,
+            "canonical_version(&name).is_err()" in update_source,
+            "!is_plain_directory(version_dir)" in update_source,
+            "remove_owned_version_cache_files(&path, &name)" in update_source,
+            "fs::symlink_metadata(path)" in update_source,
+            "FILE_ATTRIBUTE_REPARSE_POINT" in update_source,
+            "accept_missing_manifest_for_non_newer_release(response.url(), current_version)"
+            in update_source,
+            'const PREFIX: &str = "/Undermori/M2Shelf/releases/download/v"'
+            in update_source,
+            "pub(crate) fn begin_operation" in update_source,
+            "state.update_manager.begin_operation()?" in commands_source,
+            "state.update_manager.downloaded(&version)?" in commands_source,
+            "ensure_no_active_scan(&state)?" in commands_source,
+            "crate::update::lock_and_verify_file_against_manifest(" in commands_source,
+            "UpdateDistribution::Portable => {" in commands_source,
+            "crate::portable_update::prepare_portable_update(" in commands_source,
+            "std::mem::forget(prepared);" in commands_source,
+            "UpdateDistribution::Nsis => {" in commands_source,
+            "std::process::Command::new(&downloaded.path)" in commands_source,
+        )
+    )
+    if not update_cache_mutation_ok:
+        fail("update cache mutation lacks bounded size, app-cache path, serialization, or safe cleanup guards")
+    else:
+        passed("Rust-owned update cache uses bounded verified writes and guarded cleanup")
+
+    portable_update_source = production.get("portable_update.rs", "")
+    authentication_position = app_bootstrap_source.find(
+        "portable_update::authenticate_update_transaction_before_mutex(transaction_id)"
+    )
+    update_mutex_position = app_bootstrap_source.find(
+        "portable_update::wait_for_update_mutex_before_startup"
+    )
+    single_instance_position = app_bootstrap_source.find("single_instance::acquire()")
+    authenticated_child_before_mutex_ok = (
+        -1 < authentication_position < update_mutex_position < single_instance_position
+        and "fn authenticate_update_transaction(" in portable_update_source
+        and "state.phase != ApplyPhase::Launched" in portable_update_source
+        and "state.transaction_id != transaction_id" in portable_update_source
+        and "request.helper_ready_path" in portable_update_source
+        and "current_executable" in portable_update_source
+    )
+    recovery_persistence_region = portable_update_source[
+        portable_update_source.find("fn persist_recovery_outcome(") :
+        portable_update_source.find("fn append_recovery_persistence_error(")
+    ]
+    recovery_notice_before_terminal_state_ok = (
+        recovery_persistence_region.find("write_rollback_notice(request, outcome)?")
+        < recovery_persistence_region.find("write_transaction_state(request, phase")
+        and recovery_persistence_region.find("write_rollback_notice(request, outcome)?") >= 0
+    )
+    portable_install_mutation_ok = all(
+        (
+            "database.backup_for_portable_update(&database_backup_path)?"
+            in portable_update_source,
+            "_database_update_barrier: DatabaseUpdateBarrier" in portable_update_source,
+            "acquire_update_mutex()?" in portable_update_source,
+            "mark_interrupted_transactions_recovery_required" in portable_update_source,
+            "reject_library_root_overlap(" in portable_update_source,
+            "cache::paths_overlap_checked(install_directory, &root)" in portable_update_source,
+            "OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX"
+            in portable_update_source,
+            "fn validate_request_structure" in portable_update_source,
+            '.join("updates")' in portable_update_source,
+            '.join("transactions")' in portable_update_source,
+            "let expected_archive = database_parent" in portable_update_source,
+            '"M2Shelf-Portable-{}-x64.zip"' in portable_update_source,
+            "request.archive_path != expected_archive" in portable_update_source,
+            '".m2shelf-update-staging-{}"' in portable_update_source,
+            '".m2shelf-update-backup-{}"' in portable_update_source,
+            "fn ensure_plain_directory" in portable_update_source,
+            "FILE_ATTRIBUTE_REPARSE_POINT" in portable_update_source,
+            "fn seal_verified_archive" in portable_update_source,
+            portable_update_source.count("verify_open_file_against_manifest(") >= 2,
+            "MAX_ARCHIVE_FILES" in portable_update_source,
+            "MAX_EXTRACTED_BYTES" in portable_update_source,
+            "MAX_ENTRY_BYTES" in portable_update_source,
+            "validate_archive_name(&raw_name)?" in portable_update_source,
+            "entry.is_dir()" in portable_update_source,
+            "entry.unix_mode()" in portable_update_source,
+            "Portable 更新 ZIP 包含重复文件名" in portable_update_source,
+            "ReplaceFileW" in portable_update_source,
+            "MoveFileExW" in portable_update_source,
+            "REPLACEFILE_WRITE_THROUGH" in portable_update_source,
+            "MOVEFILE_WRITE_THROUGH" in portable_update_source,
+            "fn rollback_files" in portable_update_source,
+            "fn restore_database" in portable_update_source,
+            "fn wait_for_health" in portable_update_source,
+            "ApplyPhase::Completed" in portable_update_source,
+            "validate_request_identity(request_path, request)?" in portable_update_source,
+            "cleanup_pre_ready_transaction" in portable_update_source,
+            "PreparedTransactionCleanup" in portable_update_source,
+            authenticated_child_before_mutex_ok,
+            recovery_notice_before_terminal_state_ok,
+            "entries.take(64)" in portable_update_source,
+        )
+    )
+    if not portable_install_mutation_ok:
+        fail("Portable update mutation lacks request containment, bounded extraction, atomic replacement, or rollback guards")
+    else:
+        passed("Rust-owned Portable installer is path-bound, bounded, atomic, and rollback-aware")
+
     public_mutation_names = re.findall(
         r"#\[tauri::command(?:\([^\]]*\))?\]\s*pub\s+(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)",
         production.get("commands.rs", ""),
@@ -613,8 +814,10 @@ def check_source_safety() -> None:
         fail(f"dangerous source-media command names exposed: {dangerous_names}")
 
     player = production.get("player.rs", "")
-    if "Command::new(executable)" not in player or '.arg("--")' not in player or ".arg(media)" not in player:
-        fail("mpv must use a validated executable and separate literal media argument after --")
+    if "Command::new(executable)" not in player or ".arg(media)" not in player:
+        fail("player must use a validated executable and a separate literal media argument")
+    if '.arg("--")' in player:
+        fail("generic player launch must not pass the mpv-specific -- sentinel")
     if "validate_executable(executable)" not in player:
         fail("mpv executable is not validated before play")
 
@@ -624,6 +827,23 @@ def check_source_safety() -> None:
     scanner_hits = [token for token in mutating_tokens if token in scanner]
     if scanner_hits:
         fail(f"scanner production code mutates filesystem: {scanner_hits}")
+
+    bdmv_root_boundary_ok = all(
+        (
+            "refresh_ancestors(&connection, Some(scanned_node_id), &canonical_root)?" in scanner_with_tests,
+            "has_typical_bdmv(Path::new(&path), canonical_root)" in scanner_with_tests,
+            "pub fn has_typical_bdmv(path: &Path, library_root: &Path)" in scanner_with_tests,
+            "fs::canonicalize(library_root)" in scanner_with_tests,
+            "canonicalize_within_library_root(path, &canonical_root)" in scanner_with_tests,
+            "fn find_stream_directory(bdmv: &Path, canonical_root: &Path)" in scanner_with_tests,
+            "file_type.is_symlink()" in scanner_with_tests,
+            "bdmv_detection_never_reads_a_complete_structure_outside_the_library_root" in scanner_with_tests,
+        )
+    )
+    if not bdmv_root_boundary_ok:
+        fail("scanner production BDMV probing can escape the canonical Library Root boundary")
+    else:
+        passed("BDMV probing canonicalizes every enumerated directory inside its Library Root")
 
     database = production.get("db.rs", "")
     database_with_tests = read("src-tauri/src/db.rs")
@@ -644,7 +864,22 @@ def check_source_safety() -> None:
     if not root_overlap_guard:
         fail("Library Root overlap protection is missing from command, transaction, or scan boundary")
 
-    if not any(message.startswith(("filesystem mutation", "dangerous", "scanner production", "shell-mediated", "cache deletion", "mpv", "Library Root")) for message in ERRORS):
+    if not any(
+        message.startswith(
+            (
+                "filesystem mutation",
+                "dangerous",
+                "scanner production",
+                "shell-mediated",
+                "cache deletion",
+                "update cache mutation",
+                "Portable update mutation",
+                "mpv",
+                "Library Root",
+            )
+        )
+        for message in ERRORS
+    ):
         passed("source-media read-only, non-overlapping roots, and literal mpv launch safety")
 
 
@@ -720,7 +955,7 @@ def check_bangumi_contract() -> None:
     models = read("src-tauri/src/models.rs")
     required_request_fragments = [
         '"keyword": keyword',
-        '"type": [2]',
+        '"filter": { "type": SUPPORTED_SUBJECT_TYPES',
         '"sort": "match"',
         '"nsfw": false',
     ]
@@ -792,13 +1027,28 @@ def check_bangumi_contract() -> None:
 
     commands = read("src-tauri/src/commands.rs")
     db = read("src-tauri/src/db.rs")
+    validation_region = commands[
+        commands.find("fn validate_bindable_bangumi_subject") : commands.find("fn library_root_paths")
+    ]
     bind_region = commands[
         commands.find("pub async fn bind_bangumi") : commands.find("pub fn clear_bangumi_binding")
     ]
     save_region = db[db.find("pub fn save_binding") : db.find("pub fn set_node_cover")]
-    combined = bind_region + save_region
-    if "subject_type" not in combined or not re.search(r"subject(?:\.|_)type\s*!?=\s*2", combined):
-        fail("bind_bangumi does not revalidate Anime subject type 2 in Rust")
+    combined = validation_region + bind_region + save_region
+    supported_types = all(
+        token in source
+        for token in (
+            "pub const SUBJECT_TYPE_ANIME: i64 = 2",
+            "pub const SUBJECT_TYPE_LIVE_ACTION: i64 = 6",
+            "is_supported_subject_type",
+        )
+    )
+    if (
+        not supported_types
+        or "validate_bindable_bangumi_subject(&subject)?" not in bind_region
+        or "is_supported_subject_type(subject.subject_type)" not in validation_region
+    ):
+        fail("bind_bangumi does not restrict Rust binding to Bangumi animation/live-action subjects")
     if "subject_id" not in combined or not re.search(r"subject(?:\.|_)id\s*(?:<=|<|==)\s*0", combined):
         fail("bind_bangumi does not reject a non-positive subject ID in Rust")
 
@@ -1129,12 +1379,141 @@ def check_brand_release_and_icons() -> None:
     except (OSError, struct.error) as error:
         fail(f"cannot validate Windows ICO: {error}")
 
+    public_key_text = read("src-tauri/update-public-key.txt").strip()
+    try:
+        public_key_bytes = base64.b64decode(public_key_text, validate=True)
+    except (binascii.Error, ValueError):
+        public_key_bytes = b""
+    public_key_ok = all(
+        (
+            public_key_text != "UNCONFIGURED",
+            len(public_key_bytes) == 32,
+            base64.b64encode(public_key_bytes).decode("ascii") == public_key_text,
+            public_key_bytes != bytes(32),
+        )
+    )
+    if not public_key_ok:
+        fail("updater public key must be a configured, canonical 32-byte Ed25519 key")
+    else:
+        passed("configured canonical 32-byte Ed25519 update public key")
+
+    update_source = read("src-tauri/src/update.rs")
+    portable_update_source = read("src-tauri/src/portable_update.rs")
+    updater_cli = read("src-tauri/src/bin/m2shelf_updater.rs")
+    update_manifest_runtime_contract = (
+        'const PUBLIC_KEY_TEXT: &str = include_str!("../update-public-key.txt")',
+        "const MAX_MANIFEST_BYTES: u64 = 256 * 1024",
+        "pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024",
+        '#[serde(rename_all = "camelCase", deny_unknown_fields)]',
+        "fn validate_manifest_with_key(",
+        "fn validate_asset_with_key(",
+        'format!("M2Shelf-Portable-{version}-x64.zip")',
+        'format!("M2Shelf-Setup-{version}-x64.exe")',
+        "if asset.file_name != expected_file_name",
+        "fn canonical_version(",
+        "!version.pre.is_empty() || !version.build.is_empty()",
+        'const SIGNATURE_DOMAIN: &[u8] = b"M2Shelf.Update.v1\\0"',
+        "message.extend_from_slice(APP_ID.as_bytes())",
+        "message.extend_from_slice(&size.to_le_bytes())",
+        "message.extend_from_slice(sha256)",
+        "verify_asset_digest_and_signature(",
+        "lock_and_verify_file_against_manifest(",
+        ".https_only(true)",
+        "Policy::custom",
+        "attempt.previous().len() >= 5",
+        "read_bounded_response(response, MAX_MANIFEST_BYTES",
+        ".take(limit + 1)",
+        'Some("github.com"',
+        '"release-assets.githubusercontent.com"',
+        '"objects.githubusercontent.com"',
+        "signing_key.verifying_key() != expected",
+    )
+    updater_identity_contract = (
+        '"identity" =>',
+        "if args.len() != 1",
+        "sign(parse_options(&args[1..], &[\"version\", \"platform\", \"file\"])?",
+        '"verify" => verify(parse_options(',
+        '&["version", "platform", "file", "signature"]',
+        "parse_options(&args[1..], &[\"request\"])?",
+        "signer_identity_for_cli()",
+        "sign_artifact_for_cli(&file, version, platform, &private_key)",
+        "verify_artifact_for_cli(&file, version, platform, signature)",
+        'env::var("M2SHELF_UPDATE_PRIVATE_KEY")',
+    )
+    signer_identity_source_contract = (
+        "pub struct SignerIdentityOutput",
+        "pub fn signer_identity_for_cli()",
+        "schema_version: 1",
+        "app_id: APP_ID",
+        'version: env!("CARGO_PKG_VERSION")',
+        "public_key: BASE64_STANDARD.encode(key.to_bytes())",
+        "ensure_signing_key_matches_text(&key, PUBLIC_KEY_TEXT)?",
+        "pub fn verify_artifact_for_cli(",
+        "verify_artifact_with_key(",
+        "&configured_verifying_key()?",
+        "cli_verifier_rehashes_the_file_and_rejects_mismatched_signatures",
+    )
+    if (
+        any(token not in update_source for token in update_manifest_runtime_contract)
+        or any(token not in updater_cli for token in updater_identity_contract)
+        or any(token not in update_source for token in signer_identity_source_contract)
+    ):
+        fail("signed update manifest, bounded transport, or updater-helper identity contract is incomplete")
+    else:
+        passed("strict signed manifest, bounded HTTPS transport, and embedded-key helper identity")
+
+    expected_portable_payload = [
+        "M2Shelf.exe",
+        "M2ShelfUpdater.exe",
+        "M2Shelf.portable.json",
+        "README_zh-CN.txt",
+        "SHA256SUMS.txt",
+    ]
+
+    def rust_payload_array(name: str) -> list[str] | None:
+        match = re.search(
+            rf"const\s+{re.escape(name)}\s*:\s*\[&str;\s*(\d+)\]\s*=\s*\[(.*?)\];",
+            portable_update_source,
+            re.DOTALL,
+        )
+        if not match:
+            return None
+        aliases = {
+            "UPDATER_FILE": "M2ShelfUpdater.exe",
+            "PORTABLE_MARKER_FILE": "M2Shelf.portable.json",
+        }
+        entries: list[str] = []
+        for item in match.group(2).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            literal = re.fullmatch(r'"([^"\\]*)"', item)
+            if literal:
+                entries.append(literal.group(1))
+            elif item in aliases:
+                entries.append(aliases[item])
+            else:
+                return None
+        if int(match.group(1)) != len(entries):
+            return None
+        return entries
+
     portable = read("scripts/build_portable.ps1")
     portable_contract = (
         "M2Shelf-Portable-$version-$Architecture.zip",
         '"M2Shelf.exe"',
+        '"M2ShelfUpdater.exe"',
+        '"M2Shelf.portable.json"',
+        "schemaVersion = 1",
+        'appId = "app.morimediashelf.desktop"',
+        'distribution = "portable"',
+        '"SHA256SUMS.txt"',
         "$binaryVersion.ProductVersion",
+        "Updater public key must contain exactly 32 Ed25519 bytes",
         "$actualMachine",
+        "$sourceUpdaterHash",
+        "$releaseUpdater.LastWriteTimeUtc",
+        "Assert-NoPrivateBuildPath -Path $sourceUpdater",
         "$newestInput",
         '"package-lock.json"',
         '"index.html"',
@@ -1142,12 +1521,279 @@ def check_brand_release_and_icons() -> None:
         '"tsconfig.json"',
         '"tsconfig.node.json"',
         '"src-tauri\\capabilities"',
+        '"src-tauri\\update-public-key.txt"',
         '(Join-Path $repoRoot "src")',
+        "$identityOutput = @(& $sourceUpdater identity)",
+        '$expectedIdentityProperties = @("appId", "publicKey", "schemaVersion", "version")',
+        '[string]$identity.appId -cne "app.morimediashelf.desktop"',
+        "[string]$identity.version -cne $version",
+        "[string]$identity.publicKey -cne $publicKeyText",
+        "$missingStageFiles",
+        "$unexpectedStageFiles",
     )
-    if any(token not in portable for token in portable_contract):
-        fail("portable builder does not emit the required archive/executable names")
+    stage_files_match = re.search(
+        r"\$requiredStageFiles\s*=\s*@\((.*?)\)", portable, re.DOTALL
+    )
+    stage_files = (
+        re.findall(r'"([^"\r\n]+)"', stage_files_match.group(1))
+        if stage_files_match
+        else []
+    )
+    rust_required_payload = rust_payload_array("REQUIRED_PAYLOAD_FILES")
+    rust_allowed_payload = rust_payload_array("ALLOWED_PAYLOAD_FILES")
+    portable_payload_contract = (
+        stage_files == expected_portable_payload
+        and rust_required_payload == expected_portable_payload
+        and rust_allowed_payload == expected_portable_payload
+        and "!allowed.contains(&folded)" in portable_update_source
+        and "!ALLOWED_PAYLOAD_FILES.contains(&raw_name.as_str())"
+        in portable_update_source
+        and "for required in REQUIRED_PAYLOAD_FILES" in portable_update_source
+        and "Portable 更新 ZIP 包含未知文件" in portable_update_source
+        and "Portable 更新 ZIP 缺少 {required}" in portable_update_source
+    )
+    if any(token not in portable for token in portable_contract) or not portable_payload_contract:
+        fail("Portable builder/runtime does not enforce the exact five-file payload and helper identity")
     else:
-        passed("versioned, architecture-checked, freshness-guarded M2Shelf Portable build contract")
+        passed("exact five-file Portable payload with helper identity, PE, freshness, privacy, and checksums")
+
+    update_manifest = read("scripts/generate_update_manifest.ps1")
+    update_manifest_contract = (
+        "$env:M2SHELF_UPDATE_PRIVATE_KEY",
+        "sign --version $version --platform $Platform --file $Path",
+        '"windows-x64-portable"',
+        '"windows-x64-nsis"',
+        "schemaVersion = 1",
+        "publishedAt =",
+        "notes = $notes",
+        "platforms =",
+        '"zh-CN"',
+        '"en-US"',
+        '"ja-JP"',
+        '"ko-KR"',
+        "https://github.com/Undermori/M2Shelf/releases/download/v$version/",
+        'expectedProperties = @("fileName", "sha256", "signature", "size")',
+        "$signatureBytes.Length -ne 64",
+        "Get-FileHash -LiteralPath $Path -Algorithm SHA256",
+        "Ensure-HashSidecar -Path $portablePath",
+        "Ensure-HashSidecar -Path $installerPath",
+        "M2SHELF_UPDATE_PRIVATE_KEY is required",
+        "$TrustedSignerSha256 -notmatch '^[0-9A-Fa-f]{64}$'",
+        "$actualSignerSha256 -cne $TrustedSignerSha256.ToLowerInvariant()",
+        "$identityOutput = @(& $resolvedUpdater identity)",
+        '$expectedIdentityProperties = @("appId", "publicKey", "schemaVersion", "version")',
+        '[string]$identity.appId -cne "app.morimediashelf.desktop"',
+        "[string]$identity.version -cne $version",
+        "[string]$identity.publicKey -cne $publicKeyText",
+    )
+    if any(token not in update_manifest for token in update_manifest_contract):
+        fail("signed update-manifest generator does not implement the frozen v1 schema and signer CLI")
+    elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", update_manifest):
+        fail("update-manifest generator contains a literal user-profile path")
+    elif re.search(
+        r"(?is)(?:WriteAllText|WriteAllLines|Set-Content|Out-File).{0,160}M2SHELF_UPDATE_PRIVATE_KEY|"
+        r"M2SHELF_UPDATE_PRIVATE_KEY.{0,160}(?:WriteAllText|WriteAllLines|Set-Content|Out-File)",
+        update_manifest,
+    ):
+        fail("update signing private key may be persisted by the release script")
+    else:
+        passed("offline manifest generator verifies signer identity and keeps private key process-only")
+
+    offline_signer = read("scripts/sign_update_offline.ps1")
+    offline_signer_contract = (
+        "#Requires -Version 7.2",
+        "[Parameter(Mandatory = $true)][string]$CandidateDirectory",
+        "[Parameter(Mandatory = $true)][string]$EncryptedSeedPath",
+        "[Parameter(Mandatory = $true)][string]$UpdaterPath",
+        "[Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$TrustedSignerSha256",
+        "[Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$TrustedManifestGeneratorSha256",
+        "[Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$TrustedPortableSha256",
+        "[Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$TrustedNsisSha256",
+        "$actualManifestGeneratorSha256 -cne $TrustedManifestGeneratorSha256.ToLowerInvariant()",
+        "$actualPortableSha256 -cne $TrustedPortableSha256.ToLowerInvariant()",
+        "$actualNsisSha256 -cne $TrustedNsisSha256.ToLowerInvariant()",
+        "$trustedInputLocks = [System.Collections.Generic.List[System.IO.FileStream]]::new()",
+        "[System.IO.FileShare]::Read",
+        "A trusted signing input changed while it was being locked.",
+        "[System.OperatingSystem]::IsWindows()",
+        "DataProtectionScope]::CurrentUser",
+        "[System.Security.Cryptography.ProtectedData]::Unprotect(",
+        "$seedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint",
+        "$seedPath.StartsWith($repoPrefix",
+        "$seedItem.Length -lt 1 -or $seedItem.Length -gt 16384",
+        'GetEnvironmentVariable("M2SHELF_UPDATE_PRIVATE_KEY", [System.EnvironmentVariableTarget]::Process)',
+        "$seedBytes.Length -ne 32",
+        "[System.Convert]::ToBase64String($seedBytes)",
+        'SetEnvironmentVariable(\n    "M2SHELF_UPDATE_PRIVATE_KEY"',
+        "TrustedSignerSha256 = $TrustedSignerSha256.ToLowerInvariant()",
+        "& $manifestScript @manifestArguments",
+        "} finally {",
+        "$privateKeyText = $null",
+        "[System.Array]::Clear($seedBytes, 0, $seedBytes.Length)",
+        "[System.Array]::Clear($protectedBytes, 0, $protectedBytes.Length)",
+    )
+    offline_signer_forbidden = (
+        "Invoke-WebRequest",
+        "Invoke-RestMethod",
+        "Start-BitsTransfer",
+        "gh release",
+        "curl ",
+        "secrets.",
+        "Write-Output $privateKeyText",
+        "Write-Host $privateKeyText",
+    )
+    if any(token not in offline_signer for token in offline_signer_contract):
+        fail("offline DPAPI signing wrapper lacks seed, signer-fingerprint, or process-secret guards")
+    elif any(token in offline_signer for token in offline_signer_forbidden):
+        fail("offline DPAPI signing wrapper may use network/CI secrets or print private material")
+    elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", offline_signer):
+        fail("offline signing wrapper contains a literal user-profile path")
+    else:
+        passed("offline signing requires independent script, helper, and candidate fingerprints before DPAPI decrypt")
+
+    release_workflow = read(".github/workflows/windows-release.yml")
+    workflow_contract = (
+        "workflow_dispatch:",
+        'tags:',
+        '"v*"',
+        "npm run typecheck",
+        "npm run build",
+        "npm run validate",
+        "cargo test --manifest-path src-tauri/Cargo.toml --locked",
+        "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
+        "build_windows_release.ps1 -Bundles nsis",
+        "build_portable.ps1 -SkipBuild",
+        "permissions:",
+        "contents: read",
+        "persist-credentials: false",
+        'git rev-parse --verify "$tag^{commit}"',
+        "points to a different commit; refusing to attach this build",
+        "candidate-provenance.json",
+        "schemaVersion = 1",
+        'repository = "${{ github.repository }}"',
+        '"commit_sha=$headCommit" >> $env:GITHUB_OUTPUT',
+        'commitSha = "${{ steps.release.outputs.commit_sha }}"',
+        "actions/upload-artifact@",
+        "if-no-files-found: error",
+        "retention-days: 14",
+        "windows-x64-unsigned-candidate",
+        "M2Shelf-Portable-${{ steps.release.outputs.version }}-x64.zip",
+        "M2Shelf-Setup-${{ steps.release.outputs.version }}-x64.exe",
+        "M2Shelf-Setup-${{ steps.release.outputs.version }}-x64.exe.sha256",
+        "bundle/candidate-provenance.json",
+    )
+    if any(token not in release_workflow for token in workflow_contract):
+        fail("Windows CI workflow lacks a read-only unsigned-candidate, provenance, build, or quality gate")
+    elif any(
+        token in release_workflow
+        for token in (
+            "secrets.",
+            "M2SHELF_UPDATE_PRIVATE_KEY",
+            "UPDATE_SIGNING_KEY",
+            "generate_update_manifest.ps1",
+            "gh release",
+            "bundle/latest.json",
+            "contents: write",
+            "--clobber",
+        )
+    ):
+        fail("Windows CI candidate workflow may sign, publish, use a secret, or request write access")
+    elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", release_workflow):
+        fail("Windows GitHub Release workflow contains a literal user-profile path")
+    else:
+        passed("read-only Windows CI produces an unsigned provenance-bound candidate without secrets")
+
+    offline_publisher = read("scripts/publish_signed_release.ps1")
+    offline_publisher_contract = (
+        "#Requires -Version 7.2",
+        "[Parameter(Mandatory = $true)][string]$CandidateDirectory",
+        "[Parameter(Mandatory = $true)][string]$VerifierPath",
+        "[Parameter(Mandatory = $true)][ValidatePattern('^[0-9A-Fa-f]{64}$')][string]$TrustedVerifierSha256",
+        "[Parameter(Mandatory = $true)][string]$ReleaseNotesPath",
+        "[switch]$Publish",
+        "$repository = \"Undermori/M2Shelf\"",
+        'Invoke-GitText -Arguments @("status", "--porcelain=v1", "--untracked-files=normal")',
+        'Invoke-GitText -Arguments @("rev-parse", "--verify", "HEAD")',
+        'Invoke-GitText -Arguments @("rev-parse", "--verify", "$tag^{commit}")',
+        'Invoke-GitText -Arguments @("rev-parse", "--verify", "refs/tags/$tag")',
+        "$tagCommit -cne $headCommit",
+        "Assert-RemoteTagMatches -Tag $tag -ExpectedTagObjectSha $tagObjectSha",
+        'Assert-ExactProperties -Object $provenance -Expected @(',
+        'Assert-ExactProperties -Object $provenance.artifacts -Expected @("nsis", "portable")',
+        'Assert-ExactProperties -Object $provenance.artifacts.portable -Expected @("fileName", "sha256", "size")',
+        'Assert-ExactProperties -Object $provenance.artifacts.nsis -Expected @("fileName", "sha256", "size")',
+        "$provenance.tagExists -isnot [bool] -or -not $provenance.tagExists",
+        '[string]$provenance.repository -cne $repository',
+        '[string]$provenance.commitSha -cne $headCommit',
+        '[string]$provenance.sourceRef -cne "refs/tags/$tag"',
+        'portableSignature = (Join-Path $candidatePath "$portableName.sig")',
+        'nsisSignature = (Join-Path $candidatePath "$installerName.sig")',
+        "Read-SignatureSidecar",
+        "[System.Convert]::ToBase64String($signatureBytes) -cne $signature",
+        "$actualVerifierSha256 -cne $TrustedVerifierSha256.ToLowerInvariant()",
+        "$identityOutput = @(& $resolvedVerifier identity)",
+        'Assert-ExactProperties -Object $identity -Expected @("appId", "publicKey", "schemaVersion", "version")',
+        '[string]$identity.publicKey -cne $publicKeyText',
+        "Invoke-ArtifactVerifier",
+        "verify --version $version --platform $Platform --file $Path --signature $Signature",
+        'Assert-ExactProperties -Object $verified -Expected @("fileName", "sha256", "signature", "size")',
+        "[string]$verified.signature -cne $Signature",
+        'Assert-ExactProperties -Object $manifest -Expected @("notes", "platforms", "publishedAt", "schemaVersion", "version")',
+        'Assert-ExactProperties -Object $manifest.notes -Expected @("en-US", "ja-JP", "ko-KR", "zh-CN")',
+        'Assert-ExactProperties -Object $manifest.platforms -Expected @("windows-x64-nsis", "windows-x64-portable")',
+        'Assert-ExactProperties -Object $manifestAsset -Expected @("fileName", "sha256", "signature", "size", "url")',
+        "$actualSha256 -cne $provenanceSha256",
+        "Assert-HashSidecar -Path $contract.HashPath",
+        "$manifestAsset.signature -cne $sidecarSignature",
+        '$expectedUrl = "https://github.com/$repository/releases/download/$tag/$($contract.FileName)"',
+        "if (-not $Publish)",
+        'Write-Output "No GitHub changes were made. Pass -Publish',
+        "[System.IO.FileAccess]::Read",
+        "A signed release input changed while it was being locked for upload.",
+        "A GitHub release already exists for $tag; immutable releases are never modified.",
+        '"--draft"',
+        '"--verify-tag"',
+        '"--notes-file", $resolvedReleaseNotes',
+        "gh release upload $tag @uploadPaths",
+        "@($expectedUploadNames) -ccontains $remoteName",
+        "$remoteAssets.Count -ne $expectedUploadFiles.Count",
+        "$null -eq $remoteAsset.digest",
+        "[string]::IsNullOrWhiteSpace([string]$remoteAsset.digest)",
+        '[string]$remoteAsset.digest -cne "sha256:$($expectedAsset.Sha256)"',
+        "gh release edit $tag --repo $repository --draft=false",
+    )
+    offline_publisher_forbidden = (
+        "M2SHELF_UPDATE_PRIVATE_KEY",
+        "UPDATE_SIGNING_KEY",
+        "EncryptedSeed",
+        "ProtectedData",
+        "openssl",
+        "secrets.",
+        "--clobber",
+    )
+    if any(token not in offline_publisher for token in offline_publisher_contract):
+        fail("offline publisher lacks exact provenance/manifest/assets, immutable tag, or draft verification")
+    elif any(token in offline_publisher for token in offline_publisher_forbidden):
+        fail("offline publisher may access signing material, CI secrets, or overwrite release assets")
+    elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", offline_publisher):
+        fail("offline publisher contains a literal user-profile path")
+    else:
+        passed("offline publisher verifies exact signed inputs and immutable tag before draft publication")
+
+    portable_readme = read("docs/PORTABLE_README_zh-CN.txt")
+    if any(
+        token not in portable_readme
+        for token in (
+            "M2ShelfUpdater.exe",
+            "M2Shelf.portable.json",
+            "Ed25519",
+            "SHA256SUMS.txt",
+            ".sha256",
+        )
+    ):
+        fail("Portable README does not explain helper, marker, signed updates, and checksums")
+    else:
+        passed("Portable README documents signed helper-based updates and integrity files")
 
     release_builder = read("scripts/build_windows_release.ps1")
     release_contract = (
@@ -1155,22 +1801,50 @@ def check_brand_release_and_icons() -> None:
         "$repoRoot",
         "CARGO_ENCODED_RUSTFLAGS",
         "--remap-path-prefix=",
+        "Updater public key must contain exactly 32 Ed25519 bytes",
         "npm run tauri build -- --bundles $Bundles",
+        "cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin M2ShelfUpdater",
+        '$installerName = "${productName}_${version}_x64-setup.exe"',
+        '"M2Shelf-Setup-$version-x64.exe"',
+        "Assert-X64Pe -Path $releaseExecutable",
+        "Assert-X64Pe -Path $releaseUpdater",
+        "Assert-PlainDestinationOrMissing -Path $stableInstaller",
+        "Remove-Item -LiteralPath $stableInstaller -Force",
+        "[System.IO.File]::WriteAllText(",
     )
     if any(token not in release_builder for token in release_contract):
-        fail("public Windows release builder does not dynamically remap private build paths")
+        fail("public Windows release builder lacks path remapping, x64 identity, or stable NSIS output guards")
+    elif not (
+        release_builder.find("Push-Location $repoRoot")
+        < release_builder.find("npm run tauri build -- --bundles $Bundles")
+        < release_builder.find(
+            "cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin M2ShelfUpdater"
+        )
+        < release_builder.find(
+            "} finally {",
+            release_builder.find(
+                "cargo build --manifest-path src-tauri/Cargo.toml --release --locked --bin M2ShelfUpdater"
+            ),
+        )
+    ):
+        fail("M2ShelfUpdater must be built after Tauri inputs inside the same path-remapping scope")
     elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", release_builder):
         fail("public Windows release builder must not contain a literal user-profile path")
     else:
-        passed("public Windows release build remaps private source paths without hardcoded profiles")
+        passed("public Windows release build remaps paths and emits verified canonical x64 NSIS artifacts")
 
     validate_launcher = read("scripts/run_validate.mjs")
-    if "M2SHELF_PYTHON" not in validate_launcher:
-        fail("validation launcher must support an explicit, portable Python path")
+    validate_launcher_contract = (
+        "M2SHELF_PYTHON",
+        '[...prefix, "--version"]',
+        "if (probe.status !== 0) continue;",
+    )
+    if any(token not in validate_launcher for token in validate_launcher_contract):
+        fail("validation launcher must reject broken aliases and support an explicit portable Python path")
     elif re.search(r"(?i)[A-Z]:\\Users\\[^\\\s]+", validate_launcher):
         fail("validation launcher must not contain a literal user-profile path")
     else:
-        passed("validation launcher contains no personal Python path")
+        passed("validation launcher probes interpreters and contains no personal Python path")
 
     brand_archive = read("scripts/build_brand_assets.ps1")
     if (
@@ -1192,6 +1866,7 @@ def check_ui_windows_interaction_contract() -> None:
     settings_page = read("src/pages/SettingsPage.tsx")
     media_card = read("src/components/MediaCard.tsx")
     work_detail = read("src/pages/WorkDetailPage.tsx")
+    poster_image = read("src/components/PosterImage.tsx")
     context_menu = read("src/components/ContextMenu.tsx")
     batch_context_menu = read("src/components/BatchContextMenu.tsx")
     batch_tag_dialog = read("src/components/BatchTagDialog.tsx")
@@ -1208,6 +1883,7 @@ def check_ui_windows_interaction_contract() -> None:
     frontend_models = read("src/types/media.ts")
     frontend_format = read("src/lib/format.ts")
     cover_hook = read("src/hooks/useCoverDataUrl.ts")
+    poster_viewport_hook = read("src/hooks/usePosterViewportLifecycle.ts")
     poster_helper = read("src/lib/poster.ts")
     i18n = read("src/lib/i18n.tsx")
     css = read("src/styles.css")
@@ -1256,6 +1932,41 @@ def check_ui_windows_interaction_contract() -> None:
         fail(f"Windows-style navigation state contract is incomplete: {missing_navigation}")
     else:
         passed("back button, Alt+Left/mouse history, scroll, filter, sort, and view snapshots")
+
+    loader_ordering_ok = all(
+        token in app
+        for token in (
+            "const rootsLoadGeneration = useRef(0)",
+            "const allResourcesLoadGeneration = useRef(0)",
+            "const recentlyWatchedLoadGeneration = useRef(0)",
+            "const favoriteFoldersLoadGeneration = useRef(0)",
+            "const favoriteNodesLoadGeneration = useRef(0)",
+            "const currentRefreshGeneration = useRef(0)",
+            "const favoritesLoadingState = useRef",
+            "state.pending.add(token)",
+            "state.pending.delete(request.token)",
+            "const invalidateFavoritesLoads = useCallback",
+            "requestGeneration === allResourcesLoadGeneration.current",
+            "requestGeneration === recentlyWatchedLoadGeneration.current",
+            "requestGeneration === favoriteFoldersLoadGeneration.current",
+            "requestGeneration === favoriteNodesLoadGeneration.current",
+            "const isCurrentRefresh = () =>",
+            "const refreshCurrentAndAllResources = useCallback",
+            'page === "all" ? Promise.resolve(null) : loadAllResources()',
+        )
+    )
+    duplicate_all_refresh_absent = all(
+        fragment not in app
+        for fragment in (
+            "Promise.all([refreshCurrent(), loadRoots(selectedRootId), loadAllResources()])",
+            "Promise.all([refreshCurrent(), loadAllResources()])",
+            "Promise.all([refreshCurrent(), loadAllResources(), loadRoots(rootId)])",
+        )
+    )
+    if not loader_ordering_ok or not duplicate_all_refresh_absent:
+        fail("collection loaders can regress to stale-response commits, early loading close, or duplicate All Resources refreshes")
+    else:
+        passed("collection loaders commit only the latest response and coordinate loading without duplicate All Resources queries")
 
     section_restore_ok = all(
         (
@@ -1336,14 +2047,20 @@ def check_ui_windows_interaction_contract() -> None:
     else:
         passed("search-result navigation delays scroll restoration until result layout is ready")
 
-    settings_unmount_guard_ok = (
-        settings_page.count("if (mounted.current) applyAppearance") >= 2
-        and "if (mounted.current) onError(errorMessage(error));" in settings_page
+    settings_unmount_guard_ok = all(
+        (
+            "onPersistenceFailure(candidate, rollback, errorMessage(error), appearanceRevision)"
+            in settings_page,
+            "parentAppearanceRevision.current = onAppearanceChange(next)" in settings_page,
+            "const handleSettingsPersistenceFailure = useCallback" in app,
+            "settingsAppearanceRevision.current === appearanceRevision" in app,
+            "onPersistenceFailure={handleSettingsPersistenceFailure}" in app,
+        )
     )
     if not settings_unmount_guard_ok:
-        fail("settings autosave can invoke stale appearance/error callbacks after unmount")
+        fail("settings autosave lacks parent-owned revision-safe rollback after unmount")
     else:
-        passed("settings autosave guards late appearance/error callbacks after unmount")
+        passed("settings autosave rolls back through a revision-safe parent callback after unmount")
 
     context_menu_viewport_ok = all(
         (
@@ -1483,17 +2200,45 @@ def check_ui_windows_interaction_contract() -> None:
             "rememberResolvedCover" in cover_hook,
             "coverRequests.size > 600" not in cover_hook,
             "scheduleCoverRequest" in cover_hook,
-            "IntersectionObserver" in media_card,
-            'rootMargin: "700px 0px"' in media_card,
-            'decoding="async"' in media_card,
+            "Route changes must not cancel work" in cover_hook,
+            "warms the cross-page LRU" in cover_hook,
+            "resolvedCoverEvictionListeners" in cover_hook,
+            "subscribeResolvedCoverEviction" in cover_hook,
+            "notifyResolvedCoverEvicted" in cover_hook,
+            "resolvedCoverEvictionListeners.delete(key)" in cover_hook,
+            "resolvedCoverEvictionListeners.get(key) === listeners" in cover_hook,
+            "latestCoverKeyByNode" in cover_hook,
+            "if (latestCoverKeyByNode.get(nodeId) === key) rememberResolvedCover(key, url)" in cover_hook,
+            "resolvedCoverUrls.get(cacheKey)" in cover_hook,
+            "useLayoutEffect(() =>" in cover_hook,
+            "if (enabled || !hasCachedCover || !cacheKey) return" in cover_hook,
+            "evictedCacheKey !== cacheKey" in cover_hook,
+            "cancelIfQueued" not in cover_hook,
+            "subscribers" not in cover_hook,
+            "usePosterViewportLifecycle" in media_card,
+            "IntersectionObserver" in poster_viewport_hook,
+            'target.closest(".content-scroll")' in poster_viewport_hook,
+            "MAX_RETAINED_POSTERS = 64" in poster_viewport_hook,
+            "retainedPosters = new Map" in poster_viewport_hook,
+            "trimRetainedPosters" in poster_viewport_hook,
+            "!poster.nearViewport" in poster_viewport_hook,
+            "activationMarginPx: 1_000" in media_card,
+            "retentionEnabled: hasCachedCover" in media_card,
+            "retentionMarginPx: 1_800" in media_card,
+            "updateRetainedPosterProximity" in poster_viewport_hook,
+            'image.decoding = "async"' in poster_image,
+            "canvasReady" in poster_image,
+            "poster-image-preview" in poster_image,
+            'loading={active ? "eager" : "lazy"}' in poster_image,
             'loading="lazy"' not in media_card,
+            "new IntersectionObserver" in poster_viewport_hook,
             "!enabled || state.key !== cacheKey || state.loading" in cover_hook,
         )
     )
     if not startup_cover_loading_ok:
         fail("startup cover loading can regress to eager full-Node/root-stat IPC or deferred-cover failure state")
     else:
-        passed("single-gate lazy cover IPC with bounded resolved-data LRU and lightweight safety context")
+        passed("cross-page poster preview cache, bounded lazy cover IPC, and lightweight safety context")
 
     scan_listener_region = app[
         app.find("const handleScanProgress") : app.find("const selectRoot")
@@ -1536,12 +2281,36 @@ def check_ui_windows_interaction_contract() -> None:
     else:
         passed("All Resources and Browse hydrate bindings/tags in bounded SQL batches")
 
+    search_region = rust_database[
+        rust_database.find("pub fn search(&self") : rust_database.find("pub fn list_unbound_bangumi_candidates")
+    ]
+    batched_search_hydration_ok = all(
+        (
+            "transaction_with_behavior(TransactionBehavior::Deferred)" in search_region,
+            "load_node_rows_by_ids_conn(" in search_region,
+            "hydrate_nodes_metadata_conn(&transaction, &mut nodes)" in search_region,
+            "get_binding_conn" not in search_region,
+            "list_node_tags_conn" not in search_region,
+            "batched_search_hydration_matches_legacy_results_for_many_unicode_hits" in rust_database,
+        )
+    )
+    if not batched_search_hydration_ok:
+        fail("Search can regress to torn metadata snapshots or per-hit binding/tag SQL queries")
+    else:
+        passed("Search batches file-owner Nodes and metadata inside one deferred SQLite snapshot")
+
     search_cover_ok = all(
         (
             "function SearchResult" in search_page,
-            "useCoverDataUrl(hit.node, coverRevision)" in search_page,
+            "useCoverDataUrl(hit.node, coverRevision, coverRequested)" in search_page,
+            "<PosterImage active={coverVisible}" in search_page,
+            "usePosterViewportLifecycle" in search_page,
+            "activationMarginPx: 800" in search_page,
+            "retentionEnabled: hasCachedCover" in search_page,
+            "retentionMarginPx: 1_400" in search_page,
+            "ref={resultRef}" in search_page,
             'className={`search-hit-cover' in search_page,
-            ".search-hit-cover img" in css,
+            ".search-hit-cover .poster-image" in css,
         )
     )
     empty_search_placeholders = i18n.count('"search.placeholder": ""') >= 4
@@ -1944,27 +2713,78 @@ def check_ui_windows_interaction_contract() -> None:
             if interpolation is not None and interpolation != "auto":
                 degraded_interpolation.append(selector)
 
-    required_poster_declarations = {
-        "display": "block",
-        "image-rendering": "auto",
-        "position": "absolute",
-        "inset": "0",
-    }
     poster_image_quality_ok = all(
         (
-            all(
-                declarations.get(property_name) == value
-                for declarations in (cover_image_declarations, detail_image_declarations)
-                for property_name, value in required_poster_declarations.items()
-            ),
             not transformed_poster_selectors,
             not degraded_interpolation,
-            wide_cover_declarations.get("object-fit") == "contain",
-            wide_detail_declarations.get("object-fit") == "contain",
             "shouldContainPosterArtwork" in poster_helper,
+            "posterRenderLayout" in poster_helper,
             re.search(r"naturalWidth\s*/\s*naturalHeight", poster_helper) is not None,
-            re.search(r"shouldContainPosterArtwork\s*\(\s*event\.currentTarget\.naturalWidth", media_card) is not None,
-            re.search(r"shouldContainPosterArtwork\s*\(\s*event\.currentTarget\.naturalWidth", work_detail) is not None,
+            "<PosterImage" in media_card,
+            "<PosterImage" in work_detail,
+            'resizeQuality: "high"' in poster_image,
+            'context.imageSmoothingQuality = "high"' in poster_image,
+            "context.imageSmoothingEnabled = true" in poster_image,
+            "window.devicePixelRatio" in poster_image,
+            "MAX_DEVICE_PIXEL_RATIO = 2" in poster_image,
+            "MAX_DOWNSCALE_RATIO_PER_PASS = 2" in poster_image,
+            "createProgressivelyDownscaledBitmap" in poster_image,
+            "const firstWidth = nextDimension(sourceWidth, destinationWidth)" in poster_image,
+            "resizeWidth: firstWidth" in poster_image,
+            "shouldCancel: () => boolean" in poster_image,
+            "if (cancelled())" in poster_image,
+            "next.close()" in poster_image,
+            "current.close()" in poster_image,
+            "MAX_CONCURRENT_POSTER_RENDERS = 2" in poster_image,
+            "MAX_CACHED_POSTER_BITMAPS = 128" in poster_image,
+            "MAX_CACHED_POSTER_BITMAP_BYTES = 128 * 1024 * 1024" in poster_image,
+            "cachedPosterBitmaps" in poster_image,
+            "cachedPosterBitmapBytes" in poster_image,
+            "getCachedPosterBitmap" in poster_image,
+            "rememberCachedPosterBitmap" in poster_image,
+            "existing.bitmap.close()" in poster_image,
+            "bytes: bitmap.width * bitmap.height * 4" in poster_image,
+            "drawCachedPosterBitmap" in poster_image,
+            "isInsideVisibleScrollport" in poster_image,
+            "renderGenerationRef" in poster_image,
+            "renderGenerationRef.current !== renderGeneration" in poster_image,
+            "useLayoutEffect(() => () =>" in poster_image,
+            poster_image.count("renderGenerationRef.current += 1") >= 2,
+            "key={cacheKey}" in poster_image,
+            "errorHandlerRef.current()" in poster_image,
+            poster_image.count("errorHandlerRef.current()") == 1,
+            "posterRenderQueue.indexOf(queued)" in poster_image,
+            "scheduledRenderTask?.cancel()" in poster_image,
+            "devicePixelContentBoxSize" in poster_image,
+            'box: "device-pixel-content-box"' in poster_image,
+            "new ResizeObserver((entries)" in poster_image,
+            'window.addEventListener("resize", scheduleRender)' in poster_image,
+            'resolutionQuery?.addEventListener("change", handleResolutionChange)' in poster_image,
+            "bitmap?.close()" in poster_image,
+            'image.removeAttribute("src")' in poster_image,
+            "canvas.width = 1" in poster_image,
+            "canvas.height = 1" in poster_image,
+            "useLayoutEffect" in poster_image,
+            "!canvasReady" in poster_image,
+            "poster-image-preview" in poster_image,
+            'loading={active ? "eager" : "lazy"}' in poster_image,
+            "cacheKey={coverCacheKey}" in media_card,
+            "cacheKey={coverCacheKey}" in search_page,
+            "cacheKey={coverCacheKey}" in work_detail,
+            "<PosterImage active={coverVisible}" in media_card,
+            "<PosterImage active={coverVisible}" in search_page,
+            re.search(
+                r"\.poster-image\s*\{[^}]*display:\s*block;[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*image-rendering:\s*auto",
+                css,
+            ) is not None,
+            ".poster-image-preview.is-wide-artwork" in css,
+            re.search(
+                r"\.cover-frame\s+\.poster-image,\s*\.detail-cover\s+\.poster-image,\s*\.search-hit-cover\s+\.poster-image\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0",
+                css,
+            ) is not None,
+            re.search(r"\.cover-frame\s*\{[^}]*border:\s*0", css) is not None,
+            re.search(r"\.detail-cover\s*\{[^}]*border:\s*0", css) is not None,
+            ".cover-frame::after, .detail-cover::after" in css,
             re.search(
                 r"\.poster-grid-grid\s*\{\s*grid-template-columns:\s*repeat\(auto-fill,\s*\d+px\)",
                 css,
@@ -1990,9 +2810,23 @@ def check_ui_windows_interaction_contract() -> None:
         )
     )
     if not poster_image_quality_ok:
-        fail("poster images must share one frame ratio, use integer grid tracks, one lazy-load gate, normal interpolation, and no transformed hover surface")
+        fail("poster images must use bounded DPR-aware high-quality sampling, shared frame geometry, one lazy-load gate, and no transformed hover surface")
     else:
-        passed("shared-ratio poster sampling, interpolation, and non-transformed rendering contract")
+        passed("bounded DPR-aware poster sampling, shared geometry, and non-transformed rendering contract")
+
+    poster_overlay_controls_ok = (
+        re.search(r"\.quick-bind\s*\{[^}]*z-index:\s*5", css) is not None
+        and 'className="double-click-hint"' not in browse_page
+        and ".double-click-hint" not in css
+    )
+    if not poster_overlay_controls_ok:
+        fail(
+            "poster card actions must render above the frame border and Browse must not repeat the video-play hint"
+        )
+    else:
+        passed(
+            "poster card actions stay above the frame border and Browse omits the duplicate video-play hint"
+        )
 
     if "all.waterfall" in all_page:
         fail("All Resources page still renders the unified-waterfall eyebrow")
@@ -2069,6 +2903,7 @@ def check_durable_context() -> None:
         "title_extractor.rs",
         "build_windows_release.ps1",
         "0007_favorite_folders.sql",
+        "0008_bangumi_subject_type.sql",
         "watch_history",
         "node_favorite_folders",
         "lib/i18n.tsx",
@@ -2117,16 +2952,27 @@ def main() -> int:
         ("src-tauri/migrations/0005_user_tags.sql", 300),
         ("src-tauri/migrations/0006_watch_history.sql", 250),
         ("src-tauri/migrations/0007_favorite_folders.sql", 500),
+        ("src-tauri/migrations/0008_bangumi_subject_type.sql", 80),
+        ("src-tauri/migrations/0009_library_recognition_mode.sql", 80),
         ("src-tauri/windows-app-manifest.xml", 300),
+        ("src-tauri/update-public-key.txt", 40),
         ("src-tauri/src/lib.rs", 100),
         ("src-tauri/src/commands.rs", 1_000),
+        ("src-tauri/src/update.rs", 10_000),
+        ("src-tauri/src/portable_update.rs", 10_000),
+        ("src-tauri/src/bin/m2shelf_updater.rs", 2_000),
         ("src/lib/api.ts", 1_000),
         ("src/components/TagManagerDialog.tsx", 2_000),
         ("scripts/build_portable.ps1", 1_000),
         ("scripts/build_windows_release.ps1", 1_000),
+        ("scripts/generate_update_manifest.ps1", 3_000),
+        ("scripts/sign_update_offline.ps1", 3_000),
+        ("scripts/publish_signed_release.ps1", 3_000),
         ("scripts/build_brand_assets.ps1", 1_000),
         ("scripts/prepare_logo_source.ps1", 1_000),
         ("scripts/generate_icons.ps1", 1_000),
+        ("docs/PORTABLE_README_zh-CN.txt", 500),
+        (".github/workflows/windows-release.yml", 3_000),
     ):
         require_file(relative, minimum)
 

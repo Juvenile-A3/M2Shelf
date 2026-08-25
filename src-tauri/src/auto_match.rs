@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    thread,
 };
 
 use crate::{
     bangumi, cache,
     db::{AppResult, ConditionalBindingSave, Database},
-    models::{BangumiSubject, CoverSource, MediaNode, NodeType},
+    models::{BangumiSubject, CoverSource, MediaNode, MetadataBinding, NodeType},
     scanner::ScanTarget,
     title_extractor::{self, EditionKind, MatchEvidence},
 };
@@ -15,6 +16,8 @@ const AUTO_SEARCH_LIMIT: usize = 20;
 const MAX_QUERIES_PER_NODE: usize = 3;
 const MAX_CANDIDATES_PER_NODE: usize = 30;
 const MAX_DETAIL_ENRICHMENTS: usize = 5;
+const MAX_DETAIL_FETCHES_PER_RUN: usize = 256;
+const MAX_PARALLEL_DETAIL_FETCHES: usize = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AutoMatchReport {
@@ -81,7 +84,7 @@ impl Default for MatchWeights {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrongConflict {
-    NonAnime,
+    UnsupportedSubjectType,
     Year,
     Season,
     MissingSeason,
@@ -124,6 +127,52 @@ struct RecalledCandidate {
 struct MatchRunCache {
     searches: HashMap<String, Result<Vec<BangumiSubject>, String>>,
     details: HashMap<i64, Result<BangumiSubject, String>>,
+    cover_requests_disabled: bool,
+    detail_requests_disabled: bool,
+    detail_fetches_started: usize,
+}
+
+enum DetailRequestPlan {
+    Cached(Box<Result<BangumiSubject, String>>),
+    Fetch,
+    Exhausted,
+}
+
+impl MatchRunCache {
+    fn plan_detail_request(&mut self, subject_id: i64) -> DetailRequestPlan {
+        if let Some(result) = self.details.get(&subject_id) {
+            return DetailRequestPlan::Cached(Box::new(result.clone()));
+        }
+        if self.detail_requests_disabled {
+            return DetailRequestPlan::Exhausted;
+        }
+        if self.detail_fetches_started >= MAX_DETAIL_FETCHES_PER_RUN {
+            return DetailRequestPlan::Exhausted;
+        }
+        self.detail_fetches_started += 1;
+        DetailRequestPlan::Fetch
+    }
+
+    fn store_detail_result(&mut self, subject_id: i64, result: Result<BangumiSubject, String>) {
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| bangumi::is_provider_wide_detail_error(error))
+        {
+            self.detail_requests_disabled = true;
+        }
+        self.details.insert(subject_id, result);
+    }
+
+    fn cover_download_allowed(&self) -> bool {
+        !self.cover_requests_disabled
+    }
+
+    fn record_cover_failure(&mut self, error: &str) {
+        if bangumi::is_provider_wide_cover_error(error) {
+            self.cover_requests_disabled = true;
+        }
+    }
 }
 
 /// Runs the confidence matcher for the unbound, eligible Nodes in a completed scan scope.
@@ -273,8 +322,17 @@ where
         return Ok(AutoMatchNodeResult::Unmatched);
     }
     let initial_binding = database.get_binding(node.id)?;
-    if write_mode == MatchWriteMode::IfAbsent && initial_binding.is_some() {
-        return Ok(AutoMatchNodeResult::AlreadyBound);
+    if write_mode == MatchWriteMode::IfAbsent {
+        if let Some(binding) = initial_binding.as_ref() {
+            return restore_bound_cover(
+                database,
+                node,
+                binding,
+                cache_root,
+                run_cache,
+                is_cancelled,
+            );
+        }
     }
 
     let media_file_names = database
@@ -358,15 +416,121 @@ where
         return Ok(AutoMatchNodeResult::Matched);
     }
 
+    download_and_commit_cover(
+        &cache_operation,
+        database,
+        node.id,
+        &subject,
+        cache_root,
+        run_cache,
+        is_cancelled,
+    )
+}
+
+fn restore_bound_cover<C>(
+    database: &Database,
+    node: &MediaNode,
+    binding: &MetadataBinding,
+    cache_root: Result<&Path, &str>,
+    run_cache: &mut MatchRunCache,
+    is_cancelled: &C,
+) -> AppResult<AutoMatchNodeResult>
+where
+    C: Fn() -> bool,
+{
+    if node.cover_source == CoverSource::Manual
+        || binding
+            .cover_cache_path
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file())
+    {
+        return Ok(AutoMatchNodeResult::AlreadyBound);
+    }
+    let Some(_) = binding
+        .provider_image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(AutoMatchNodeResult::AlreadyBound);
+    };
+    let cache_operation = cache::begin_cover_cache_operation();
+
+    // Re-read after acquiring the cache barrier. A user may have selected a manual cover or
+    // rebound the Node after candidate selection; the recovery path must never override it.
+    let current_node = database.get_node(node.id)?;
+    let Some(current_binding) = database.get_binding(node.id)? else {
+        return Ok(AutoMatchNodeResult::AlreadyBound);
+    };
+    if current_node.cover_source == CoverSource::Manual
+        || current_binding.provider_subject_id != binding.provider_subject_id
+        || current_binding
+            .cover_cache_path
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file())
+    {
+        return Ok(AutoMatchNodeResult::AlreadyBound);
+    }
+    let Some(image_url) = current_binding
+        .provider_image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(AutoMatchNodeResult::AlreadyBound);
+    };
+    let subject = subject_from_binding(&current_binding, image_url);
+    download_and_commit_cover(
+        &cache_operation,
+        database,
+        node.id,
+        &subject,
+        cache_root,
+        run_cache,
+        is_cancelled,
+    )
+}
+
+fn subject_from_binding(binding: &MetadataBinding, image_url: &str) -> BangumiSubject {
+    BangumiSubject {
+        subject_id: binding.provider_subject_id,
+        subject_type: binding.provider_subject_type,
+        title: binding.provider_title.clone(),
+        title_cn: binding.provider_title_cn.clone(),
+        title_en: binding.provider_title_en.clone(),
+        title_ja: binding.provider_title_ja.clone(),
+        title_ko: binding.provider_title_ko.clone(),
+        match_aliases: Vec::new(),
+        date: binding.provider_date.clone(),
+        image_url: Some(image_url.to_string()),
+        summary: None,
+    }
+}
+
+fn download_and_commit_cover<C>(
+    cache_operation: &cache::CoverCacheOperationGuard,
+    database: &Database,
+    node_id: i64,
+    subject: &BangumiSubject,
+    cache_root: Result<&Path, &str>,
+    run_cache: &mut MatchRunCache,
+    is_cancelled: &C,
+) -> AppResult<AutoMatchNodeResult>
+where
+    C: Fn() -> bool,
+{
     // A manual cover selected before or during matching is explicit curation and is never
     // replaced. The new binding may still improve the locale-aware title.
-    if database.get_node(node.id)?.cover_source == CoverSource::Manual {
+    if database.get_node(node_id)?.cover_source == CoverSource::Manual {
         return Ok(AutoMatchNodeResult::Matched);
     }
-
-    let cover_result = match cache_root {
-        Ok(cache_root) => bangumi::download_cover(&cache_operation, cache_root, &subject),
-        Err(error) => Err(error.to_string()),
+    let cover_result = if !run_cache.cover_download_allowed() {
+        Err("Bangumi 封面服务本轮连续失败，已延后获取封面。绑定已保留，可以稍后重试。".into())
+    } else {
+        match cache_root {
+            Ok(cache_root) => bangumi::download_cover(cache_operation, cache_root, subject),
+            Err(error) => Err(error.to_string()),
+        }
     };
     if is_cancelled() {
         return Ok(AutoMatchNodeResult::Matched);
@@ -374,25 +538,28 @@ where
     let cover_error = match cover_result {
         Ok(Some(path)) => {
             if database.set_bangumi_cover_for_subject_unless_manual(
-                node.id,
+                node_id,
                 subject.subject_id,
                 &path,
             )? {
-                database.set_binding_cover_error_if_subject(node.id, subject.subject_id, None)?;
+                database.set_binding_cover_error_if_subject(node_id, subject.subject_id, None)?;
+            } else if let Ok(active_cache) = cache_root {
+                remove_cached_file_if_unreferenced(cache_operation, database, &path, active_cache);
             }
             false
         }
         Ok(None) => {
             database.set_binding_cover_error_if_subject(
-                node.id,
+                node_id,
                 subject.subject_id,
                 Some("该 Bangumi 条目没有可用封面。"),
             )?;
             true
         }
         Err(error) => {
+            run_cache.record_cover_failure(&error);
             database.set_binding_cover_error_if_subject(
-                node.id,
+                node_id,
                 subject.subject_id,
                 Some(&error),
             )?;
@@ -471,8 +638,10 @@ where
         })));
     }
 
-    // Stage one uses search response metadata only. Only the most plausible five Subjects incur
-    // a detail request; detail errors remain best-effort and do not discard search evidence.
+    // Stage one uses the complete bounded Subject rows returned by search. A common exact,
+    // high-confidence result already has enough evidence to bind safely and no longer incurs five
+    // redundant detail round trips. Ambiguous/translated evidence may still enrich at most five
+    // candidates, while a high-confidence winner missing only its image enriches just that winner.
     let weights = MatchWeights::default();
     let mut preliminary = recalled
         .iter()
@@ -486,29 +655,71 @@ where
         })
         .collect::<Vec<_>>();
     sort_scores(&mut preliminary);
-    let detail_ids = preliminary
-        .iter()
-        .take(MAX_DETAIL_ENRICHMENTS)
-        .map(|score| score.subject.subject_id)
-        .collect::<Vec<_>>();
+    let preliminary_decision = decide_scores(preliminary.clone(), is_container, &weights);
+    let detail_ids = detail_candidate_ids(&preliminary, &preliminary_decision);
+    if detail_ids.is_empty() {
+        return Ok(OnlineAssessment::Decision(Box::new(preliminary_decision)));
+    }
 
-    for subject_id in detail_ids {
+    // Reserve each tiny batch against the run-wide budget before starting threads. The cache is
+    // touched only on this coordinator thread, so there is no shared-map race. Cancellation and
+    // provider-wide failure breakers are observed before the next batch.
+    for subject_ids in detail_ids.chunks(MAX_PARALLEL_DETAIL_FETCHES) {
         if is_cancelled() {
             return Ok(OnlineAssessment::Cancelled);
         }
-        let Some(candidate) = recalled
-            .iter_mut()
-            .find(|candidate| candidate.subject.subject_id == subject_id)
-        else {
-            continue;
-        };
-        let enriched = run_cache
-            .details
-            .entry(subject_id)
-            .or_insert_with(|| bangumi::enrich_subject(&candidate.subject))
-            .clone();
-        if let Ok(subject) = enriched {
-            candidate.subject = subject;
+        let mut completed = Vec::<(i64, Result<BangumiSubject, String>)>::new();
+        let mut fetches = Vec::<(i64, BangumiSubject)>::new();
+        for subject_id in subject_ids {
+            let Some(subject) = recalled
+                .iter()
+                .find(|candidate| candidate.subject.subject_id == *subject_id)
+                .map(|candidate| candidate.subject.clone())
+            else {
+                continue;
+            };
+            match run_cache.plan_detail_request(*subject_id) {
+                DetailRequestPlan::Cached(result) => completed.push((*subject_id, *result)),
+                DetailRequestPlan::Fetch => fetches.push((*subject_id, subject)),
+                // Search responses still participate in the unchanged scorer after either the
+                // run-wide budget or the provider-wide detail breaker is exhausted.
+                DetailRequestPlan::Exhausted => {}
+            }
+        }
+
+        let fetched = thread::scope(|scope| {
+            let handles = fetches
+                .into_iter()
+                .map(|(subject_id, subject)| {
+                    (
+                        subject_id,
+                        scope.spawn(move || bangumi::enrich_subject(&subject)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|(subject_id, handle)| {
+                    let result = handle
+                        .join()
+                        .unwrap_or_else(|_| Err("Bangumi 详情补全线程发生内部错误。".into()));
+                    (subject_id, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (subject_id, result) in fetched {
+            run_cache.store_detail_result(subject_id, result.clone());
+            completed.push((subject_id, result));
+        }
+        for (subject_id, result) in completed {
+            if let Ok(subject) = result {
+                if let Some(candidate) = recalled
+                    .iter_mut()
+                    .find(|candidate| candidate.subject.subject_id == subject_id)
+                {
+                    candidate.subject = subject;
+                }
+            }
         }
         if is_cancelled() {
             return Ok(OnlineAssessment::Cancelled);
@@ -533,6 +744,22 @@ where
     ))))
 }
 
+fn detail_candidate_ids(preliminary: &[CandidateScore], decision: &MatchDecision) -> Vec<i64> {
+    if decision.confidence == MatchConfidence::High {
+        return decision
+            .best
+            .as_ref()
+            .filter(|best| best.subject.image_url.is_none())
+            .map(|best| vec![best.subject.subject_id])
+            .unwrap_or_default();
+    }
+    preliminary
+        .iter()
+        .take(MAX_DETAIL_ENRICHMENTS)
+        .map(|score| score.subject.subject_id)
+        .collect()
+}
+
 /// Merges provider results by rank round instead of allowing the earliest query to fill the
 /// bounded candidate pool first. Query order remains the deterministic tie-breaker within a
 /// rank, while each query gets an equal opportunity to contribute candidates.
@@ -550,7 +777,7 @@ fn merge_search_results_fair(search_results: &[Vec<BangumiSubject>]) -> Vec<Reca
             let Some(subject) = results.get(rank) else {
                 continue;
             };
-            if subject.subject_type != 2 {
+            if !bangumi::is_supported_subject_type(subject.subject_type) {
                 continue;
             }
             if let Some(existing_index) = subject_indexes.get(&subject.subject_id).copied() {
@@ -674,9 +901,9 @@ pub fn score_candidate(
     score += similarity_score;
 
     let mut strong_conflicts = Vec::new();
-    if subject.subject_type != 2 {
+    if !bangumi::is_supported_subject_type(subject.subject_type) {
         score += weights.edition_conflict;
-        strong_conflicts.push(StrongConflict::NonAnime);
+        strong_conflicts.push(StrongConflict::UnsupportedSubjectType);
     }
 
     let subject_year = subject.date.as_deref().and_then(parse_subject_year);
@@ -963,6 +1190,18 @@ mod tests {
         }
     }
 
+    fn subject_with_type(
+        id: i64,
+        title: &str,
+        title_cn: Option<&str>,
+        subject_type: i64,
+    ) -> BangumiSubject {
+        BangumiSubject {
+            subject_type,
+            ..subject(id, title, title_cn)
+        }
+    }
+
     fn evidence(title: &str) -> MatchEvidence {
         title_extractor::build_match_evidence(title, title, None, &[])
     }
@@ -986,6 +1225,93 @@ mod tests {
         assert!(exact.score > ranked_first.score);
         assert!(exact.primary_exact);
         assert!(ranked_first.score < weights.pending_threshold);
+    }
+
+    #[test]
+    fn dotted_movie_release_names_pass_the_existing_high_confidence_gate() {
+        for (raw, title, year, subject_type) in [
+            (
+                "The.Sword.of.Doom.1966.1080p.BluRay.x264",
+                "The Sword of Doom",
+                1966,
+                bangumi::SUBJECT_TYPE_LIVE_ACTION,
+            ),
+            (
+                "WolfWalkers.2020.1080p.BluRay.x265",
+                "WolfWalkers",
+                2020,
+                bangumi::SUBJECT_TYPE_ANIME,
+            ),
+            (
+                "The.Empire.of.Corpses.2015.1080p.BDRip.HEVC",
+                "The Empire of Corpses",
+                2015,
+                bangumi::SUBJECT_TYPE_ANIME,
+            ),
+        ] {
+            let evidence = evidence(raw);
+            let mut candidate = subject_with_type(1, title, None, subject_type);
+            candidate.date = Some(format!("{year}-01-01"));
+            candidate.image_url = Some("https://lain.bgm.tv/pic/cover/l/test.jpg".into());
+            let weights = MatchWeights::default();
+            let score = score_candidate(&evidence, &candidate, 0, &weights);
+            let decision = decide_scores(vec![score], false, &weights);
+
+            assert_eq!(evidence.primary_title, title, "raw={raw}");
+            assert_eq!(evidence.year, Some(year), "raw={raw}");
+            assert_eq!(decision.confidence, MatchConfidence::High, "raw={raw}");
+            assert!(decision
+                .best
+                .as_ref()
+                .is_some_and(|best| best.strong_conflicts.is_empty()));
+        }
+    }
+
+    #[test]
+    fn high_confidence_search_metadata_skips_redundant_details() {
+        let evidence = evidence("WolfWalkers.2020.1080p");
+        let weights = MatchWeights::default();
+        let mut candidate = subject(1, "WolfWalkers", None);
+        candidate.date = Some("2020-01-01".into());
+        candidate.image_url = Some("https://lain.bgm.tv/pic/cover/l/test.jpg".into());
+        let score = score_candidate(&evidence, &candidate, 0, &weights);
+        let decision = decide_scores(vec![score.clone()], false, &weights);
+
+        assert_eq!(decision.confidence, MatchConfidence::High);
+        assert!(detail_candidate_ids(&[score], &decision).is_empty());
+
+        let mut missing_image = decision.clone();
+        missing_image.best.as_mut().unwrap().subject.image_url = None;
+        assert_eq!(detail_candidate_ids(&[], &missing_image), vec![1]);
+    }
+
+    #[test]
+    fn detail_and_cover_breakers_are_run_wide_but_keep_cached_results() {
+        let mut cache = MatchRunCache::default();
+        cache.store_detail_result(
+            1,
+            Err("读取 Bangumi 条目详情失败：api.bgm.tv 返回 HTTP 503。".into()),
+        );
+        assert!(matches!(
+            cache.plan_detail_request(2),
+            DetailRequestPlan::Exhausted
+        ));
+        assert!(matches!(
+            cache.plan_detail_request(1),
+            DetailRequestPlan::Cached(_)
+        ));
+
+        let mut isolated = MatchRunCache::default();
+        isolated.store_detail_result(1, Err("api.bgm.tv 返回 HTTP 404".into()));
+        assert!(matches!(
+            isolated.plan_detail_request(2),
+            DetailRequestPlan::Fetch
+        ));
+        isolated.record_cover_failure("lain.bgm.tv 返回 HTTP 404");
+        assert!(isolated.cover_download_allowed());
+        isolated
+            .record_cover_failure("下载 Bangumi 封面失败：lain.bgm.tv 返回 HTTP 503。绑定已保留。");
+        assert!(!isolated.cover_download_allowed());
     }
 
     #[test]
@@ -1047,6 +1373,25 @@ mod tests {
         };
         assert_eq!(decision.confidence, MatchConfidence::High);
         assert!(decision.best.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires external network access"]
+    fn live_structured_match_accepts_a_high_confidence_live_action_movie() {
+        let evidence = evidence("盗梦空间 (2010)");
+        let mut cache = MatchRunCache::default();
+        let decision = match assess_evidence_online(&evidence, false, &mut cache, &|| false)
+            .expect("Bangumi live assessment should succeed")
+        {
+            OnlineAssessment::Decision(decision) => decision,
+            OnlineAssessment::Cancelled => panic!("live assessment was unexpectedly cancelled"),
+        };
+        assert_eq!(decision.confidence, MatchConfidence::High);
+        let best = decision
+            .best
+            .expect("live-action match should have a best result");
+        assert_eq!(best.subject.subject_type, bangumi::SUBJECT_TYPE_LIVE_ACTION);
+        assert!(best.subject.image_url.is_some());
     }
 
     #[test]
@@ -1140,6 +1485,48 @@ mod tests {
         );
         assert!(movie.score > tv.score);
         assert!(tv.strong_conflicts.contains(&StrongConflict::Edition));
+    }
+
+    #[test]
+    fn exact_live_action_movie_can_pass_the_existing_high_confidence_gate() {
+        let evidence = evidence("奥本海默 (2023)");
+        let weights = MatchWeights::default();
+        let mut live_action = subject_with_type(
+            451975,
+            "Oppenheimer",
+            Some("奥本海默"),
+            bangumi::SUBJECT_TYPE_LIVE_ACTION,
+        );
+        live_action.date = Some("2023-07-21".into());
+        live_action.image_url = Some("https://lain.bgm.tv/pic/cover/l/test.jpg".into());
+        let exact = score_candidate(&evidence, &live_action, 0, &weights);
+
+        assert!(exact.primary_exact);
+        assert!(exact.strong_conflicts.is_empty());
+        assert!(exact.score >= weights.automatic_threshold);
+        assert_eq!(
+            decide_scores(vec![exact], false, &weights).confidence,
+            MatchConfidence::High
+        );
+    }
+
+    #[test]
+    fn unsupported_bangumi_subject_types_remain_strong_conflicts() {
+        let evidence = evidence("同名作品");
+        let weights = MatchWeights::default();
+        let book = score_candidate(
+            &evidence,
+            &subject_with_type(10, "同名作品", None, 1),
+            0,
+            &weights,
+        );
+        assert!(book
+            .strong_conflicts
+            .contains(&StrongConflict::UnsupportedSubjectType));
+        assert_ne!(
+            decide_scores(vec![book], false, &weights).confidence,
+            MatchConfidence::High
+        );
     }
 
     #[test]
@@ -1282,6 +1669,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(duplicates.len(), 1);
         assert_eq!(duplicates[0].official_rank, 1);
+    }
+
+    #[test]
+    fn candidate_pool_accepts_live_action_but_rejects_other_subject_types() {
+        let animation = subject_with_type(1, "Animation", None, bangumi::SUBJECT_TYPE_ANIME);
+        let live_action = subject_with_type(
+            2,
+            "Live Action Film",
+            None,
+            bangumi::SUBJECT_TYPE_LIVE_ACTION,
+        );
+        let game = subject_with_type(3, "Game", None, 4);
+
+        let recalled = merge_search_results_fair(&[vec![animation, live_action, game]]);
+        assert_eq!(
+            recalled
+                .iter()
+                .map(|candidate| candidate.subject.subject_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn detail_enrichment_budget_is_run_wide_and_cached_results_are_free() {
+        let mut cache = MatchRunCache::default();
+        for subject_id in 1..=MAX_DETAIL_FETCHES_PER_RUN as i64 {
+            assert!(matches!(
+                cache.plan_detail_request(subject_id),
+                DetailRequestPlan::Fetch
+            ));
+            cache.store_detail_result(subject_id, Err("detail unavailable".into()));
+        }
+        assert_eq!(cache.detail_fetches_started, MAX_DETAIL_FETCHES_PER_RUN);
+        assert!(matches!(
+            cache.plan_detail_request(1),
+            DetailRequestPlan::Cached(result) if result.is_err()
+        ));
+        assert!(matches!(
+            cache.plan_detail_request(MAX_DETAIL_FETCHES_PER_RUN as i64 + 1),
+            DetailRequestPlan::Exhausted
+        ));
     }
 
     #[test]

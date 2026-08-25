@@ -10,7 +10,7 @@ import { OtherResourceList } from "../components/OtherResourceList";
 import { bindingDisplayTitle, canBindBangumi, nodeDisplayTitle, nodeHasVideo, nodeTypeLabel } from "../lib/format";
 import { useCoverDataUrl } from "../hooks/useCoverDataUrl";
 import { useI18n } from "../lib/i18n";
-import { shouldContainPosterArtwork } from "../lib/poster";
+import { PosterImage } from "../components/PosterImage";
 
 interface WorkDetailPageProps {
   detail: NodeDetail | null;
@@ -37,7 +37,7 @@ interface WorkDetailPageProps {
 export function WorkDetailPage({ detail, loading, rootLabel, onRoot, onBreadcrumb, onBack, onBangumi, onRetryCover, onRetryCoverNode, onClearBangumi, onReveal, onPlay, onRevealMedia, onOpenResource, onRevealResource, onOpenChild, onBangumiNode, onMenu, coverRevision }: WorkDetailPageProps) {
   const { t } = useI18n();
   const coverNode = detail ? { ...detail.node, binding: detail.binding } : null;
-  const { coverUrl: cover, coverFailed: coverReadFailed, coverLoading } = useCoverDataUrl(coverNode, coverRevision);
+  const { coverCacheKey, coverUrl: cover, coverFailed: coverReadFailed, coverLoading } = useCoverDataUrl(coverNode, coverRevision);
   const [imageFailed, setImageFailed] = useState(false);
   useEffect(() => setImageFailed(false), [cover]);
   if (loading || !detail) return <LoadingState label={t("detail.loading")} />;
@@ -54,7 +54,7 @@ export function WorkDetailPage({ detail, loading, rootLabel, onRoot, onBreadcrum
       <header className="detail-toolbar"><button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" />{t("detail.back")}</button><Breadcrumb rootLabel={rootLabel} items={detail.breadcrumbs} currentNodeId={node.id} onRoot={onRoot} onNode={onBreadcrumb} /></header>
       <div className="detail-content">
         <section className="detail-hero">
-          <div className={`detail-cover ${cover && !coverFailed ? "has-cover" : ""}`}>{cover && !coverFailed ? <img alt={t("detail.coverAlt", { title })} decoding="async" onError={() => setImageFailed(true)} onLoad={(event) => event.currentTarget.classList.toggle("is-wide-artwork", shouldContainPosterArtwork(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight))} src={cover} /> : <><Icon name={isContainer ? "folder-open" : "work"} /><span>{coverError ? t("detail.coverFailed") : isContainer ? t("detail.resourceContainer") : t("detail.noCover")}</span>{bindable && (coverError ? <button onClick={onRetryCover} type="button"><Icon name="refresh" />{t("detail.retrieveAgain")}</button> : <button onClick={onBangumi} type="button"><Icon name="plus" />{t("provider.bangumi")}</button>)}</>}</div>
+          <div className={`detail-cover ${cover && !coverFailed ? "has-cover" : ""}`}>{cover && !coverFailed ? <PosterImage alt={t("detail.coverAlt", { title })} cacheKey={coverCacheKey} onError={() => setImageFailed(true)} src={cover} /> : <><Icon name={isContainer ? "folder-open" : "work"} /><span>{coverError ? t("detail.coverFailed") : isContainer ? t("detail.resourceContainer") : t("detail.noCover")}</span>{bindable && (coverError ? <button onClick={onRetryCover} type="button"><Icon name="refresh" />{t("detail.retrieveAgain")}</button> : <button onClick={onBangumi} type="button"><Icon name="plus" />{t("provider.bangumi")}</button>)}</>}</div>
           <div className="detail-copy">
             <p className="eyebrow">{nodeTypeLabel(node.nodeType)}{node.manualTypeOverride && ` · ${t("node.manual")}`}</p>
             <h1>{title}</h1>

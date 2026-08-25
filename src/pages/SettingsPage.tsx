@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { AppBootstrap, AppLanguage, AppSettings, AppTheme, CacheStats, LibraryRoot } from "../types/media";
+import type { AppBootstrap, AppLanguage, AppSettings, AppTheme, CacheStats, LibraryRoot, UpdateDownloadStatus } from "../types/media";
 import { EmptyState } from "../components/EmptyState";
 import { Icon } from "../components/Icon";
 import { LoadingState } from "../components/LoadingState";
@@ -13,13 +13,15 @@ interface SettingsPageProps {
   onAddRoot: () => void;
   onRemoveRoot: (root: LibraryRoot) => void;
   onScanRoot: (root: LibraryRoot) => void;
-  onLanguageChange: (language: AppLanguage) => void;
-  onThemeChange: (theme: AppTheme) => void;
+  onAppearanceChange: (settings: AppSettings) => number;
+  onPersistenceFailure: (failed: AppSettings, rollback: AppSettings | null, message: string, appearanceRevision: number) => void;
+  updateDownloadStatus: UpdateDownloadStatus;
+  onCheckForUpdate: () => void;
   onError: (message: string) => void;
   onSuccess: (message: string) => void;
 }
 
-export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScanRoot, onLanguageChange, onThemeChange, onError, onSuccess }: SettingsPageProps) {
+export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScanRoot, onAppearanceChange, onPersistenceFailure, updateDownloadStatus, onCheckForUpdate, onError, onSuccess }: SettingsPageProps) {
   const { t } = useI18n();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [cache, setCache] = useState<CacheStats | null>(null);
@@ -31,6 +33,7 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScan
   const persistedSettings = useRef<AppSettings | null>(null);
   const latestSettings = useRef<AppSettings | null>(null);
   const settingsRevision = useRef(0);
+  const parentAppearanceRevision = useRef(0);
   const saveInFlight = useRef(false);
   const saveRequested = useRef(false);
   const mounted = useRef(true);
@@ -61,8 +64,7 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScan
   }, []);
 
   const applyAppearance = (next: AppSettings) => {
-    onLanguageChange(next.language);
-    onThemeChange(next.theme);
+    parentAppearanceRevision.current = onAppearanceChange(next);
   };
 
   const drainAutoSave = async () => {
@@ -78,6 +80,7 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScan
         const candidate = latestSettings.current;
         if (!candidate) continue;
         const revision = settingsRevision.current;
+        const appearanceRevision = parentAppearanceRevision.current;
         const previousPersisted = persistedSettings.current;
         try {
           const saved = await api.updateSettings(candidate);
@@ -103,9 +106,10 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScan
           latestSettings.current = rollback;
           if (rollback) {
             if (mounted.current) setSettings(rollback);
-            if (mounted.current) applyAppearance(rollback);
           }
-          if (mounted.current) onError(errorMessage(error));
+          // The parent outlives this page. It must restore persisted appearance/update-check state
+          // and surface the error even if navigation unmounted Settings while the IPC was pending.
+          onPersistenceFailure(candidate, rollback, errorMessage(error), appearanceRevision);
         }
       }
     } finally {
@@ -219,6 +223,10 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onRemoveRoot, onScan
         <section className="settings-section about-section">
           <div className="settings-section-heading"><span className="settings-symbol coral"><Icon name="info" /></span><div><h2>{t("settings.aboutTitle")}</h2><p>{t("settings.aboutDescription")}</p></div></div>
           <div className="about-brand"><strong>{t("brand.name")}</strong><span>{t("brand.subtitle")}</span></div>
+          <div className="update-preferences">
+            <label className="switch-field update-auto-check"><span><strong>{t("settings.autoCheckUpdates")}</strong><small>{t("settings.autoCheckUpdatesDescription")}</small></span><input aria-label={t("settings.autoCheckUpdates")} checked={settings?.autoCheckUpdates ?? false} disabled={!settings || !desktopAvailable} onChange={(event) => changeSettings((current) => ({ ...current, autoCheckUpdates: event.target.checked }))} type="checkbox" /><i /></label>
+            <div className="switch-field update-manual-check"><span><strong>{t("settings.manualCheckUpdates")}</strong><small>{t("settings.manualCheckUpdatesDescription")}</small></span><button aria-label={t("update.checkAria")} className={`button secondary${updateDownloadStatus.phase === "CHECKING" ? " is-busy" : ""}`} disabled={!desktopAvailable || updateDownloadStatus.phase === "CHECKING" || updateDownloadStatus.phase === "DOWNLOADING" || updateDownloadStatus.phase === "APPLYING"} onClick={onCheckForUpdate} title={t("update.checkAria")} type="button"><Icon name="refresh" />{updateDownloadStatus.phase === "CHECKING" ? t("update.checking") : t("update.check")}</button></div>
+          </div>
           <dl className="about-grid">
             <div><dt>{t("settings.currentVersion")}</dt><dd>{bootstrap?.version ?? t("common.notAvailable")}</dd></div>
             <div><dt>{t("settings.updateDate")}</dt><dd>{bootstrap?.buildDate ?? t("common.notAvailable")}</dd></div>

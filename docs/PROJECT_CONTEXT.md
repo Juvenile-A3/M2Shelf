@@ -4,13 +4,13 @@
 
 ## 当前状态
 
-- 版本：`0.5.7`
+- 版本：`0.5.8`
 - 目标：Windows x64 桌面应用
 - 前端：React 19、TypeScript 5.8、Vite 6
 - 客户端：Tauri 2、Rust 2021
 - 数据：SQLite（`rusqlite` bundled）
 - 网络：`reqwest` + rustls native roots，使用系统代理
-- 主要外部服务：Bangumi 官方 API 和封面主机
+- 主要外部服务：Bangumi 官方 API / 封面主机，以及 M²Shelf GitHub Releases 更新清单与资产
 
 仓库没有独立服务器。所有数据库访问在 Rust 中完成，前端通过类型化 Tauri 命令通信。
 
@@ -23,7 +23,8 @@
 - `types/media.ts`：前端 DTO、语言、主题、分类、排序和设置类型；
 - `lib/api.ts`：唯一的 Tauri invoke 封装；
 - `lib/i18n.tsx`：`zh-CN`、`en-US`、`ja-JP`、`ko-KR` 文案及标题选择；
-- `lib/poster.ts`、`hooks/useCoverDataUrl.ts`：海报布局和缓存图加载；主列表与详情页共用海报框比例，网格用整数像素列宽并只通过 IntersectionObserver 启动延迟加载；
+- `components/UpdateBanner.tsx`、`UpdateDialog.tsx`：更新可用提示，以及紧凑的说明、下载进度和安装确认对话框；设置/About 页面只保留同层级的自动检查开关与手动检查按钮；
+- `components/PosterImage.tsx`、`lib/poster.ts`、`hooks/useCoverDataUrl.ts`、`hooks/usePosterViewportLifecycle.ts`：缓存图加载以及主列表/详情共用的 DPR 对齐高质量重采样；128 项/约 32 MiB 源图 LRU 提供即时预览，128 项/128 MiB 最终位图 LRU 跨页面同步恢复清晰 Canvas，64 项挂载 Canvas 工作集独立受限，列表以内部滚动容器为观察根并使用预热区和保留区；
 - `pages/`：Onboarding、All Resources、Browse、Search、Recently Watched、Favorites、Work Detail、Settings；
 - `components/`：海报网格、文件列表、标签筛选、上下文菜单、编辑模式和对话框；
 - `styles.css`：语义主题变量、布局和响应式样式。
@@ -42,7 +43,11 @@
 - `bangumi.rs`：官方搜索、Subject 获取和封面请求；
 - `cache.rs`：应用封面缓存校验、同目录原子提交、读写/清理屏障与拥有文件清理；
 - `player.rs`：播放器测试和字面参数启动；
-- `window_state.rs`：窗口尺寸校验、恢复和保存。
+- `window_state.rs`：窗口尺寸校验、恢复和保存；
+- `update.rs`：固定 GitHub 清单、规范稳定 SemVer、下载状态、有界网络、SHA-256 与 Ed25519 验证；
+- `portable_update.rs`：Portable 事务准备、helper-ready、受限解包、替换、健康回执、SQLite/文件回滚和恢复提示；
+- `single_instance.rs`：Windows 单实例互斥锁及已有窗口唤醒；
+- `bin/m2shelf_updater.rs`：随 Portable 分发的更新 helper，同时为受控线下签名/发布提供严格的 identity、sign 和公钥 verify 命令。
 
 ### 配置与脚本
 
@@ -50,8 +55,13 @@
 - `src-tauri/capabilities/default.json`：最小 Tauri 权限；
 - `src-tauri/icons/`：用户确认母版及派生的 PNG、ICO、SVG；
 - `scripts/validate_project.py`：跨源码和构建契约验证；
-- `scripts/build_windows_release.ps1`：公开 Windows 构建、Portable 组装和隐私检查；
+- `scripts/run_validate.mjs`：先探测可用 Python 解释器并跳过无效的 Windows Store 别名，再运行验证器；
+- `scripts/build_windows_release.ps1`：公开 Windows 主程序、updater helper 与 NSIS 构建；验证稳定版本、x64 PE、产品元数据和隐私路径，并输出固定命名安装包及 SHA-256；
 - `scripts/build_portable.ps1`：Portable 目录和 ZIP；
+- `scripts/generate_update_manifest.ps1`：为两个固定版本化资产生成 SHA-256、Ed25519 签名边车和严格 `latest.json`；
+- `scripts/sign_update_offline.ps1`：在隔离 Windows 签名环境中核对独立保存的脚本、helper 与候选摘要后解开仓库外 seed；开发机 CurrentUser DPAPI 仅用于流程验收，不构成生产隔离；
+- `scripts/publish_signed_release.ps1`：在本地和远端条件全部匹配后创建、核对并发布不可变 Release；
+- `.github/workflows/windows-release.yml`：固定 action commit 的质量门禁和无签名 Windows 候选构建，只上传资产、校验和与来源证明；
 - `scripts/generate_icons.ps1`、`build_brand_assets.ps1`：从固定母版生成图标。
 
 ## 数据库
@@ -67,6 +77,8 @@
 5. `0005_user_tags.sql`：`tags`、`node_tags`；
 6. `0006_watch_history.sql`：`watch_history`；
 7. `0007_favorite_folders.sql`：`favorite_folders`、`node_favorite_folders`。
+8. `0008_bangumi_subject_type.sql`：为绑定增加 `provider_subject_type`；旧记录兼容默认动画 type 2，新绑定只允许动画 type 2 或真人影视 type 6。
+9. `0009_library_recognition_mode.sql`：为每个 Root 保存 `FOLDER` / `VIDEO_FILE` 识别方式；旧 Root 默认 `FOLDER`。
 
 关键关系：
 
@@ -76,37 +88,49 @@
 - 每个 Node 最多一个 Bangumi 绑定；
 - 标签、收藏夹通过关联表实现多对多；
 - 最近观看每个 Node 一行，删除 Node 时外键级联；
-- `settings` 同时保存 AppSettings、窗口尺寸和分作用域排序键。
+- `settings` 同时保存 AppSettings（含 `auto_check_updates`）、窗口尺寸和分作用域排序键；更新器运行态和下载进度不写入 SQLite。
 
 ## 核心调用流程
 
 ### 启动
 
-Rust 以隐藏状态创建主窗口，创建应用数据目录、打开 SQLite、执行 migrations，并在首次显示前恢复经过 DPI/工作区校验的窗口尺寸。前端先独立应用持久化语言和主题，在 React 首屏提交后通知原生窗口显示；其余 bootstrap、资源库、排序、扫描状态、全部资源和最近观看继续并行装载。
+Rust 先取得 Windows 单实例锁，再以隐藏状态创建主窗口，创建应用数据目录、打开 SQLite、执行 migrations，并在首次显示前恢复经过 DPI/工作区校验的窗口尺寸。第二个普通启动会唤醒已有窗口后退出。前端先独立应用持久化语言和主题，在 React 首屏提交后通知原生窗口显示；其余 bootstrap、资源库、排序、扫描状态、全部资源和最近观看继续并行装载。若上一轮 Portable 更新已自动回滚或需要人工恢复，bootstrap 会持续返回尚未确认的恢复状态，且该结果独立于其他并行初始化请求落地；前端以本地化模态警告持续展示，只有用户明确确认且原生清理成功后才移除持久通知。
 
 ### 扫描
 
-前端调用扫描命令并监听进度事件。`scanner.rs` 只读遍历目录，`db.rs` 在事务中更新 Node、文件、计数和分类。完成后，未绑定且合格的 Node 可进入自动匹配；人工分类和应用元数据不被普通扫描覆盖。
+前端添加 Root 时先用四语言模态框选择识别方式，再把选择随 Root 写入 SQLite。`scanner.rs` 的 `FOLDER` 分支原样保留目录树、分类和局部扫描；`VIDEO_FILE` 分支递归只读遍历，把普通视频以真实文件路径创建为隐藏 Root 下的扁平 `AUTO_WORK` Node，每个 Node 挂一个媒体文件并独立进入绑定，BDMV 则按一套结构聚合为一个 Work。非视频资源挂在隐藏 Root，不成为作品。文件 Node 的局部重扫请求由 Rust 升级为整 Root 扫描；只有完整无错误遍历才清理未见旧 Node。`db.rs` 更新 Node、文件、计数和分类。Rust 以扫描生命周期互斥锁和独立 worker 活跃标记串行化扫描、匹配现有资源、清缓存、删除 Root 与更新退出准备；活跃状态持续到后台线程完整退出，不能在终态事件与线程收尾之间启动第二个 worker。完成后，未绑定且合格的 Node 可进入自动匹配；人工分类和应用元数据不被普通扫描覆盖。
 
 ### 自动匹配
 
-`title_extractor.rs` 生成结构化证据，`auto_match.rs` 最多发起三个搜索并公平合并候选，依据多语言标题、季度、年份和类型评分。只有高置信度且领先分差足够的 Anime Subject 写入绑定。普通路径不替换绑定或手工封面。
+`title_extractor.rs` 生成结构化证据，并仅对具有年份/技术段的多点发行名把点号视为分隔符。`auto_match.rs` 最多发起三个搜索并公平合并候选，依据多语言标题、季度、年份和类型评分。搜索元数据已经形成高置信且含图的结果会直接使用；高置信缺图只补全胜出项，模糊结果最多补全五项，详情以两路小批并发执行。单次匹配运行最多新发起 256 个 Subject 详情请求，同一 Subject 复用本轮缓存；详情服务出现提供方级故障后本轮停止新详情请求并继续以搜索元数据保守评分。`bangumi.rs` 只请求并接收动画 type 2 与真人影视 type 6；两者都必须达到同一高置信度和领先分差才写入绑定，其他 Subject 类型保持强冲突。`provider_subject_type` 随绑定持久化，使真人影视可在重启后重新读取详情和重试封面。普通路径不替换绑定或手工封面。
 
 ### 封面
 
-Bangumi 封面下载到活动应用缓存，Node 保存实际缓存路径和失败原因。本地手工封面也复制到缓存。两类写入均使用目标目录内 UUID 临时文件并原子替换，失败时保留旧成品。普通读取/写入共享缓存操作屏障，显式清理独占屏障并在扫描或自动匹配运行时被后端拒绝，因此文件变化和 SQLite 路径更新不会交错。切换缓存目录只影响新写入；旧路径继续可读，清理范围仍受应用拥有目录与文件名限制。
+Bangumi 封面下载到活动应用缓存，Node 保存实际缓存路径和失败原因。本地手工封面也复制到缓存。两类写入均使用目标目录内 UUID 临时文件并原子替换，并在提交前校验格式、字节数和像素尺寸；旧缓存读取也复验像素尺寸。失败时保留旧成品和有效绑定。同一匹配运行遇到封面 CDN 的提供方级故障后停止继续放大请求。清缓存或物理文件丢失后，扫描候选会沿用绑定中保存的 Subject 与图片 URL 只恢复封面，不重新搜索、改绑或覆盖手工封面。普通读取/写入共享缓存操作屏障，显式清理独占屏障并在扫描或自动匹配运行时被后端拒绝，因此文件变化和 SQLite 路径更新不会交错。切换缓存目录只影响新写入；旧路径继续可读，清理范围仍受应用拥有目录与文件名限制。
 
 ### 浏览与导航
 
-Rust 返回已 hydrate 的 Node DTO；列表所需的 Bangumi 绑定与用户标签按最多 500 个 Node 分块批量查询，避免全部资源和目录浏览退化为每项两次附加 SQL。前端按当前语言选择标题，封面 IPC 保持 4 路并发，并用 128 项/约 32 MiB 字符预算的 LRU 缓存已解码 data URL。全部资源、搜索、最近观看、收藏夹和每个 Root 各有会话快照。历史返回恢复快照；资源库与收藏夹恢复会重新查询当前行，避免把旧业务数据写回 UI。
+Rust 返回已 hydrate 的 Node DTO；列表所需的 Bangumi 绑定与用户标签按最多 500 个 Node 分块批量查询，避免全部资源和目录浏览退化为每项两次附加 SQL。`Database::search` 也在同一个 deferred SQLite 读事务中完成 Node 命中、文件命中及其所属 Node 补齐、批量绑定/标签 hydrate、自然排序与最终截断，确保本地搜索结果来自同一快照且不出现逐项查询。前端按当前语言选择标题；主列表、详情与搜索结果共用 `PosterImage`，封面 IPC 保持 4 路并发，并用 128 项/约 32 MiB 字符预算的 LRU 缓存精确版本 data URL。页面切换时，已排队读取继续完成并预热此跨页缓存；同一 Node 的旧 revision 即使晚完成也不能重新写入 LRU。命中时先同步显示普通源图预览。渐进重采样后的 ImageBitmap 以 128 项和 128 MiB 双上限另行跨页缓存，命中时在 `useLayoutEffect` 中为实际可见卡片同步画回 Canvas，因此返回页面无需再次解码和缩放；render generation 阻止旧异步任务覆盖新封面。主列表以 `.content-scroll` 为显式观察根，在上下 1000 px 内预热、1800 px 内保护；搜索结果分别使用 800/1400 px。挂载 Canvas 另保留在跨列表共享的 64 项目标工作集；超限时只淘汰最旧且位于保护区外的 Canvas，保护区内项目允许暂时软超限，Canvas 不在时仍显示源图预览。源图 LRU 达到容量后淘汰最旧项，并向已经释放的挂载卡片发送一次性精确失效通知，防止 data URL 与监听引用无界积累。大图重采样首级即裁剪，之后最多约 2:1 渐进缩小。全部资源、搜索、最近观看、收藏夹和每个 Root 各有会话快照。集合与 Root 加载器分别维护请求代次，只有最新响应可提交数据或关闭 loading；收藏夹 folders/nodes 共享 epoch 与 pending 集合，避免一个旧请求提前结束另一个请求的 loading。历史返回恢复快照；资源库与收藏夹恢复会重新查询当前行，避免把旧业务数据写回 UI。
+
+Bangumi 手动弹窗为每次预填、搜索和绑定维护 Node ID 与请求代次。关闭弹窗、切换 Node 或手动修改关键词会使旧异步结果失效，旧预填不会覆盖用户输入，旧搜索结果不会显示到新关键词或新作品，旧绑定回调也不会关闭或刷新新作品的弹窗；绑定提交期间输入保持锁定。
 
 ### 播放
 
-`player.rs` 以程序路径和媒体路径的独立字面参数启动播放器。只有成功 spawn 后，`db.rs` 才 upsert 最近观看记录。
+`player.rs` 以程序路径启动，并只把媒体绝对路径作为一个独立字面参数传入，不经过 shell，也不附加 mpv 专属的 `--`。mpv/VLC 的显式测试可执行有界 `--version`；其他 GUI 播放器只校验已选择的 `.exe`，避免测试参数反而唤起空窗口。只有成功 spawn 后，`db.rs` 才 upsert 最近观看记录。
+
+### 稳定更新
+
+前端启动后仅在 `auto_check_updates` 开启时静默检查一次，也可从设置页同层级按钮手动检查；自动检查不下载、不安装。手动检查无更新或失败时只显示本地化 toast，只有发现有效新版本才打开紧凑更新对话框。`update.rs` 读取固定的 `https://github.com/Undermori/M2Shelf/releases/latest/download/latest.json`，严格解析四语言说明和 Portable/NSIS 两个平台，拒绝预发布、build metadata、相同/更低版本、未知字段、错误文件名或非固定版本 Release URL。若该地址 404，只有最终 URL 精确指向本仓库规范的 `v{version}/latest.json` 且版本不高于客户端时才返回无更新；更高版本缺清单仍失败，且此分支不提供任何下载候选。
+
+下载使用应用更新缓存中的唯一 partial 文件并限制大小、主机、重定向和超时。更新缓存根、版本目录和 Portable 事务目录在写入、枚举或清理前都验证为应用目录中的普通非重解析目录，并再次与 Library Root 比较真实路径；旧缓存清理只删除严格命名且确认普通的更新文件，不递归穿过链接。完成下载后核对长度和 SHA-256，再用仓库编译进主程序的 Ed25519 公钥验证绑定 `appId + version + platform + size + digest` 的签名；执行前对打开的文件再锁定并复验。检查、下载和安装由后端互斥，前端也抑制重复操作。
+
+NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当前目录标记、更新缓存及安装目录的 Library Root 隔离，复制已安装的可信 `M2ShelfUpdater.exe` 到应用数据事务目录，并在取得 SQLite 单写入屏障后通过 online backup 建立一致快照及长度/SHA-256 记录；该屏障保留到旧进程退出，避免快照后的写入在回滚时丢失。helper 全程持有 Windows 命名更新互斥锁，在旧程序退出前锁定、复验并密封 ZIP，原子写入 helper-ready；普通手动启动会先等待该锁。只有新版子进程携带的规范事务 ID 能同时认证精确活动事务、当前可执行文件、目标版本和 `Launched` 阶段时才允许绕过等待。helper 严格验证 ZIP 的扁平固定文件集、Portable 标记和 Windows 产品版本，在同卷暂存/备份后替换且最后处理 `M2Shelf.exe`，启动新进程并等待精确版本健康回执及完整三秒存活观察。成功后先原子写入仍保留事务材料的终态 `Completed`，完成受校验清理后再清除保留标记；下次启动会续作中断的 `Completed` 清理。失败时先确认新进程终止、逆序恢复文件，再以长度、SHA-256、SQLite `quick_check` 复验快照，预检并隔离 WAL/SHM 后原子恢复主库；无法安全恢复时保持当前数据库并保留材料。helper 异常终止留下的非终态事务会在下次启动严格识别并标为 `RECOVERY_REQUIRED`，不执行缺少可靠文件日志的猜测式回滚。回滚和人工恢复提示都持久显示到用户明确确认。
+
+`0.5.8` 是第一个携带该更新器和 Portable helper 的版本，因此 `0.5.7` 及更早用户必须手动安装 `0.5.8` 一次。之后客户端才具备上述更新能力。
 
 ## 持久化设置
 
-`AppSettings` 保存播放器、默认视图、视频扩展名、Bangumi 开关、封面缓存、语言和主题。设置页采用序列化自动保存。
+`AppSettings` 保存播放器、默认视图、视频扩展名、Bangumi 开关、封面缓存、语言、主题和 `auto_check_updates`。设置页采用序列化自动保存；该布尔值只决定启动检查，不授予自动下载或安装权限。
 
 窗口尺寸使用独立 `settings` 键，由原生生命周期保存；原生窗口隐藏创建，恢复尺寸和前端主题首帧完成后再显示。全部资源、资源库浏览和收藏夹排序也使用独立键。完整 AppSettings 更新不得覆盖这些键。
 
@@ -114,14 +138,18 @@ Rust 返回已 hydrate 的 Node DTO；列表所需的 Bangumi 绑定与用户标
 
 - Library Root 只读；应用写入仅限 SQLite、应用缓存和构建输出；
 - Library Root 添加命令先 canonicalize 并检查重叠，数据库在 `BEGIN IMMEDIATE` 事务内再次拒绝等于、祖先或子孙 Root；扫描命令与 worker 入口还会复核登记路径和旧数据库中的重叠 Root，防止 Node 归属漂移；
-- 扫描会对根、局部目标、递归目录和文件重新 canonicalize，并拒绝 Library Root 外的链接或重解析目标；
+- 扫描会对根、局部目标、递归目录和文件重新 canonicalize，并拒绝 Library Root 外的链接或重解析目标；BDMV/STREAM 探测同样先验证真实路径边界并跳过 symlink，不能通过局部扫描或人工重置分类读取 Root 外目录；
 - Tauri capability 只开放所需能力，前端无直接 SQL；
 - CSP 限制资源和连接来源；
-- Bangumi 请求有官方主机白名单、TLS、超时和结果上限；
+- Bangumi 请求有官方主机白名单、TLS、连接/总超时、搜索/详情响应体上限和有界重试；HTTP 429 的数字 `Retry-After` 最多等待两秒，一次提供方级搜索失败会停止本轮剩余在线匹配；
+- 更新请求有独立的 GitHub HTTPS 主机/重定向白名单、严格清单 schema、固定资产 URL、大小上限、SHA-256 和内置 Ed25519 公钥验证；404 兼容只可证明旧版/同版无更新，不能产生安装候选；
+- 更新缓存与事务目录拒绝 symlink、junction 和 Windows reparse point，按真实路径保持在应用目录且位于所有 Library Root 之外；清理仅处理严格识别的普通文件与空目录；
 - 文件和播放器路径不经过 shell；
 - 自定义缓存不可位于 Library Root；
 - 手工封面在原子写入缓存前校验 15 MiB 上限、格式签名和像素尺寸；播放器测试有 5 秒超时；持久化 IPC 文本有后端长度上限；
 - 批量标签、收藏夹和分类操作先验证 Node 集并事务提交；
+- Portable 安装目录不得与 Library Root 重叠；更新 ZIP 仅接受固定的五个扁平普通文件，拒绝目录、链接、未知项、路径穿越、大小写重名和越界尺寸；
+- 生产 Ed25519 私钥不在源码或 GitHub；CI 仅产出无签名候选和仅供核对的 `candidate-provenance.json`。生产签名必须位于 Agent 不可访问的独立离线环境，并在解密前核对受信 attestation 或独立构建的候选摘要、manifest generator/helper 指纹以及匹配的 app ID、版本和嵌入公钥；开发机 CurrentUser DPAPI 仅用于流程测试；
 - 仓库不得包含密钥、个人路径、真实索引数据库或私密截图。
 
 ## 修改路由
@@ -132,7 +160,8 @@ Rust 返回已 hydrate 的 Node DTO；列表所需的 Bangumi 绑定与用户标
 - 扫描：检查完整/局部扫描、清理、取消、分类和只读边界；
 - 匹配：同步检查 extractor、scorer、Bangumi client 和现有测试；
 - i18n：四种语言一起更新；主题：检查 light、dark、system；
-- 发布：使用 `scripts/build_windows_release.ps1`，不要手工复制目标文件。
+- 更新协议：同步检查 `update.rs`、`portable_update.rs`、helper、四语言 UI、验证器和发布脚本；签名消息或 `latest.json` schema 属于兼容协议，不能单边更改；
+- 发布：严格按 `docs/UPDATE_RELEASE_PROCESS.md` 使用构建、线下签名和 fail-closed 发布脚本，不要手工拼装或替换已发布资产。
 
 ## 验证
 
@@ -145,11 +174,16 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
-发布还需验证 Portable 的版本、架构、多帧图标、校验和、隐私扫描和启动。生成目录、依赖目录、数据库副本和本机缓存不属于源码，不能提交。
+发布还需验证 NSIS、Portable、helper 的版本/身份、架构、多帧图标、隐私扫描、校验和、签名、清单/来源证明和启动。生成目录、依赖目录、数据库副本、本机缓存和线下密钥文件不属于源码，不能提交。
 
-## 当前本地发布状态
+## 当前发布状态
 
-- `0.5.7` Windows x64 Release 已于 2026-08-24 通过正式脚本构建；
-- 本地 Portable：`bundle/M2Shelf-Portable-0.5.7-x64.zip`；
-- SHA-256：`3DF766478A9E6733DDCF36FFA1BDA59E8A5BCD0676AB32C2807A1A0AD15CCA5F`；
-- 已验证压缩包与内层校验和、版本元数据、x64 PE、隐私标记和短时启动；当前尚未提交、推送或发布到 GitHub。
+- 仓库源码版本已更新为 `0.5.8`，包含稳定更新客户端、Portable helper 和线下发布工具；
+- 当前合并工作树已通过 TypeScript typecheck、前端 production build、103 项仓库契约、Rust fmt、158 项默认 Rust 测试、5 项显式实网 Rust 测试及 Clippy `-D warnings`；新增回归覆盖旧 Root 的 `FOLDER` migration 默认值、逐视频扁平 Node、嵌套文件、BDMV 聚合、附件不生成作品和播放器字面单参数。完整 `npm audit` 报告 0 个漏洞，`cargo audit` 报告 0 个 RustSec 漏洞。RustSec 另列出 16 项未维护依赖和一项经 GTK 依赖引入的 `glib` unsound 警告，其中 `glib` 不进入 Windows x64 依赖树，Windows 树中的 `unic-*` 未维护警告仍需跟踪上游 Tauri；
+- 真人影视、罗马字别名、type 6 搜索和封面响应的 5 项实网回归均已通过；固定 GitHub `latest.json` 的精确重定向与 404 fail-closed 分支由自动化测试覆盖；
+- 当前代码对应的本地测试产物为 `bundle/M2Shelf-Portable-0.5.8-x64.zip`（7,726,446 bytes，SHA-256 `623358231f7661cd8c50c9564d0ebe6a3361f6571855a25139f81a40a3d5751f`）；正式构建脚本已验证 Portable 固定五文件、内部哈希、x64 主程序/helper、版本/helper identity 和个人路径扫描，本轮另在隔离临时目录完成五秒隐藏启动冒烟。目录中较早生成的同版本 Setup 不包含本轮最终代码，不得随本轮 Portable 一起发布；
+- 开发机 DPAPI seed 未能由当前 Windows 执行上下文解密，签名 wrapper 已 fail-closed，未生成 `latest.json` 或 `.sig`；结合安全审计结论，本地产物只能作为未发布测试版，不能冒充正式签名 Release；
+- 本轮文档更新时尚未发布 `v0.5.8` GitHub Release，README 的公开下载仍指向 `0.5.7`，在正式发布完成前不要提前改链接；
+- 当前开发机上的 DPAPI seed 和嵌入公钥不能在“同 Windows 用户/Agent 被攻陷”的模型下作为生产信任根；正式发布前必须在隔离签名环境轮换并重新构建，且清理公开历史中已识别的非 noreply commit 元数据；
+- `0.5.7` 没有内置更新器，必须手动安装 `0.5.8` 这一引导版本；
+- 任何后续 Agent 应以当前工作树的实际质量门禁、构建和签名结果更新本节，不得把未运行的验证或未发布的 Release 写成已完成。

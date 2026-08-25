@@ -9,6 +9,16 @@ const candidates = [
 ];
 
 for (const [command, prefix] of candidates) {
+  const probe = spawnSync(command, [...prefix, "--version"], {
+    encoding: "utf8",
+    stdio: "ignore",
+  });
+  if (probe.error) {
+    if (probe.error.code === "ENOENT") continue;
+    throw probe.error;
+  }
+  if (probe.status !== 0) continue;
+
   const result = spawnSync(command, [...prefix, "-B", "scripts/validate_project.py"], {
     encoding: "utf8",
     stdio: "inherit",

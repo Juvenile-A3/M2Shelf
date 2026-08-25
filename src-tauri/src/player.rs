@@ -22,6 +22,15 @@ use crate::{db::AppResult, models::PlayerTestResult};
 
 pub fn test(path: &Path) -> AppResult<PlayerTestResult> {
     validate_executable(path)?;
+    if !supports_version_probe(path) {
+        return Ok(PlayerTestResult {
+            ok: true,
+            message: "已选择有效的播放器程序；播放时会直接传入视频文件路径。".into(),
+            version: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+        });
+    }
     let mut child = match Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
@@ -80,14 +89,27 @@ pub fn test(path: &Path) -> AppResult<PlayerTestResult> {
     }
 }
 
+fn supports_version_probe(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "mpv" | "mpvnet" | "vlc"
+            )
+        })
+}
+
 pub fn play(executable: &Path, media: &Path) -> AppResult<()> {
     validate_executable(executable)?;
     if !media.is_file() {
         return Err("视频文件已不存在；请重新扫描资源库。".into());
     }
+    if !media.is_absolute() {
+        return Err("视频路径不是绝对路径；请重新扫描资源库。".into());
+    }
     // Arguments are passed directly to CreateProcess/std::process, never through a shell.
     Command::new(executable)
-        .arg("--")
         .arg(media)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -265,6 +287,29 @@ fn validate_executable(path: &Path) -> AppResult<()> {
 mod tests {
     use super::*;
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    #[test]
+    fn player_receives_only_the_literal_media_path() {
+        let executable = Path::new(r"C:\Players\播放器.exe");
+        let media = Path::new(r"C:\媒体 库\日本語\[特典] A&B (01).mkv");
+        let mut command = Command::new(executable);
+        command.arg(media);
+        let arguments = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(arguments, vec![media.as_os_str()]);
+    }
+
+    #[test]
+    fn version_probe_is_limited_to_players_that_support_it() {
+        assert!(supports_version_probe(Path::new(r"C:\Players\mpv.exe")));
+        assert!(supports_version_probe(Path::new(r"C:\Players\VLC.EXE")));
+        assert!(!supports_version_probe(Path::new(
+            r"C:\Players\PotPlayerMini64.exe"
+        )));
+        assert!(!supports_version_probe(Path::new(
+            r"C:\Players\mpc-hc64.exe"
+        )));
+    }
 
     #[test]
     fn wide_shell_path_preserves_unicode_spaces_and_special_characters() {

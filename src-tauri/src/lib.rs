@@ -5,11 +5,21 @@ mod commands;
 mod db;
 pub mod models;
 mod player;
+pub mod portable_update;
 mod scanner;
+mod single_instance;
 mod title_extractor;
+pub mod update;
 mod window_state;
 
-use std::{io, path::PathBuf, sync::Mutex};
+use std::{
+    io,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
 
 use db::Database;
 use scanner::ScanControl;
@@ -20,20 +30,58 @@ pub const DATABASE_URL: &str = "sqlite:morimediashelf.db";
 pub struct AppState {
     database: Database,
     default_cover_cache_dir: PathBuf,
+    scan_lifecycle: Mutex<()>,
+    scan_worker_active: std::sync::Arc<AtomicBool>,
     active_scan: Mutex<Option<ScanControl>>,
     window_size: window_state::WindowSizeMemory,
+    update_manager: update::UpdateManager,
+    update_recovery_notice: Mutex<Option<String>>,
+    update_exit_in_progress: AtomicBool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let active_update_transaction = match portable_update::current_update_transaction_id() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("invalid Portable update transaction argument: {error}");
+            return;
+        }
+    };
+    if let Some(transaction_id) = active_update_transaction.as_deref() {
+        if let Err(error) =
+            portable_update::authenticate_update_transaction_before_mutex(transaction_id)
+        {
+            eprintln!("rejected unauthenticated Portable update child: {error}");
+            return;
+        }
+    }
+    if let Err(error) =
+        portable_update::wait_for_update_mutex_before_startup(active_update_transaction.as_deref())
+    {
+        eprintln!("failed to wait for Portable update helper: {error}");
+        return;
+    }
+    let _single_instance_guard = match single_instance::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            single_instance::focus_existing_instance();
+            return;
+        }
+        Err(error) => {
+            eprintln!("failed to acquire single-instance guard: {error}");
+            return;
+        }
+    };
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| io::Error::other(format!("无法确定应用数据目录：{error}")))?;
             std::fs::create_dir_all(&app_data_dir)?;
+            let update_cache_dir = app_data_dir.join("updates");
             let default_cover_cache_dir = app_data_dir.join("cache").join("covers");
             let database = Database::new(app_data_dir.join("morimediashelf.db"));
             database.migrate().map_err(io::Error::other)?;
@@ -59,6 +107,36 @@ pub fn run() {
                 .into_iter()
                 .map(|root| PathBuf::from(root.path))
                 .collect::<Vec<_>>();
+            let update_recovery_notice =
+                match update::ensure_safe_update_cache(&update_cache_dir, &library_roots) {
+                    Ok(_) => {
+                        if let Err(error) =
+                            portable_update::mark_interrupted_transactions_recovery_required(
+                                &update_cache_dir,
+                                active_update_transaction.as_deref(),
+                            )
+                        {
+                            eprintln!("failed to mark interrupted update transaction: {error}");
+                        }
+                        if let Err(error) = portable_update::cleanup_completed_transactions(
+                            &update_cache_dir,
+                            &library_roots,
+                        ) {
+                            eprintln!("failed to clean completed update transactions: {error}");
+                        }
+                        match portable_update::read_rollback_notice(&update_cache_dir) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                eprintln!("failed to read update rollback notice: {error}");
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("disabled unsafe application update cache: {error}");
+                        None
+                    }
+                };
             if let Ok(validated) = cache::validate_cache_location(&configured_cache, library_roots)
             {
                 let is_default = cache::is_equal_or_within(&validated, &default_cover_cache_dir)
@@ -70,13 +148,19 @@ pub fn run() {
             app.manage(AppState {
                 database,
                 default_cover_cache_dir,
+                scan_lifecycle: Mutex::new(()),
+                scan_worker_active: std::sync::Arc::new(AtomicBool::new(false)),
                 active_scan: Mutex::new(None),
                 window_size: window_state::WindowSizeMemory::new(initial_window_size),
+                update_manager: update::UpdateManager::new(update_cache_dir),
+                update_recovery_notice: Mutex::new(update_recovery_notice),
+                update_exit_in_progress: AtomicBool::new(false),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_bootstrap,
+            commands::acknowledge_update_recovery_notice,
             commands::show_main_window,
             commands::list_library_roots,
             commands::add_library_root,
@@ -135,6 +219,10 @@ pub fn run() {
             commands::get_cache_stats,
             commands::clear_cover_cache,
             commands::rebuild_index,
+            commands::check_for_update,
+            commands::download_update,
+            commands::get_update_download_status,
+            commands::install_downloaded_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build M²Shelf");
@@ -162,9 +250,11 @@ pub fn run() {
             // small application-settings write, and never wait for or resume background work.
             commands::cancel_scan_on_exit(app);
             let state = app.state::<AppState>();
-            if let Some(size) = state.window_size.get() {
-                if let Err(error) = state.database.save_window_size(size) {
-                    eprintln!("failed to persist main window size: {error}");
+            if !state.update_exit_in_progress.load(Ordering::Acquire) {
+                if let Some(size) = state.window_size.get() {
+                    if let Err(error) = state.database.save_window_size(size) {
+                        eprintln!("failed to persist main window size: {error}");
+                    }
                 }
             }
         }
