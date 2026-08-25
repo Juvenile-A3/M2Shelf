@@ -14,7 +14,13 @@
 
 ## 2. 发布前准备
 
-### 2.1 首次建立或轮换生产信任根
+### 2.1 长期生产更新密钥规则
+
+自 `v0.5.11` 起，当前 production seed 与 `src-tauri/update-public-key.txt` 中的 update public key 作为 M²Shelf 的长期生产更新签名密钥使用。后续正常版本发布必须继续使用现有 production seed，在隔离环境完成签名；不得重新生成 production seed，也不得生成、替换或改写 `src-tauri/update-public-key.txt`。只有在明确执行生产密钥轮换流程时，才允许建立新的 seed 和公钥。
+
+任何涉及 production key/seed 的生成、替换或轮换操作，都必须立即停止当前发布流程，并先取得项目所有者的明确确认。不得根据版本升级、文件缺失、Agent 建议或自动化结果自行推断需要轮换密钥。
+
+### 2.2 首次建立或轮换生产信任根
 
 分发版 `M2ShelfUpdater.exe` 不提供密钥生成命令。仓库中的 `tools/offline-key-init` 是独立 Cargo crate，不属于主 workspace，也不得出现在 CI、NSIS、Portable、Release 或 PATH 中。日常开发账号与 Agent 只允许审查、测试不涉及真实密钥的纯逻辑并通过 `scripts/build_offline_key_init.ps1` 编译该工具；脚本会先运行该独立 crate 的 fmt、test 与 clippy，再锁定依赖、重映射私人路径、验证 x64 并输出 SHA-256，但绝不执行其 `init` 命令。每个版本的 `bundle/offline-key-init-v{version}` 必须预先不存在；脚本拒绝覆盖已有交付目录或文件。
 
