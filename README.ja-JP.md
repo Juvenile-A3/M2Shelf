@@ -44,9 +44,9 @@ Bangumi の検索とカバー取得にはインターネット接続が必要で
 
 ## ダウンロード
 
-現在のバージョン：**M²Shelf 0.5.7**（Windows x64）
+現在のバージョン：**M²Shelf 0.5.11**（Windows x64）
 
-- [Portable 版をダウンロード](https://github.com/Undermori/M2Shelf/releases/download/v0.5.7/M2Shelf-Portable-0.5.7-x64.zip)
+- [Portable 版をダウンロード](https://github.com/Undermori/M2Shelf/releases/download/v0.5.11/M2Shelf-Portable-0.5.11-x64.zip)
 - [最新 Release を表示](https://github.com/Undermori/M2Shelf/releases/latest)
 - [すべての Release を表示](https://github.com/Undermori/M2Shelf/releases)
 
