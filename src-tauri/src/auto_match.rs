@@ -814,7 +814,21 @@ fn merge_search_results_fair(search_results: &[Vec<BangumiSubject>]) -> Vec<Reca
 /// Produces up to three distinct, safe provider queries in evidence-priority order.
 pub fn match_queries(evidence: &MatchEvidence) -> Vec<String> {
     let mut queries = Vec::new();
-    push_query(&mut queries, &evidence.primary_title);
+    let evidenced_numeric_primary =
+        title_extractor::is_four_digit_numeric_title(&evidence.primary_title)
+            && evidence.year.is_some()
+            && evidence
+                .frequent_file_title
+                .as_ref()
+                .is_some_and(|file_title| {
+                    title_extractor::normalize_title_for_match(file_title)
+                        == title_extractor::normalize_title_for_match(&evidence.primary_title)
+                });
+    let primary_query_added = if evidenced_numeric_primary {
+        push_distinct_query(&mut queries, &evidence.primary_title)
+    } else {
+        push_query(&mut queries, &evidence.primary_title)
+    };
     // A folder may use a fan-created English translation that the official provider has never
     // indexed, while episode files or the parent still carry a romanized/original title. Give
     // those independent local sources first access to the two remaining bounded searches.
@@ -836,20 +850,45 @@ pub fn match_queries(evidence: &MatchEvidence) -> Vec<String> {
         }
         push_query(&mut queries, candidate);
     }
+    // Keep independent title sources ahead of the date-qualified fallback, but use an otherwise
+    // free query slot to improve provider recall for movie titles that share common words.
+    if primary_query_added && queries.len() < MAX_QUERIES_PER_NODE {
+        if let Some(year) = evidence.year {
+            let qualified = format!("{} {year}", evidence.primary_title.trim());
+            let numeric_title_equals_year = evidence
+                .primary_title
+                .trim()
+                .parse::<i32>()
+                .is_ok_and(|title_number| title_number == year);
+            if evidenced_numeric_primary && !numeric_title_equals_year {
+                push_distinct_query(&mut queries, &qualified);
+            } else if !evidenced_numeric_primary {
+                push_query(&mut queries, &qualified);
+            }
+        }
+    }
     queries.truncate(MAX_QUERIES_PER_NODE);
     queries
 }
 
-fn push_query(queries: &mut Vec<String>, candidate: &str) {
+fn push_query(queries: &mut Vec<String>, candidate: &str) -> bool {
     if !title_extractor::is_safe_match_query(candidate) {
-        return;
+        return false;
     }
+    push_distinct_query(queries, candidate)
+}
+
+fn push_distinct_query(queries: &mut Vec<String>, candidate: &str) -> bool {
     let normalized = title_extractor::normalize_title_for_match(candidate);
-    if !queries
-        .iter()
-        .any(|query| title_extractor::normalize_title_for_match(query) == normalized)
+    if normalized.is_empty()
+        || queries
+            .iter()
+            .any(|query| title_extractor::normalize_title_for_match(query) == normalized)
     {
+        false
+    } else {
         queries.push(candidate.trim().to_string());
+        true
     }
 }
 
@@ -1683,6 +1722,49 @@ mod tests {
         assert_eq!(queries.len(), 3);
         assert_eq!(queries[0], "STEINS;GATE 0");
         assert!(!queries.iter().any(|query| query == "123"));
+    }
+
+    #[test]
+    fn movie_query_uses_a_free_slot_for_title_and_year() {
+        let movie = evidence("Oppenheimer.2023.1920x1080.BluRay.x264");
+        let queries = match_queries(&movie);
+        assert_eq!(queries, vec!["Oppenheimer", "Oppenheimer 2023"]);
+    }
+
+    #[test]
+    fn evidenced_numeric_movie_title_is_queried_but_ambiguous_number_is_not() {
+        let movie = crate::title_extractor::build_match_evidence(
+            "Movies",
+            "Movies",
+            None,
+            &["1917.2019.1080p.BluRay.x264.mkv".into()],
+        );
+        assert_eq!(match_queries(&movie), vec!["1917", "1917 2019"]);
+
+        let same_title_and_year = crate::title_extractor::build_match_evidence(
+            "Movies",
+            "Movies",
+            None,
+            &["1984.1984.1080p.BluRay.x264.mkv".into()],
+        );
+        assert_eq!(match_queries(&same_title_and_year), vec!["1984"]);
+
+        let ambiguous = crate::title_extractor::build_match_evidence(
+            "Movies",
+            "Movies",
+            None,
+            &["1917.mkv".into()],
+        );
+        assert!(match_queries(&ambiguous).is_empty());
+    }
+
+    #[test]
+    fn title_year_query_never_displaces_three_independent_title_sources() {
+        let mut movie = evidence("Oppenheimer.2023.1920x1080.BluRay.x264");
+        movie.frequent_file_title = Some("オッペンハイマー".into());
+        movie.parent_title = Some("奥本海默".into());
+        let queries = match_queries(&movie);
+        assert_eq!(queries, vec!["Oppenheimer", "オッペンハイマー", "奥本海默"]);
     }
 
     #[test]

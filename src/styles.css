@@ -442,7 +442,7 @@ img { display: block; }
 .switch-field strong { color: #535d5e; font-size: 9px; }
 .switch-field small { color: #969a97; font-size: 8px; }
 .switch-field input { position: absolute; opacity: 0; }
-.switch-field i { position: relative; width: 35px; height: 20px; border-radius: 12px; background: #cbc8c1; transition: background 150ms; }
+.switch-field i { position: relative; flex: 0 0 auto; width: 35px; height: 20px; border-radius: 12px; background: #cbc8c1; transition: background 150ms; }
 .switch-field i::after { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: white; box-shadow: 0 2px 5px rgba(0,0,0,.14); content: ""; transition: transform 150ms; }
 .switch-field input:checked + i { background: #6e947a; }
 .switch-field input:checked + i::after { transform: translateX(15px); }
@@ -567,6 +567,7 @@ img { display: block; }
 .created-by { margin: 17px 0 0; color: #7e8683; font-size: var(--text-small); }
 .update-preferences { margin: 16px 0 12px; }
 .settings-switch-row, .update-manual-check { min-height: 58px; padding: 11px 2px; border-bottom: 1px solid var(--border-normal); }
+.settings-columns .settings-switch-row { border-bottom: 0; }
 .update-manual-check > span { min-width: 0; }
 .update-manual-check .button { flex: 0 0 auto; }
 .update-manual-check .is-busy svg, .update-actions .is-busy svg { animation: spin 1.15s linear infinite; }

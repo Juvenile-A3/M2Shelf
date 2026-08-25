@@ -55,7 +55,15 @@ pub struct TitleSignals {
 /// Produces temporary Bangumi search text only. It never writes names back to the database or
 /// the source filesystem.
 pub fn extract_search_keyword(raw_name: &str) -> String {
-    extract_keyword_with_mode(raw_name, false).0
+    let normalized = raw_name.nfkc().collect::<String>();
+    let detected_year = detect_year(&normalized);
+    let (candidate, _) = extract_keyword_with_mode(raw_name, false);
+    let without_year = remove_year_marker(&candidate, detected_year);
+    if without_year.is_empty() {
+        candidate
+    } else {
+        without_year
+    }
 }
 
 /// Builds the evidence consumed by the confidence matcher. `parent_name` is optional because a
@@ -79,13 +87,32 @@ pub fn build_match_evidence(
         .map(extract_search_keyword)
         .filter(|value| is_useful_candidate(value));
     let ranked_file_titles = ranked_file_candidates(media_file_names);
+    let media_file_year = dominant_media_file_year(media_file_names);
     let frequent_file_title = ranked_file_titles.first().cloned();
-    let primary_title = if is_safe_match_query(&primary_signals.cleaned_title) {
+    let local_year = primary_signals.year.or(folder_signals.year);
+    let file_corrects_title_year = frequent_file_title.as_deref().is_some_and(|file_title| {
+        file_title_corrects_title_shaped_year(
+            &primary_signals.cleaned_title,
+            local_year,
+            file_title,
+            media_file_year,
+        )
+    });
+    let resolved_year = if file_corrects_title_year {
+        media_file_year
+    } else {
+        local_year.or(media_file_year)
+    };
+    let primary_title = if file_corrects_title_year {
+        frequent_file_title
+            .clone()
+            .unwrap_or_else(|| primary_signals.cleaned_title.clone())
+    } else if is_safe_match_query(&primary_signals.cleaned_title) {
         primary_signals.cleaned_title.clone()
     } else {
         frequent_file_title
             .clone()
-            .filter(|value| is_safe_match_query(value))
+            .filter(|value| is_safe_match_query(value) || is_four_digit_numeric_title(value))
             .unwrap_or_else(|| primary_signals.cleaned_title.clone())
     };
 
@@ -145,7 +172,7 @@ pub fn build_match_evidence(
         alternate_titles,
         parent_title,
         frequent_file_title,
-        year: primary_signals.year.or(folder_signals.year),
+        year: resolved_year,
         season_number: primary_signals
             .season_number
             .or(folder_signals.season_number),
@@ -243,7 +270,9 @@ fn ranked_file_candidates(media_file_names: &[String]) -> Vec<String> {
     let mut frequency: HashMap<String, (String, usize)> = HashMap::new();
     for file_name in media_file_names {
         let candidate = extract_media_file_keyword(file_name);
-        if is_useful_candidate(&candidate) {
+        if is_useful_candidate(&candidate)
+            && numeric_file_title_has_independent_year(file_name, &candidate)
+        {
             let key = normalize_title_for_match(&candidate);
             frequency
                 .entry(key)
@@ -260,6 +289,86 @@ fn ranked_file_candidates(media_file_names: &[String]) -> Vec<String> {
             .then_with(|| left.0.cmp(&right.0))
     });
     candidates.into_iter().map(|entry| entry.0).collect()
+}
+
+/// Uses file-name dates only as a fallback when the Node names carry no year. A single movie
+/// file is useful evidence; for multi-file works, conflicting years must have one unique winner
+/// so episode batches cannot introduce an arbitrary year conflict.
+fn dominant_media_file_year(media_file_names: &[String]) -> Option<i32> {
+    let mut frequency = HashMap::<i32, usize>::new();
+    for file_name in media_file_names {
+        let normalized = file_name.nfkc().collect::<String>();
+        if let Some(year) = detect_year(&normalized) {
+            let candidate = extract_media_file_keyword(file_name);
+            if !numeric_file_title_has_independent_year(file_name, &candidate) {
+                continue;
+            }
+            *frequency.entry(year).or_default() += 1;
+        }
+    }
+    let mut ranked = frequency.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let (year, count) = ranked.first().copied()?;
+    if ranked
+        .get(1)
+        .is_some_and(|(_, next_count)| *next_count == count)
+    {
+        None
+    } else {
+        Some(year)
+    }
+}
+
+fn numeric_file_title_has_independent_year(file_name: &str, candidate: &str) -> bool {
+    if !is_four_digit_numeric_title(candidate) {
+        return true;
+    }
+    let normalized = file_name.nfkc().collect::<String>();
+    let Some(year) = detect_year(&normalized) else {
+        return false;
+    };
+    let Ok(title_number) = normalize_title_for_match(candidate).parse::<i32>() else {
+        return false;
+    };
+    title_number != year || count_year_occurrences(&normalized, year) >= 2
+}
+
+fn file_title_corrects_title_shaped_year(
+    local_title: &str,
+    local_year: Option<i32>,
+    file_title: &str,
+    file_year: Option<i32>,
+) -> bool {
+    let (Some(local_year), Some(file_year)) = (local_year, file_year) else {
+        return false;
+    };
+    if local_year == file_year {
+        return false;
+    }
+    let normalized_file = normalize_title_for_match(file_title);
+    if is_four_digit_numeric_title(local_title)
+        && normalized_file == normalize_title_for_match(local_title)
+    {
+        return true;
+    }
+
+    let year = local_year.to_string();
+    let mut removed = false;
+    let without_local_year = clean_join(
+        file_title
+            .split_whitespace()
+            .filter_map(|token| {
+                if !removed && trim_numeric(token) == year {
+                    removed = true;
+                    None
+                } else {
+                    Some(token.to_string())
+                }
+            })
+            .collect(),
+    );
+    removed
+        && normalize_title_for_match(&without_local_year) == normalize_title_for_match(local_title)
 }
 
 /// File names frequently contain a useful romanized/original title even when the folder uses a
@@ -712,7 +821,8 @@ fn is_semantic_group(value: &str) -> bool {
 fn is_technical_atom(value: &str) -> bool {
     let lower = value
         .trim_matches(|character: char| !character.is_alphanumeric() && character != '#')
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+        .replace('\u{00d7}', "x");
     if lower.is_empty() || lower.chars().all(|character| character.is_ascii_digit()) {
         return true;
     }
@@ -786,8 +896,10 @@ fn is_technical_atom(value: &str) -> bool {
         return true;
     }
     if lower.split_once('x').is_some_and(|(width, height)| {
-        matches!(width, "720" | "1280" | "1920" | "2560" | "3840" | "7680")
-            && matches!(height, "480" | "720" | "1080" | "1440" | "2160" | "4320")
+        matches!(
+            width,
+            "720" | "1280" | "1920" | "2048" | "2560" | "3840" | "4096" | "7680"
+        ) && matches!(height, "480" | "720" | "1080" | "1440" | "2160" | "4320")
     }) {
         return true;
     }
@@ -838,6 +950,10 @@ fn looks_like_episode_token(value: &str) -> bool {
 
 fn is_ascii_number(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+}
+
+fn is_likely_plain_episode_number(value: &str) -> bool {
+    (1..=3).contains(&value.len()) && is_ascii_number(value)
 }
 
 fn is_crc(value: &str) -> bool {
@@ -906,7 +1022,7 @@ fn remove_technical_words(value: &str, preserve_semantics: bool) -> (String, Vec
             let trimmed = token.trim_matches(|character: char| {
                 !character.is_ascii_alphanumeric() && character != '第' && character != '話'
             });
-            (!preserve_semantics && trimmed.chars().all(|character| character.is_ascii_digit()))
+            (!preserve_semantics && is_likely_plain_episode_number(trimmed))
                 || (looks_like_episode_token(&trimmed.to_ascii_lowercase())
                     && !(preserve_semantics && detect_season(trimmed).is_some()))
         })
@@ -936,6 +1052,7 @@ fn trim_numeric(value: &str) -> &str {
 fn detect_year(value: &str) -> Option<i32> {
     let chars = value.chars().collect::<Vec<_>>();
     let mut index = 0;
+    let mut detected = None;
     while index + 3 < chars.len() {
         if chars[index..index + 4]
             .iter()
@@ -949,8 +1066,11 @@ fn detect_year(value: &str) -> Option<i32> {
                     .collect::<String>()
                     .parse::<i32>()
                     .ok()?;
-                if (1900..=2099).contains(&year) {
-                    return Some(year);
+                if (1900..=2099).contains(&year) && !is_resolution_component(&chars, index) {
+                    // Scene releases can contain a year-shaped number in the title before the
+                    // actual release year (`Blade.Runner.2049.2017`). The later valid marker is
+                    // the useful date while the earlier number remains part of the work title.
+                    detected = Some(year);
                 }
             }
             index += 4;
@@ -958,7 +1078,84 @@ fn detect_year(value: &str) -> Option<i32> {
             index += 1;
         }
     }
-    None
+    detected
+}
+
+fn count_year_occurrences(value: &str, year: i32) -> usize {
+    let target = year.to_string().chars().collect::<Vec<_>>();
+    let characters = value.chars().collect::<Vec<_>>();
+    if target.is_empty() || characters.len() < target.len() {
+        return 0;
+    }
+    (0..=characters.len() - target.len())
+        .filter(|start| {
+            characters[*start..*start + target.len()] == target
+                && (*start == 0 || !characters[*start - 1].is_ascii_digit())
+                && (*start + target.len() == characters.len()
+                    || !characters[*start + target.len()].is_ascii_digit())
+        })
+        .count()
+}
+
+fn is_resolution_component(characters: &[char], start: usize) -> bool {
+    resolution_side_after(characters, start + 4) || resolution_side_before(characters, start)
+}
+
+fn resolution_side_after(characters: &[char], mut index: usize) -> bool {
+    while characters
+        .get(index)
+        .is_some_and(|character| character.is_whitespace())
+    {
+        index += 1;
+    }
+    if !characters
+        .get(index)
+        .is_some_and(|character| matches!(character, 'x' | 'X' | '\u{00d7}'))
+    {
+        return false;
+    }
+    index += 1;
+    while characters
+        .get(index)
+        .is_some_and(|character| character.is_whitespace())
+    {
+        index += 1;
+    }
+    let digit_start = index;
+    while characters
+        .get(index)
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        index += 1;
+    }
+    is_resolution_side(&characters[digit_start..index])
+}
+
+fn resolution_side_before(characters: &[char], mut index: usize) -> bool {
+    while index > 0 && characters[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    if index == 0 || !matches!(characters[index - 1], 'x' | 'X' | '\u{00d7}') {
+        return false;
+    }
+    index -= 1;
+    while index > 0 && characters[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    let digit_end = index;
+    while index > 0 && characters[index - 1].is_ascii_digit() {
+        index -= 1;
+    }
+    is_resolution_side(&characters[index..digit_end])
+}
+
+fn is_resolution_side(characters: &[char]) -> bool {
+    (3..=4).contains(&characters.len())
+        && characters
+            .iter()
+            .collect::<String>()
+            .parse::<u16>()
+            .is_ok_and(|value| value >= 480)
 }
 
 fn detect_season(value: &str) -> Option<u16> {
@@ -1130,13 +1327,20 @@ fn remove_year_marker(value: &str, year: Option<i32>) -> String {
         return value.to_string();
     };
     let year = year.to_string();
-    clean_join(
-        value
-            .split_whitespace()
-            .filter(|token| trim_numeric(token) != year)
-            .map(str::to_string)
-            .collect(),
-    )
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let without_year = tokens
+        .iter()
+        .filter(|token| trim_numeric(token) != year)
+        .map(|token| (*token).to_string())
+        .collect::<Vec<_>>();
+    if without_year.is_empty()
+        && tokens.len() > 1
+        && tokens.iter().all(|token| trim_numeric(token) == year)
+    {
+        year
+    } else {
+        clean_join(without_year)
+    }
 }
 
 fn remove_semantic_markers(value: &str, season: Option<u16>, edition: EditionKind) -> String {
@@ -1350,6 +1554,14 @@ pub fn is_safe_match_query(value: &str) -> bool {
         && !is_generic_title(trimmed)
 }
 
+pub fn is_four_digit_numeric_title(value: &str) -> bool {
+    let normalized = normalize_title_for_match(value);
+    normalized.len() == 4
+        && normalized
+            .chars()
+            .all(|character| character.is_ascii_digit())
+}
+
 fn is_useful_candidate(value: &str) -> bool {
     let compact = value.trim();
     compact.chars().count() >= 2 && !is_generic_title(compact)
@@ -1500,6 +1712,16 @@ mod tests {
                 "The Empire of Corpses",
                 2015,
             ),
+            (
+                "Blade.Runner.2049.2017.1920x1080.BluRay.x265",
+                "Blade Runner 2049",
+                2017,
+            ),
+            (
+                "Resolution.Test.2020.2048\u{00d7}1080.BluRay.x265",
+                "Resolution Test",
+                2020,
+            ),
         ];
         for (raw, expected_title, expected_year) in cases {
             let evidence = build_match_evidence(raw, raw, None, &[]);
@@ -1508,6 +1730,85 @@ mod tests {
             assert_eq!(extract_search_keyword(raw), expected_title, "raw={raw}");
             assert!(is_safe_match_query(&evidence.primary_title), "raw={raw}");
         }
+    }
+
+    #[test]
+    fn media_file_name_supplies_movie_title_and_year_when_folder_is_generic() {
+        let evidence = build_match_evidence(
+            "Movies",
+            "Movies",
+            None,
+            &["Blade.Runner.2049.2017.1920x1080.BluRay.x265.mkv".into()],
+        );
+
+        assert_eq!(evidence.primary_title, "Blade Runner 2049");
+        assert_eq!(evidence.year, Some(2017));
+    }
+
+    #[test]
+    fn numeric_movie_title_requires_independent_release_year_evidence() {
+        let structured = build_match_evidence(
+            "Movies",
+            "Movies",
+            None,
+            &["1917.2019.1080p.BluRay.x264.mkv".into()],
+        );
+        assert_eq!(structured.primary_title, "1917");
+        assert_eq!(structured.year, Some(2019));
+        assert_eq!(structured.frequent_file_title.as_deref(), Some("1917"));
+
+        let same_number_twice = build_match_evidence(
+            "Movies",
+            "Movies",
+            None,
+            &["1984.1984.1080p.BluRay.x264.mkv".into()],
+        );
+        assert_eq!(same_number_twice.primary_title, "1984");
+        assert_eq!(same_number_twice.year, Some(1984));
+
+        let ambiguous = build_match_evidence("Movies", "Movies", None, &["1917.mkv".into()]);
+        assert_eq!(ambiguous.frequent_file_title, None);
+        assert_eq!(ambiguous.year, None);
+    }
+
+    #[test]
+    fn media_file_year_restores_a_four_digit_number_that_belongs_to_the_title() {
+        let evidence = build_match_evidence(
+            "Blade Runner 2049",
+            "Blade Runner 2049",
+            None,
+            &["Blade.Runner.2049.2017.1920x1080.BluRay.x265.mkv".into()],
+        );
+        assert_eq!(evidence.primary_title, "Blade Runner 2049");
+        assert_eq!(evidence.year, Some(2017));
+
+        let leading_number = build_match_evidence(
+            "2001 A Space Odyssey",
+            "2001 A Space Odyssey",
+            None,
+            &["2001.A.Space.Odyssey.1968.1080p.BluRay.x264.mkv".into()],
+        );
+        assert_eq!(leading_number.primary_title, "2001 A Space Odyssey");
+        assert_eq!(leading_number.year, Some(1968));
+    }
+
+    #[test]
+    fn dominant_file_year_requires_a_unique_frequency_winner() {
+        assert_eq!(
+            dominant_media_file_year(&[
+                "Movie.2020.1080p.mkv".into(),
+                "Movie.2020.2160p.mkv".into(),
+                "Movie.2021.1080p.mkv".into(),
+            ]),
+            Some(2020)
+        );
+        assert_eq!(
+            dominant_media_file_year(&[
+                "Movie.2020.1080p.mkv".into(),
+                "Movie.2021.1080p.mkv".into(),
+            ]),
+            None
+        );
     }
 
     #[test]
