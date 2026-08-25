@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- 版本：`0.5.9`
+- 版本：`0.5.10`
 - 目标：Windows x64 桌面应用
 - 前端：React 19、TypeScript 5.8、Vite 6
 - 客户端：Tauri 2、Rust 2021
@@ -127,7 +127,7 @@ Bangumi 手动弹窗为每次预填、搜索和绑定维护 Node ID 与请求代
 
 NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当前目录标记、更新缓存及安装目录的 Library Root 隔离，复制已安装的可信 `M2ShelfUpdater.exe` 到应用数据事务目录，并在取得 SQLite 单写入屏障后通过 online backup 建立一致快照及长度/SHA-256 记录；该屏障保留到旧进程退出，避免快照后的写入在回滚时丢失。helper 全程持有 Windows 命名更新互斥锁，在旧程序退出前锁定、复验并密封 ZIP，原子写入 helper-ready；普通手动启动会先等待该锁。只有新版子进程携带的规范事务 ID 能同时认证精确活动事务、当前可执行文件、目标版本和 `Launched` 阶段时才允许绕过等待。helper 严格验证 ZIP 的扁平固定文件集、Portable 标记和 Windows 产品版本，在同卷暂存/备份后替换且最后处理 `M2Shelf.exe`，启动新进程并等待精确版本健康回执及完整三秒存活观察。成功后先原子写入仍保留事务材料的终态 `Completed`，完成受校验清理后再清除保留标记；下次启动会续作中断的 `Completed` 清理。失败时先确认新进程终止、逆序恢复文件，再以长度、SHA-256、SQLite `quick_check` 复验快照，预检并隔离 WAL/SHM 后原子恢复主库；无法安全恢复时保持当前数据库并保留材料。helper 异常终止留下的非终态事务会在下次启动严格识别并标为 `RECOVERY_REQUIRED`，不执行缺少可靠文件日志的猜测式回滚。回滚和人工恢复提示都持久显示到用户明确确认。
 
-`v0.5.8` 仅保留为 CI 失败且从未创建 Release、资产或 `latest.json` 的不可变历史 tag，不授权更新。`0.5.9` 是第一个公开携带该更新器和 Portable helper 的引导版本，因此 `0.5.7` 及更早用户必须手动安装 `0.5.9` 一次。之后客户端才具备上述更新能力。
+`v0.5.8` 仅保留为 CI 失败的不可变历史 tag，`v0.5.9` 仅保留为最终修复前创建且未公开的不可变历史 tag；二者都没有 Release、资产或 `latest.json`，不授权更新。`0.5.10` 是第一个公开携带该更新器和 Portable helper 的引导版本，因此 `0.5.7` 及更早用户必须手动安装 `0.5.10` 一次。之后客户端才具备上述更新能力。
 
 ## 持久化设置
 
@@ -179,12 +179,12 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 
 ## 当前发布状态
 
-- 仓库源码版本已更新为 `0.5.9`；本轮修复 About 重复分隔线、设置开关一致性、资源库识别文案、自动匹配实时结果计数，以及中文影视发行名的全角/嵌套括号、技术噪声、中英并列片名和通用父目录提取；
-- 最终工作树已通过 TypeScript typecheck、前端 production build、103 项仓库契约；在 CI 固定的 Rust `1.88.0` 上通过 fmt、162 项默认测试（5 项实网测试默认忽略）和 Clippy `-D warnings`，并额外显式运行 5 项 Bangumi 动画、真人影视、罗马字别名与封面实网回归，全部通过；
-- `.github/workflows/windows-release.yml` 现在为 Rust 1.88 最小 profile 显式安装 `rustfmt` 和 `clippy`；同时修复两处只在该版本 Clippy 下触发的等价 `format!` 写法，避免重演失败的 `v0.5.8` Actions Rust gate；
-- 本地发布候选为 `bundle/M2Shelf-Portable-0.5.9-x64.zip`（8,196,472 bytes，SHA-256 `710e7786ec6b195322ea74225ddbd2b8bccba695ec62151a9457f23793418445`）和 `bundle/M2Shelf-Setup-0.5.9-x64.exe`（5,166,573 bytes，SHA-256 `3c8ee44397d08d193deae3c1df37705df03d9977e36cb304f41cf44d1605a1f8`）；
-- 正式构建脚本已验证 x64 主程序/NSIS/helper、产品版本、helper identity、公钥、Portable 固定五文件、内部哈希、输入新鲜度和个人路径扫描；Portable 另在隔离临时目录与隔离 AppData 中完成五秒隐藏启动冒烟；
-- 上述本地产物尚未经过隔离生产私钥的 Ed25519 签名，也没有 `.sig`、`latest.json` 或受信 provenance，因此只能作为本地测试/离线签名候选，不能冒充正式更新 Release；
-- `v0.5.8` annotated tag 保留为不可变失败记录，但没有 Release；`v0.5.9` 只有在当前提交、tag CI、独立候选证明、隔离签名和发布脚本全部通过后才能公开。README 在正式 `v0.5.9` Release 完成前继续指向 `v0.5.7`；
-- `0.5.7` 没有内置更新器，必须手动安装 `0.5.9` 这一引导版本；首次更新链路测试使用受控且内含同一信任根的旧测试客户端，不能把失败的 `v0.5.8` 当作上一稳定版；
-- 任何后续 Agent 应以当前工作树的实际质量门禁、构建和签名结果更新本节，不得把未运行的验证或未发布的 Release 写成已完成。
+- 仓库源码版本已更新为 `0.5.10`；本轮包含设置页分隔线与开关一致性修复，以及电影/真人影视作品名、发行年份、数字片名和标题内四位数字的受限匹配改进；
+- 最终工作树已通过 TypeScript typecheck、前端 production build、103 项仓库契约；在 CI 固定的 Rust `1.88.0` 上通过 fmt、169 项默认测试（5 项实网测试默认忽略）和 Clippy `-D warnings`，并额外显式运行 5 项 Bangumi 动画、真人影视、罗马字别名与封面实网回归，全部通过；
+- `.github/workflows/windows-release.yml` 为 Rust 1.88 最小 profile 显式安装 `rustfmt` 和 `clippy`，tag 构建只生成短期无签名候选，不接触生产私钥或自动发布；
+- 本地发布候选为 `bundle/M2Shelf-Portable-0.5.10-x64.zip`（8,202,468 bytes，SHA-256 `94631ae7aaa9a1afbc408fa72298d43d1a66e24a5c044373aa71fa3cd54aeb90`）和 `bundle/M2Shelf-Setup-0.5.10-x64.exe`（5,169,592 bytes，SHA-256 `a7f7929a0b8442b4a04c295da6009ef4d89a3163916fd848465d464f75e6631b`）；
+- 正式构建脚本已验证 x64 主程序/NSIS/helper、产品版本、helper identity、公钥、Portable 固定五文件、内部哈希、输入新鲜度和个人路径扫描；解压后的 Portable 在隔离 AppData 中完成五秒隐藏启动冒烟并保持响应；
+- 上述本地产物尚未经过隔离生产私钥的 Ed25519 签名，也没有 `.sig`、`latest.json` 或 tag CI 的受信 provenance，因此当前只能作为本地测试和离线签名候选，不能冒充正式更新 Release；
+- `v0.5.8` annotated tag 保留为不可变失败记录，`v0.5.9` annotated tag 保留为最终修复前的不可变未发布记录；二者均没有 Release。README 在正式 `v0.5.10` Release 完成前继续指向 `v0.5.7`；
+- `0.5.7` 没有内置更新器，必须手动安装 `0.5.10` 这一引导版本；首次更新链路测试使用受控且内含同一信任根的旧测试客户端，不能把 `v0.5.8` 或 `v0.5.9` 当作上一稳定版；
+- 任何后续 Agent 应以当前工作树的实际质量门禁、构建、tag CI、隔离签名和发布结果更新本节，不得把未运行或未公开的阶段写成已完成。
