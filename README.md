@@ -14,9 +14,15 @@ M²Shelf 把本地硬盘、移动硬盘或 NAS 映射目录中的动画、电影
 
 简单来说，可以让你的动画收藏从资源管理器里不同语言、不同压制方式、不同字幕组等不易识别的长文件名一键变成如图所示的清晰瀑布流：
 
-<img width="1427" height="888" alt="微信图片_20260823213336_62_30" src="https://github.com/user-attachments/assets/c09f2e18-aef0-4e13-ae1a-b5a7825bc3dc" />
+<img width="1445" height="1226" alt="ff3acd6cec8b9a3b76d2e1d4b7737b29" src="https://github.com/user-attachments/assets/4e1a235c-ea75-4996-b7a7-5c890e0b0803" />
 
-在动画的详情页也依旧可以看到文件名显示，并可一键在资源管理器中打开。
+在动画“作品”的详情页也依旧可以看到文件名显示，并可一键在资源管理器中打开：
+
+<img width="1445" height="1226" alt="8fcf460277f5bca26062e347984387fd" src="https://github.com/user-attachments/assets/9bac84e4-af4e-4b2a-8c5f-ecd05b06b34b" />
+
+动画“系列”的详情页展示：
+
+<img width="1445" height="1226" alt="08a0af8ef5a719090efdfa33cd88f944" src="https://github.com/user-attachments/assets/9bc04a4c-4184-4dd3-82dc-094ab32049f6" />
 
 **软件不会移动、删除、重命名或修改源媒体文件，也不要求整理现有目录。**
 
