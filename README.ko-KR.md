@@ -12,11 +12,17 @@
 
 M²Shelf는 내장·외장 드라이브 또는 NAS 매핑 폴더에 저장된 애니메이션, 영화 및 관련 리소스를 별도 색인으로 관리하며 포스터 보기, Bangumi 메타데이터, 태그, 즐겨찾기, 시청 기록 및 외부 플레이어 실행 기능을 제공합니다.
 
-쉽게 말해, 파일 탐색기에서 언어·인코딩 방식·자막 그룹 등이 뒤섞여 알아보기 어려운 긴 파일명으로 보이던 애니메이션 컬렉션을 아래와 같은 깔끔한 포스터 그리드로 한 번에 바꿔 줍니다.
+간단히 말해, 파일 탐색기에서 언어, 인코딩, 자막 그룹의 차이와 지나치게 긴 파일 이름 때문에 구분하기 어려운 애니메이션 컬렉션을 아래와 같이 읽기 쉬운 포스터 보기로 한 번에 바꿀 수 있습니다.
 
-<img width="1427" height="888" alt="M²Shelf 포스터 보기 예시" src="https://github.com/user-attachments/assets/c09f2e18-aef0-4e13-ae1a-b5a7825bc3dc" />
+<img width="1445" height="1226" alt="M²Shelf 포스터 보기" src="https://github.com/user-attachments/assets/4e1a235c-ea75-4996-b7a7-5c890e0b0803" />
 
-작품 상세 페이지에서는 원래 파일명을 그대로 확인할 수 있으며, 클릭 한 번으로 Windows 파일 탐색기에서 해당 위치를 열 수 있습니다.
+애니메이션 '작품' 상세 페이지에서도 원래 파일 이름을 그대로 확인할 수 있으며, 클릭 한 번으로 Windows 파일 탐색기에서 해당 위치를 열 수 있습니다.
+
+<img width="1445" height="1226" alt="M²Shelf 애니메이션 작품 상세 페이지" src="https://github.com/user-attachments/assets/9bac84e4-af4e-4b2a-8c5f-ecd05b06b34b" />
+
+애니메이션 '시리즈' 상세 페이지:
+
+<img width="1445" height="1226" alt="M²Shelf 애니메이션 시리즈 상세 페이지" src="https://github.com/user-attachments/assets/9bc04a4c-4184-4dd3-82dc-094ab32049f6" />
 
 **원본 미디어 파일을 이동, 삭제, 이름 변경 또는 수정하지 않으며 기존 폴더 구조를 다시 정리하도록 요구하지 않습니다.**
 
