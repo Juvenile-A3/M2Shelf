@@ -391,6 +391,11 @@ pub fn open_library_root_in_explorer(root_id: i64, state: State<'_, AppState>) -
 }
 
 #[tauri::command]
+pub fn list_hidden_nodes(state: State<'_, AppState>) -> AppResult<Vec<MediaNode>> {
+    state.database.list_hidden_nodes()
+}
+
+#[tauri::command]
 pub fn get_all_resources(state: State<'_, AppState>) -> AppResult<AllResourcesResult> {
     state.database.list_all_resources()
 }
@@ -505,7 +510,13 @@ pub fn get_node_detail(node_id: i64, state: State<'_, AppState>) -> AppResult<No
         resource_files: state.database.list_resources(node_id)?,
         breadcrumbs: state.database.breadcrumbs(node_id, true)?,
         binding,
+        work_sources: None,
     })
+}
+
+#[tauri::command]
+pub fn get_work_detail(node_id: i64, state: State<'_, AppState>) -> AppResult<NodeDetail> {
+    crate::works::work_detail(&state.database, node_id)
 }
 
 #[tauri::command]
@@ -522,9 +533,10 @@ pub fn start_scan(
     app: AppHandle,
     root_id: Option<i64>,
     node_id: Option<i64>,
+    background: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<ScanStarted> {
-    start_scan_internal(app, &state, root_id, node_id)
+    start_scan_internal(app, &state, root_id, node_id, background.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -559,6 +571,8 @@ pub fn match_existing_content(
         .first()
         .map_or_else(String::new, |node| node.absolute_path.clone());
     let initial = ScanProgress {
+        background: false,
+        library_changed: None,
         scan_id: scan_id.clone(),
         root_id,
         current_path,
@@ -576,6 +590,7 @@ pub fn match_existing_content(
         auto_match_errors: 0,
     };
     let control = ScanControl {
+        unchanged_directories: Default::default(),
         scan_id: scan_id.clone(),
         cancel: Arc::new(AtomicBool::new(false)),
         progress: Arc::new(Mutex::new(initial)),
@@ -822,17 +837,24 @@ pub async fn bind_bangumi(
     // authoritative when the optional detail request is unavailable.
     let fallback_subject = subject.clone();
     let subject_for_detail = subject;
+    let mut detail_synced = false;
     let subject = match tauri::async_runtime::spawn_blocking(move || {
         bangumi::enrich_subject(&subject_for_detail)
     })
     .await
     {
-        Ok(Ok(subject)) => subject,
+        Ok(Ok(subject)) => {
+            detail_synced = true;
+            subject
+        }
         Ok(Err(_)) | Err(_) => fallback_subject,
     };
     let active_cache = active_cover_cache_directory(&state);
     let previous_path =
         database.save_confirmed_binding_with_aliases(node_id, &subject, &confirmed_aliases)?;
+    if detail_synced {
+        database.complete_provider_alias_sync(&subject)?;
+    }
     if let (Some(path), Ok(cache_root)) = (previous_path.as_deref(), active_cache.as_ref()) {
         let cache_operation = cache::begin_cover_cache_operation();
         remove_cached_file_if_unreferenced(&cache_operation, &database, path, cache_root);
@@ -865,6 +887,22 @@ pub async fn bind_bangumi(
 }
 
 #[tauri::command]
+pub async fn sync_pending_bangumi_aliases(state: State<'_, AppState>) -> AppResult<bool> {
+    if state.update_exit_in_progress.load(Ordering::Acquire)
+        || !state
+            .database
+            .get_settings(&state.default_cover_cache_dir)?
+            .bangumi_search_enabled
+    {
+        return Ok(false);
+    }
+    let database = state.database.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::alias_sync::sync_pending(&database))
+        .await
+        .map_err(|error| format!("Bangumi 别称补全任务失败：{error}"))?
+}
+
+#[tauri::command]
 pub async fn retry_bangumi_cover(
     node_id: i64,
     state: State<'_, AppState>,
@@ -884,7 +922,7 @@ pub async fn retry_bangumi_cover(
         title_en: binding.provider_title_en,
         title_ja: binding.provider_title_ja,
         title_ko: binding.provider_title_ko,
-        match_aliases: Vec::new(),
+        match_aliases: binding.provider_aliases,
         date: binding.provider_date,
         image_url: binding.provider_image_url,
         summary: None,
@@ -1193,6 +1231,22 @@ pub fn open_cover_cache_directory(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 #[tauri::command]
+pub fn open_bangumi_subject(node_id: i64, state: State<'_, AppState>) -> AppResult<()> {
+    let binding = state
+        .database
+        .get_binding(node_id)?
+        .ok_or_else(|| "该目录尚未绑定 Bangumi。".to_string())?;
+    player::open_external_url(&bangumi_subject_url(binding.provider_subject_id)?)
+}
+
+fn bangumi_subject_url(subject_id: i64) -> AppResult<String> {
+    if subject_id <= 0 {
+        return Err("Bangumi 条目 ID 无效。".into());
+    }
+    Ok(format!("https://bgm.tv/subject/{subject_id}"))
+}
+
+#[tauri::command]
 pub fn open_external_url(url: String) -> AppResult<()> {
     // About links are intentionally allow-listed. This command is not a general URL launcher.
     let allowed_url =
@@ -1238,7 +1292,7 @@ pub fn clear_cover_cache(state: State<'_, AppState>) -> AppResult<CacheStats> {
 pub fn rebuild_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<RebuildResult> {
     // Rescanning upserts paths and removes stale index entries, while preserving manual overrides,
     // display names, metadata bindings and source files.
-    start_scan_internal(app, &state, None, None)
+    start_scan_internal(app, &state, None, None, false)
 }
 
 fn start_scan_internal(
@@ -1246,19 +1300,33 @@ fn start_scan_internal(
     state: &AppState,
     root_id: Option<i64>,
     node_id: Option<i64>,
+    background: bool,
 ) -> AppResult<ScanStarted> {
     let _scan_lifecycle = lock_scan_lifecycle(state);
     ensure_no_active_scan(state)?;
     if root_id.is_none() && node_id.is_some() {
         return Err("扫描指定目录时必须同时提供资源库 ID。".into());
     }
-    let roots = if let Some(root_id) = root_id {
+    if background && node_id.is_some() {
+        return Err("后台增量检查须以资源库为单位。".into());
+    }
+    let mut roots = if let Some(root_id) = root_id {
         vec![state.database.get_root(root_id)?]
     } else {
         state.database.list_roots()?
     };
     if roots.is_empty() {
         return Err("请先添加至少一个资源库。".into());
+    }
+    // An unplugged disk must not prevent other libraries from refreshing, nor may it enter
+    // stale-row cleanup. Explicit single-root scans still return the original validation error.
+    let root_count = roots.len();
+    if root_id.is_none() {
+        roots.retain(|root| Path::new(&root.path).is_dir());
+    }
+    let unavailable_roots = (root_count - roots.len()) as u64;
+    if roots.is_empty() {
+        return Err("所有资源库当前均不可访问；已有索引已保留。".into());
     }
     // Fail synchronously for stale, forged, or legacy-overlapping roots. The scanner repeats this
     // immediately before filesystem traversal to close the command-to-worker timing gap.
@@ -1295,13 +1363,15 @@ fn start_scan_internal(
     }
     let scan_id = Uuid::new_v4().to_string();
     let initial = ScanProgress {
+        background,
+        library_changed: Some(false),
         scan_id: scan_id.clone(),
         root_id: targets[0].root.id,
         current_path: targets[0].path.to_string_lossy().into_owned(),
         folders_scanned: 0,
         videos_found: 0,
         status: ScanStatus::Running,
-        errors: 0,
+        errors: unavailable_roots,
         message: Some("正在扫描…".into()),
         phase: crate::models::ScanPhase::Scanning,
         auto_match_current: 0,
@@ -1312,6 +1382,7 @@ fn start_scan_internal(
         auto_match_errors: 0,
     };
     let control = ScanControl {
+        unchanged_directories: Default::default(),
         scan_id: scan_id.clone(),
         cancel: Arc::new(AtomicBool::new(false)),
         progress: Arc::new(Mutex::new(initial)),
@@ -1447,6 +1518,17 @@ pub fn cancel_scan_on_exit(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_subject_link_uses_only_the_official_subject_path() {
+        assert_eq!(
+            bangumi_subject_url(174584).unwrap(),
+            "https://bgm.tv/subject/174584"
+        );
+        assert!(bangumi_subject_url(0).is_err());
+        assert!(bangumi_subject_url(-1).is_err());
+    }
+
     use rusqlite::params;
     use tempfile::TempDir;
 
@@ -1561,6 +1643,7 @@ mod tests {
             language: "zh-CN".into(),
             theme: "system".into(),
             auto_check_updates: true,
+            auto_scan_on_startup: true,
         };
         assert!(settings.validate_path_lengths().is_ok());
         settings.mpv_path = Some("x".repeat(crate::models::MAX_SETTINGS_PATH_CHARS + 1));

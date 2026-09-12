@@ -20,6 +20,7 @@ interface WorkDetailPageProps {
   onBreadcrumb: (nodeId: number) => void;
   onBack: () => void;
   onBangumi: () => void;
+  onOpenBangumi: () => void;
   onRetryCover: () => void;
   onRetryCoverNode: (node: NodeDetail["node"]) => void;
   onClearBangumi: () => void;
@@ -34,14 +35,14 @@ interface WorkDetailPageProps {
   coverRevision: number;
 }
 
-export function WorkDetailPage({ detail, loading, rootLabel, onRoot, onBreadcrumb, onBack, onBangumi, onRetryCover, onRetryCoverNode, onClearBangumi, onReveal, onPlay, onRevealMedia, onOpenResource, onRevealResource, onOpenChild, onBangumiNode, onMenu, coverRevision }: WorkDetailPageProps) {
+export function WorkDetailPage({ detail, loading, rootLabel, onRoot, onBreadcrumb, onBack, onBangumi, onOpenBangumi, onRetryCover, onRetryCoverNode, onClearBangumi, onReveal, onPlay, onRevealMedia, onOpenResource, onRevealResource, onOpenChild, onBangumiNode, onMenu, coverRevision }: WorkDetailPageProps) {
   const { t } = useI18n();
   const coverNode = detail ? { ...detail.node, binding: detail.binding } : null;
   const { coverCacheKey, coverUrl: cover, coverFailed: coverReadFailed, coverLoading } = useCoverDataUrl(coverNode, coverRevision);
   const [imageFailed, setImageFailed] = useState(false);
   useEffect(() => setImageFailed(false), [cover]);
   if (loading || !detail) return <LoadingState label={t("detail.loading")} />;
-  const { node, binding, mediaFiles, resourceFiles, children } = detail;
+  const { node, binding, mediaFiles, resourceFiles, children, workSources } = detail;
   const displayNode = binding ? { ...node, binding } : node;
   const title = nodeDisplayTitle(displayNode);
   const isContainer = node.nodeType === "CONTAINER";
@@ -58,12 +59,12 @@ export function WorkDetailPage({ detail, loading, rootLabel, onRoot, onBreadcrum
           <div className="detail-copy">
             <p className="eyebrow">{nodeTypeLabel(node.nodeType)}{node.manualTypeOverride && ` · ${t("node.manual")}`}</p>
             <h1>{title}</h1>
-            <p className="detail-folder-name">{node.folderName}</p>
-            <p className="detail-path" title={node.absolutePath}>{node.absolutePath}</p>
-            <div className="detail-stats"><span><strong>{mediaFiles.length}</strong> {t("detail.directVideos")}</span><span><strong>{resourceFiles.length}</strong> {t("detail.otherFileCount", { count: "" }).trim()}</span><span><strong>{children.length}</strong> {t("detail.childDirectoryCount", { count: "" }).trim()}</span></div>
+            {!workSources && <p className="detail-folder-name">{node.folderName}</p>}
+            {!workSources && <p className="detail-path" title={node.absolutePath}>{node.absolutePath}</p>}
+            <div className="detail-stats"><span><strong>{mediaFiles.length}</strong> {t(workSources ? "works.localVideos" : "detail.directVideos")}</span><span><strong>{resourceFiles.length}</strong> {t("detail.otherFileCount", { count: "" }).trim()}</span><span><strong>{children.length}</strong> {t("detail.childDirectoryCount", { count: "" }).trim()}</span></div>
             {bindable && <div className="binding-panel">
               <span className="binding-logo"><Icon name="bangumi" /></span>
-              {binding ? <div><small>{t("detail.bound", { id: binding.providerSubjectId })}</small><strong>{bindingDisplayTitle(displayNode) ?? title}</strong>{coverError && <em><Icon name="warning" />{t("detail.bindingCoverFailed")}</em>}</div> : <div><small>{t("provider.bangumi")}</small><strong>{t("detail.unbound")}</strong></div>}
+              {binding ? <div><small>{t("detail.bound", { id: binding.providerSubjectId })}</small><button className="binding-subject-link" type="button" onClick={onOpenBangumi} title={t("detail.openBangumi")} aria-label={t("detail.openBangumi")}><strong>{bindingDisplayTitle(displayNode) ?? title}</strong><Icon name="external" /></button>{coverError && <em><Icon name="warning" />{t("detail.bindingCoverFailed")}</em>}</div> : <div><small>{t("provider.bangumi")}</small><strong>{t("detail.unbound")}</strong></div>}
               <button className="button secondary" onClick={onBangumi} type="button">{binding ? t("detail.changeBinding") : t("detail.searchAdd")}</button>
               {binding && coverError && <button className="icon-button" aria-label={t("detail.retryCoverAria")} onClick={onRetryCover} title={t("detail.retryCover")} type="button"><Icon name="refresh" /></button>}
               {binding && <button className="icon-button" aria-label={t("detail.clearBindingAria")} onClick={onClearBangumi} title={t("detail.clearBinding")} type="button"><Icon name="trash" /></button>}
@@ -81,6 +82,7 @@ export function WorkDetailPage({ detail, loading, rootLabel, onRoot, onBreadcrum
         {resourceOnlyContainer && (children.length > 0 || resourceFiles.length > 0) && <section className="content-section child-section"><div className="section-heading"><div><p className="eyebrow">{t("detail.directoryContent")}</p><h2>{t("detail.browseFilesFolders")}</h2></div><span>{t("detail.itemCount", { count: children.length + resourceFiles.length })}</span></div><OtherResourceList files={resourceFiles} folders={children} onOpenFile={onOpenResource} onRevealFile={onRevealResource} onOpenFolder={onOpenChild} onFolderMenu={onMenu} /></section>}
         {isContainer && !resourceOnlyContainer && resourceFiles.length > 0 && <section className="content-section child-section"><div className="section-heading"><div><p className="eyebrow">{t("detail.otherResources")}</p><h2>{t("detail.containerAttachments")}</h2></div><span>{t("browse.fileCount", { count: resourceFiles.length })}</span></div><OtherResourceList files={resourceFiles} folders={[]} onOpenFile={onOpenResource} onRevealFile={onRevealResource} onOpenFolder={onOpenChild} onFolderMenu={onMenu} /></section>}
         {isContainer && !resourceOnlyContainer && children.length > 0 && <section className="content-section child-section"><div className="section-heading"><div><p className="eyebrow">{t("detail.children")}</p><h2>{t("detail.continueSeries")}</h2></div><span>{t("browse.nodeCount", { count: children.length })}</span></div><PosterGrid nodes={children} viewMode="grid" onOpen={onOpenChild} onMenu={onMenu} onBangumi={onBangumiNode} onRetryCover={onRetryCoverNode} coverRevision={coverRevision} /></section>}
+        {workSources && <details className="content-section work-sources"><summary>{t("works.sources")} · {workSources.length}</summary><p>{t("works.sourcesHelp")}</p><OtherResourceList files={[]} folders={workSources} onOpenFile={onOpenResource} onRevealFile={onRevealResource} onOpenFolder={onOpenChild} onFolderMenu={onMenu} /></details>}
       </div>
     </section>
   );

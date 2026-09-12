@@ -107,6 +107,9 @@ def check_migrations() -> None:
         "0008_bangumi_subject_type.sql",
         "0009_library_recognition_mode.sql",
         "0010_confirmed_title_aliases.sql",
+        "0011_incremental_scan.sql",
+        "0012_provider_aliases.sql",
+        "0013_alias_sync.sql",
     ]
     if [path.name for path in migration_paths] != expected:
         fail(f"expected exactly migrations {expected}, got {[p.name for p in migration_paths]}")
@@ -134,6 +137,7 @@ def check_migrations() -> None:
                 "favorite_folders",
                 "node_favorite_folders",
                 "confirmed_title_aliases",
+                "library_scan_snapshots",
             }
             missing = required_tables - table_names(connection)
             if missing:
@@ -540,7 +544,7 @@ def check_migrations() -> None:
         legacy.close()
 
     if len(ERRORS) == error_count_before:
-        passed("SQLite migrations 1-10, library recognition modes, multilingual titles, Bangumi subject types, confirmed aliases, user tags, watch history, favorites, upgrade preservation, and constraints")
+        passed("SQLite migrations 1-11, incremental snapshots, library recognition modes, multilingual titles, Bangumi subject types, confirmed aliases, user tags, watch history, favorites, upgrade preservation, and constraints")
 
 
 def extract_rust_commands() -> tuple[set[str], set[str]]:

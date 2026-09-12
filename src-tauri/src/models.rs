@@ -86,6 +86,10 @@ pub enum CollectionSort {
     TitleDesc,
     AddedDesc,
     AddedAsc,
+    ModifiedDesc,
+    ModifiedAsc,
+    WatchedAsc,
+    WatchedDesc,
 }
 
 impl CollectionSort {
@@ -95,6 +99,10 @@ impl CollectionSort {
             Self::TitleDesc => "title-desc",
             Self::AddedDesc => "added-desc",
             Self::AddedAsc => "added-asc",
+            Self::ModifiedDesc => "modified-desc",
+            Self::ModifiedAsc => "modified-asc",
+            Self::WatchedAsc => "watched-asc",
+            Self::WatchedDesc => "watched-desc",
         }
     }
 
@@ -103,6 +111,10 @@ impl CollectionSort {
             "title-desc" => Self::TitleDesc,
             "added-desc" => Self::AddedDesc,
             "added-asc" => Self::AddedAsc,
+            "modified-desc" => Self::ModifiedDesc,
+            "modified-asc" => Self::ModifiedAsc,
+            "watched-asc" => Self::WatchedAsc,
+            "watched-desc" => Self::WatchedDesc,
             _ => Self::TitleAsc,
         }
     }
@@ -175,6 +187,8 @@ pub struct LibraryRoot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataBinding {
+    #[serde(default)]
+    pub provider_aliases: Vec<String>,
     pub id: i64,
     pub node_id: i64,
     pub provider: String,
@@ -233,6 +247,11 @@ pub struct BatchMutationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaNode {
+    /// Latest source-file modification in this visible subtree, derived from the existing index.
+    #[serde(default)]
+    pub latest_file_modified_at: Option<String>,
+    #[serde(default)]
+    pub last_watched_at: Option<String>,
     pub id: i64,
     pub library_root_id: i64,
     pub parent_node_id: Option<i64>,
@@ -369,6 +388,14 @@ pub struct BrowseResult {
 pub struct AllResourcesResult {
     pub nodes: Vec<MediaNode>,
     pub total_count: i64,
+    pub works: Vec<WorkGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkGroup {
+    pub node: MediaNode,
+    pub sources: Vec<MediaNode>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,6 +414,7 @@ pub struct NodeDetail {
     pub resource_files: Vec<ResourceFile>,
     pub breadcrumbs: Vec<BreadcrumbItem>,
     pub binding: Option<MetadataBinding>,
+    pub work_sources: Option<Vec<MediaNode>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,8 +452,7 @@ pub struct BangumiSubject {
     pub title_ja: Option<String>,
     #[serde(default)]
     pub title_ko: Option<String>,
-    /// Official aliases used only while ranking provider candidates. Confirmed bindings keep the
-    /// existing stable multilingual columns, so this does not change the SQLite schema.
+    /// Official aliases used for candidate ranking and persisted with bindings for local search.
     #[serde(default)]
     pub match_aliases: Vec<String>,
     pub date: Option<String>,
@@ -473,6 +500,10 @@ impl ScanStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanProgress {
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub library_changed: Option<bool>,
     pub scan_id: String,
     pub root_id: i64,
     pub current_path: String,
@@ -519,6 +550,8 @@ pub struct AppSettings {
     pub theme: String,
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_scan_on_startup: bool,
 }
 
 pub const MAX_SETTINGS_PATH_CHARS: usize = 32_767;

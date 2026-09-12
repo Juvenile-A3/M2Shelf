@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     thread,
 };
 
@@ -200,6 +200,7 @@ impl MatchRunCache {
 pub fn run_auto_match<F, C>(
     database: &Database,
     targets: &[ScanTarget],
+    unchanged: &HashSet<PathBuf>,
     cache_root: Result<&Path, &str>,
     on_progress: F,
     is_cancelled: C,
@@ -208,8 +209,15 @@ where
     F: FnMut(usize, usize, &MediaNode, AutoMatchReport),
     C: Fn() -> bool,
 {
-    let candidates = match candidates_in_targets(database, targets) {
-        Ok(candidates) => candidates,
+    let candidates: Vec<MediaNode> = match candidates_in_targets(database, targets) {
+        Ok(candidates) => candidates
+            .into_iter()
+            .filter(|node| {
+                !Path::new(&node.absolute_path)
+                    .ancestors()
+                    .any(|path| unchanged.contains(path))
+            })
+            .collect(),
         Err(_) => {
             return AutoMatchReport {
                 errors: 1,
@@ -436,6 +444,9 @@ where
                 );
             }
         }
+    }
+    if let Some(Ok(detail)) = run_cache.details.get(&subject.subject_id) {
+        database.complete_provider_alias_sync(detail)?;
     }
     if is_cancelled() {
         return Ok(AutoMatchNodeResult::Matched);
@@ -685,7 +696,7 @@ where
     // Stage one uses the complete bounded Subject rows returned by search. A common exact,
     // high-confidence result already has enough evidence to bind safely and no longer incurs five
     // redundant detail round trips. Ambiguous/translated evidence may still enrich at most five
-    // candidates, while a high-confidence winner missing only its image enriches just that winner.
+    // candidates, while a high-confidence winner enriches just that winner to retain official aliases.
     let weights = MatchWeights::default();
     let mut preliminary = recalled
         .iter()
@@ -804,11 +815,7 @@ fn detail_candidate_ids(
         ids.push(subject_id);
     }
     if decision.confidence == MatchConfidence::High {
-        if let Some(best) = decision
-            .best
-            .as_ref()
-            .filter(|best| best.subject.image_url.is_none())
-        {
+        if let Some(best) = decision.best.as_ref() {
             if !ids.contains(&best.subject.subject_id) {
                 ids.push(best.subject.subject_id);
             }
@@ -1456,6 +1463,8 @@ mod tests {
 
     fn ineligible_progress_node(id: i64) -> MediaNode {
         MediaNode {
+            latest_file_modified_at: None,
+            last_watched_at: None,
             id,
             library_root_id: 1,
             parent_node_id: Some(1),
@@ -1835,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn high_confidence_search_metadata_skips_redundant_details() {
+    fn high_confidence_search_metadata_enriches_only_the_winner_for_aliases() {
         let evidence = evidence("WolfWalkers.2020.1080p");
         let weights = MatchWeights::default();
         let mut candidate = subject(1, "WolfWalkers", None);
@@ -1845,7 +1854,7 @@ mod tests {
         let decision = decide_scores(vec![score.clone()], false, &weights);
 
         assert_eq!(decision.confidence, MatchConfidence::High);
-        assert!(detail_candidate_ids(&[score], &decision, None).is_empty());
+        assert_eq!(detail_candidate_ids(&[score], &decision, None), vec![1]);
 
         let mut missing_image = decision.clone();
         missing_image.best.as_mut().unwrap().subject.image_url = None;

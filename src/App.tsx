@@ -5,6 +5,7 @@ import { canBindBangumi, errorMessage } from "./lib/format";
 import { BangumiModal } from "./components/BangumiModal";
 import { BatchContextMenu, type BatchNodeAction } from "./components/BatchContextMenu";
 import { BatchTagDialog } from "./components/BatchTagDialog";
+import { HiddenNodesDialog } from "./components/HiddenNodesDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ContextMenu, type NodeAction } from "./components/ContextMenu";
 import { EmptyState } from "./components/EmptyState";
@@ -48,6 +49,7 @@ type NavigationSnapshot = {
   searchRootId: number | null;
   viewMode: ViewMode;
   allFilter: string;
+  allGrouping: "works" | "folders";
   allTagFilterId: number | null;
   allSort: CollectionSort;
   browseFilter: string;
@@ -197,6 +199,11 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [allFilter, setAllFilter] = useState("");
   const [allTagFilterId, setAllTagFilterId] = useState<number | null>(null);
+  const [allGrouping, setAllGrouping] = useState<"works" | "folders">("works");
+  const startupScanAttempted = useRef(false);
+  const refreshWorkGroupsRef = useRef<(nodeId: number) => void>(() => undefined);
+  const [startupScanEnabled, setStartupScanEnabled] = useState(false);
+  const [scanListenersReady, setScanListenersReady] = useState(false);
   const [allSort, setAllSort] = useState<CollectionSort>("title-asc");
   const [browseFilter, setBrowseFilter] = useState("");
   const [browseTagFilterId, setBrowseTagFilterId] = useState<number | null>(null);
@@ -221,6 +228,7 @@ function App() {
   const [renameRoot, setRenameRoot] = useState<LibraryRoot | null>(null);
   const [confirm, setConfirm] = useState<ConfirmState>(null);
   const [dialogBusy, setDialogBusy] = useState(false);
+  const [hiddenNodesOpen, setHiddenNodesOpen] = useState(false);
   const [pendingRootAdd, setPendingRootAdd] = useState<PendingRootAdd>(null);
   const [rootAddBusy, setRootAddBusy] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -324,6 +332,7 @@ function App() {
     searchRootId,
     viewMode,
     allFilter,
+    allGrouping,
     allTagFilterId,
     allSort,
     browseFilter,
@@ -334,7 +343,7 @@ function App() {
     favoriteFilter,
     favoriteSort,
     scrollTop: contentScrollRef.current?.scrollTop ?? 0,
-  }), [allFilter, allSort, allTagFilterId, browseData, browseFilter, browseSort, browseTagFilterId, currentNode, detail, favoriteFilter, favoriteNodes, favoriteSort, page, searchQuery, searchRootId, selectedFavoriteFolderId, selectedRootId, viewMode]);
+  }), [allFilter, allGrouping, allSort, allTagFilterId, browseData, browseFilter, browseSort, browseTagFilterId, currentNode, detail, favoriteFilter, favoriteNodes, favoriteSort, page, searchQuery, searchRootId, selectedFavoriteFolderId, selectedRootId, viewMode]);
   const captureNavigationRef = useRef(captureNavigation);
   captureNavigationRef.current = captureNavigation;
 
@@ -370,6 +379,7 @@ function App() {
     setSearchRootId(previous.searchRootId);
     setViewMode(previous.viewMode);
     setAllFilter(previous.allFilter);
+    setAllGrouping(previous.allGrouping);
     setAllTagFilterId(previous.allTagFilterId);
     setAllSort(previous.allSort);
     setBrowseFilter(previous.browseFilter);
@@ -390,6 +400,7 @@ function App() {
       setCurrentNode(null);
       setSearchRootId(null);
       setAllFilter(previous.allFilter);
+      setAllGrouping(previous.allGrouping);
       setAllTagFilterId(previous.allTagFilterId);
       setAllSort(previous.allSort);
     } else if (previous.page === "search") {
@@ -672,7 +683,7 @@ function App() {
     if (!roots.some((root) => root.id === rootId)) return { snapshot: withoutRemovedRoot(snapshot, rootId) };
     if (snapshot.detail) {
       try {
-        const detail = await api.nodeDetail(snapshot.detail.node.id);
+        const detail = await api.nodeDetail(snapshot.detail.node.id, snapshot.detail.node.workView);
         return { snapshot: { ...snapshot, detail, currentNode: detail.node } };
       } catch {
         const browseData = await api.browse(rootId, null);
@@ -782,6 +793,9 @@ function App() {
       const patched = patchNavigationSnapshot(snapshot, nodeId, update);
       if (patched !== snapshot) sectionSnapshots.current.set(key, patched);
     }
+    // A binding can split or join a work. Recompute that projection while keeping the ordinary
+    // source-node patch path (including exact cover revisions) intact.
+    refreshWorkGroupsRef.current(nodeId);
   }, []);
 
   const changeEditMode = useCallback((active: boolean) => {
@@ -943,6 +957,7 @@ function App() {
       .then(([_app, nextRoots, settings, sortPreferences, activeScan, resources, recentEntries]) => {
         if (!active) return;
         setAutoCheckUpdates(settings.autoCheckUpdates ?? true);
+        setStartupScanEnabled(settings.autoScanOnStartup ?? true);
         setRoots(nextRoots);
         setSelectedRootId(nextRoots[0]?.id ?? null);
         persistedSortPreferences.current = sortPreferences;
@@ -995,7 +1010,7 @@ function App() {
     }
     if (!selectedRootId || page !== "library") return;
     if (detail) {
-      const next = await api.nodeDetail(detail.node.id);
+      const next = await api.nodeDetail(detail.node.id, detail.node.workView);
       if (!isCurrentRefresh()) return;
       setDetail(next);
       setCurrentNode(next.node);
@@ -1018,8 +1033,28 @@ function App() {
     ]);
   }, [loadAllResources, page, refreshCurrent]);
 
+  const aliasSyncBusy = useRef(false);
+  const refreshAliasResultsRef = useRef(refreshCurrentAndAllResources);
+  refreshAliasResultsRef.current = refreshCurrentAndAllResources;
+  useEffect(() => {
+    if (!desktopAvailable || !initialized || !bootstrap || bootstrap.updateRecoveryNotice || scan || aliasSyncBusy.current) return;
+    aliasSyncBusy.current = true;
+    void api.syncPendingBangumiAliases().then(async changed => {
+      if (changed) await refreshAliasResultsRef.current();
+    }).catch(() => undefined).finally(() => { aliasSyncBusy.current = false; });
+  }, [allResources, bootstrap, initialized, scan]);
+
+  refreshWorkGroupsRef.current = (nodeId) => {
+    void Promise.all([
+      loadAllResources(),
+      detail?.workSources?.some((source) => source.id === nodeId) ? refreshCurrent() : Promise.resolve(),
+    ]).catch((error) => toast(errorMessage(error), "error"));
+  };
+
   const handleScanProgress = useCallback((progress: ScanProgress) => {
-    if (!finishedScanIds.current.has(progress.scanId)) setScan(progress);
+    if (!finishedScanIds.current.has(progress.scanId)) {
+      setScan((current) => progress.background && current?.scanId === progress.scanId ? current : progress);
+    }
   }, []);
 
   const handleScanFinished = useCallback((progress: ScanProgress) => {
@@ -1031,6 +1066,7 @@ function App() {
       if (oldest) finishedIds.delete(oldest);
     }
     setScan((current) => current?.scanId === progress.scanId ? null : current);
+    if (progress.background && progress.libraryChanged !== true) return;
     const matchOnly = matchOnlyScanIds.current.delete(progress.scanId)
       || (progress.foldersScanned === 0 && progress.videosFound === 0 && progress.phase === "AUTO_MATCHING");
     const labels: Record<string, string> = { COMPLETED: t("app.scanCompleted"), CANCELLED: t("app.scanCancelled"), FAILED: t("app.scanFailed") };
@@ -1046,13 +1082,13 @@ function App() {
       unmatched: number(unmatched),
       errors: number(progress.autoMatchErrors),
     }) : null;
-    toast(autoMatchSummary ? `${summary} · ${autoMatchSummary}` : summary, progress.status === "FAILED" ? "error" : "success");
+    if (!progress.background) toast(autoMatchSummary ? `${summary} · ${autoMatchSummary}` : summary, progress.status === "FAILED" ? "error" : "success");
     void Promise.all([
       loadRoots(selectedRootId),
       refreshCurrent(),
       page === "all" ? Promise.resolve(null) : loadAllResources(),
       page === "recent" ? Promise.resolve([]) : loadRecentlyWatched(),
-    ]).catch((error) => toast(errorMessage(error), "error"));
+    ]).catch((error) => { if (!progress.background) toast(errorMessage(error), "error"); });
   }, [loadAllResources, loadRecentlyWatched, loadRoots, number, page, refreshCurrent, selectedRootId, t, toast]);
 
   const scanProgressHandlerRef = useRef(handleScanProgress);
@@ -1083,7 +1119,9 @@ function App() {
       // A short scan can finish while the two native listeners are still registering. The native
       // control retains its terminal snapshot, so reconcile once after both subscriptions settle.
       const current = await api.scanStatus();
-      if (disposed || current == null) return;
+      if (disposed) return;
+      setScanListenersReady(true);
+      if (current == null) return;
       if (current.status === "RUNNING" || current.status === "CANCELLING") {
         scanProgressHandlerRef.current(current);
       } else if (!finishedScanIds.current.has(current.scanId)) {
@@ -1157,7 +1195,10 @@ function App() {
   const navigate = useCallback((next: AppPage) => {
     const current = captureNavigation();
     const targetKey: BrowsingSectionKey | null = next === "all" || next === "search" || next === "recent" || next === "favorites" ? next : null;
-    if (targetKey && browsingSectionKey(current) === targetKey) return;
+    if (targetKey && browsingSectionKey(current) === targetKey) {
+      if (next === "search") setSearchRootId(null);
+      return;
+    }
     if (!targetKey && next === page) return;
     const requestGeneration = ++navigationGeneration.current;
     invalidateFavoritesLoads();
@@ -1178,7 +1219,7 @@ function App() {
           });
       } else {
         rememberNavigation(current);
-        restoreSectionNavigation(previous);
+        restoreSectionNavigation(next === "search" ? { ...previous, searchRootId: null } : previous);
       }
       return;
     }
@@ -1213,7 +1254,7 @@ function App() {
     }
     if (next === "search") {
       setSearchQuery("");
-      setSearchRootId(page === "all" ? null : selectedRootId);
+      setSearchRootId(null);
     }
     setPage(next);
   }, [captureNavigation, hydrateNavigationSnapshot, invalidateFavoritesLoads, loadAllResources, loadFavoriteFolders, loadRecentlyWatched, page, queueScroll, rememberNavigation, restoreSectionNavigation, selectedRootId, toast]);
@@ -1259,7 +1300,7 @@ function App() {
     setContentLoading(true);
     try {
       if (opensDetail) {
-        const next = await api.nodeDetail(node.id);
+        const next = await api.nodeDetail(node.id, node.workView);
         if (requestGeneration !== navigationGeneration.current) return;
         rememberNavigation(returnSnapshot);
         setPage("library");
@@ -1443,13 +1484,20 @@ function App() {
     }
   };
 
-  const startScan = useCallback(async (rootId?: number, nodeId?: number) => {
-    if (scan) { toast(t("app.scanAlreadyRunning"), "info"); return; }
+  const startScan = useCallback(async (rootId?: number, nodeId?: number, background = false) => {
+    if (scan) { if (!background) toast(t("app.scanAlreadyRunning"), "info"); return; }
     try {
-      const started = await api.startScan(rootId, nodeId);
-      setScan({ scanId: started.scanId, rootId: rootId ?? selectedRootId ?? 0, currentPath: t("app.scanPreparing"), foldersScanned: 0, videosFound: 0, errors: 0, status: "RUNNING", phase: "SCANNING", autoMatchCurrent: 0, autoMatchTotal: 0, autoMatchMatched: 0, autoMatchPending: 0, autoMatchUnmatched: 0, autoMatchErrors: 0 });
-    } catch (error) { toast(errorMessage(error), "error"); }
+      const started = await api.startScan(rootId, nodeId, background);
+      if (!finishedScanIds.current.has(started.scanId)) setScan({ background, libraryChanged: false, scanId: started.scanId, rootId: rootId ?? selectedRootId ?? 0, currentPath: t("app.scanPreparing"), foldersScanned: 0, videosFound: 0, errors: 0, status: "RUNNING", phase: "SCANNING", autoMatchCurrent: 0, autoMatchTotal: 0, autoMatchMatched: 0, autoMatchPending: 0, autoMatchUnmatched: 0, autoMatchErrors: 0 });
+    } catch (error) { if (!background) toast(errorMessage(error), "error"); }
   }, [scan, selectedRootId, t, toast]);
+
+  useEffect(() => {
+    if (!desktopAvailable || !initialized || !scanListenersReady || !bootstrap
+      || bootstrap.updateRecoveryNotice || startupScanAttempted.current) return;
+    startupScanAttempted.current = true;
+    if (startupScanEnabled && roots.length > 0 && !scan) void startScan(undefined, undefined, true);
+  }, [bootstrap, initialized, roots.length, scan, scanListenersReady, startScan, startupScanEnabled]);
 
   const cancelScan = async () => {
     if (!scan) return;
@@ -1458,7 +1506,8 @@ function App() {
   };
 
   const play = async (file: MediaFile) => {
-    try { await api.playMedia(file.id); void loadRecentlyWatched().catch(() => undefined); }
+    const generation = navigationGeneration.current;
+    try { await api.playMedia(file.id); void Promise.all([loadRecentlyWatched(), generation === navigationGeneration.current ? refreshCurrentAndAllResources() : loadAllResources()]).catch(() => undefined); }
     catch (error) { toast(t("app.playerLaunchFailed", { error: errorMessage(error) }), "error"); }
   };
 
@@ -1740,7 +1789,8 @@ function App() {
   }, [patchNodeEverywhere, t, toast]);
 
   const selectedRoot = useMemo(() => roots.find((root) => root.id === selectedRootId) ?? null, [roots, selectedRootId]);
-  const allProjectCount = allResources?.totalCount ?? roots.reduce((sum, root) => sum + (root.nodeCount ?? 0), 0);
+  const allProjectCount = (page === "all" && allGrouping === "works" ? allResources?.works.length : allResources?.totalCount)
+    ?? roots.reduce((sum, root) => sum + (root.nodeCount ?? 0), 0);
   const projectCount = page === "all" || (page === "search" && searchRootId == null)
     ? allProjectCount
     : page === "recent"
@@ -1766,16 +1816,16 @@ function App() {
       <Sidebar page={page} roots={roots} selectedRootId={selectedRootId} loading={rootsLoading} onNavigate={navigate} onSelectRoot={navigateRootSection} onAddRoot={() => void addRoot()} onRootMenu={(event, root) => setRootContext({ root, x: event.clientX, y: event.clientY })} projectCount={projectCount} />
       <main className="main-content">
         {!desktopAvailable && <div className="web-preview-notice"><Icon name="info" />{t("app.previewNotice")}</div>}
-        {scan && (scan.status === "RUNNING" || scan.status === "CANCELLING") && <ScanBanner progress={scan} onCancel={() => void cancelScan()} />}
+        {scan && !scan.background && (scan.status === "RUNNING" || scan.status === "CANCELLING") && <ScanBanner progress={scan} onCancel={() => void cancelScan()} />}
         <div className="content-scroll" ref={contentScrollRef}>
-          {page === "all" && <AllResourcesPage data={allResources} loading={allResourcesLoading} viewMode={viewMode} onViewMode={setViewMode} filter={allFilter} onFilter={setAllFilter} tagFilterId={allTagFilterId} onTagFilter={setAllTagFilterId} sort={allSort} onSort={changeAllSort} onOpenNode={openNode} onMenu={openNodeMenu} onBangumi={requestBangumi} onRetryCover={retryCover} onScan={() => void startScan()} onAddRoot={() => void addRoot()} onSearch={(query) => openSearch(query, null)} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} matchBusy={matchBusy || favoriteBusy || Boolean(scan)} onEditMode={changeEditMode} onToggleSelection={toggleNodeSelection} onSelectAll={selectNodeIds} onClearSelection={clearNodeSelection} onBatchTags={() => setBatchTagsOpen(true)} onBatchFavorites={() => setFavoriteAssignmentNodeIds([...selectedNodeIds])} onBatchMenu={openBatchMenu} onMatch={(nodeIds, rematch) => void matchExisting(nodeIds, rematch)} />}
+          {page === "all" && <AllResourcesPage grouping={allGrouping} onGrouping={(value) => { setAllGrouping(value); changeEditMode(false); }} data={allResources} loading={allResourcesLoading} viewMode={viewMode} onViewMode={setViewMode} filter={allFilter} onFilter={setAllFilter} tagFilterId={allTagFilterId} onTagFilter={setAllTagFilterId} sort={allSort} onSort={changeAllSort} onOpenNode={openNode} onMenu={openNodeMenu} onBangumi={requestBangumi} onRetryCover={retryCover} onScan={() => void startScan()} onAddRoot={() => void addRoot()} onSearch={(query) => openSearch(query, null)} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} matchBusy={matchBusy || favoriteBusy || Boolean(scan)} onEditMode={changeEditMode} onToggleSelection={toggleNodeSelection} onSelectAll={selectNodeIds} onClearSelection={clearNodeSelection} onBatchTags={() => setBatchTagsOpen(true)} onBatchFavorites={() => setFavoriteAssignmentNodeIds([...selectedNodeIds])} onBatchMenu={openBatchMenu} onMatch={(nodeIds, rematch) => void matchExisting(nodeIds, rematch)} />}
           {page === "recent" && <RecentlyWatchedPage entries={recentlyWatched} loading={recentlyWatchedLoading} viewMode={viewMode} onViewMode={setViewMode} onOpenNode={(node) => void openNode(node)} onMenu={(event, node) => setContext({ node, x: event.clientX, y: event.clientY })} onBangumi={requestBangumi} onRetryCover={(node) => void retryCover(node)} coverRevision={coverRevision} />}
           {page === "favorites" && <FavoritesPage folders={favoriteFolders} nodes={favoriteNodes} selectedFolderId={selectedFavoriteFolderId} loading={favoritesLoading} viewMode={viewMode} onViewMode={setViewMode} filter={favoriteFilter} onFilter={setFavoriteFilter} sort={favoriteSort} onSort={changeFavoriteSort} onOpenFolder={(folderId) => void openFavoriteFolder(folderId)} onBack={goBack} onCreate={() => setFavoriteFolderDialog("new")} onRename={setFavoriteFolderDialog} onDelete={deleteFavoriteFolder} onOpenNode={openNode} onMenu={openNodeMenu} onBangumi={requestBangumi} onRetryCover={retryCover} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} busy={favoriteBusy || matchBusy || Boolean(scan)} onEditMode={changeEditMode} onToggleSelection={toggleNodeSelection} onSelectAll={selectNodeIds} onClearSelection={clearNodeSelection} onBatchTags={() => setBatchTagsOpen(true)} onBatchFavorites={() => setFavoriteAssignmentNodeIds([...selectedNodeIds])} onBatchMenu={openBatchMenu} onRematch={() => void matchExisting([...selectedNodeIds], true)} onRemoveSelected={() => void removeSelectedFromFavorite()} />}
           {page === "library" && !selectedRoot && <EmptyState eyebrow={t("app.emptyEyebrow")} title={t("app.emptyTitle")} description={desktopAvailable ? t("app.emptyDesktop") : t("app.emptyWeb")} action={<button className="button primary" disabled={!desktopAvailable} onClick={() => void addRoot()} type="button"><Icon name="plus" />{t("app.addMediaDirectory")}</button>} />}
           {page === "library" && selectedRoot && !detail && <BrowsePage data={browseData} currentNode={currentNode} loading={contentLoading} viewMode={viewMode} onViewMode={setViewMode} filter={browseFilter} onFilter={setBrowseFilter} tagFilterId={browseTagFilterId} onTagFilter={setBrowseTagFilterId} sort={browseSort} onSort={changeBrowseSort} onRoot={goRoot} onBreadcrumb={(id) => void openBreadcrumb(id)} onOpenNode={openNode} onMenu={openNodeMenu} onBangumi={requestBangumi} onRetryCover={retryCover} onPlay={(file) => void play(file)} onRevealMedia={(file) => void revealMedia(file)} onOpenResource={(file) => void openResource(file)} onRevealResource={(file) => void revealResource(file)} onScan={() => void startScan(selectedRoot.id, currentNode?.id)} onAddRoot={() => void addRoot()} onSearch={(query) => openSearch(query, selectedRoot.id)} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} matchBusy={matchBusy || favoriteBusy || Boolean(scan)} onEditMode={changeEditMode} onToggleSelection={toggleNodeSelection} onSelectAll={selectNodeIds} onClearSelection={clearNodeSelection} onBatchTags={() => setBatchTagsOpen(true)} onBatchFavorites={() => setFavoriteAssignmentNodeIds([...selectedNodeIds])} onBatchMenu={openBatchMenu} onMatch={(nodeIds, rematch) => void matchExisting(nodeIds, rematch)} />}
-          {page === "library" && selectedRoot && detail && <WorkDetailPage detail={detail} loading={contentLoading} rootLabel={selectedRoot.displayName} onRoot={goRoot} onBreadcrumb={(id) => void openBreadcrumb(id)} onBack={goBack} onBangumi={() => requestBangumi(detail.node)} onRetryCover={() => void retryCover(detail.node)} onRetryCoverNode={(node) => void retryCover(node)} onClearBangumi={() => void nodeAction("clear-bangumi", detail.node)} onReveal={() => void nodeAction("explorer", detail.node)} onPlay={(file) => void play(file)} onRevealMedia={(file) => void revealMedia(file)} onOpenResource={(file) => void openResource(file)} onRevealResource={(file) => void revealResource(file)} onOpenChild={(node) => void openNode(node)} onBangumiNode={requestBangumi} onMenu={(event, node) => setContext({ node, x: event.clientX, y: event.clientY })} coverRevision={coverRevision} />}
-          {page === "search" && <SearchPage initialQuery={searchQuery} rootId={searchRootId} onQueryChange={setSearchQuery} onOpen={(hit: SearchHit) => void openNode(hit.node)} onError={(message) => toast(message, "error")} onResultsReady={applyPendingScroll} coverRevision={coverRevision} />}
-          {page === "settings" && <SettingsPage roots={roots} bootstrap={bootstrap} onAddRoot={() => void addRoot()} onRemoveRoot={removeRoot} onScanRoot={(root) => void startScan(root.id)} onAppearanceChange={applySettingsAppearance} onPersistenceFailure={handleSettingsPersistenceFailure} updateDownloadStatus={updateDownloadStatus} onCheckForUpdate={() => { if (updateCheckResult?.update && updateDownloadStatus.phase !== "CHECKING" && updateDownloadStatus.phase !== "DOWNLOADING" && updateDownloadStatus.phase !== "APPLYING") { setUpdateDialogOpen(true); setUpdateInstallRequest(0); } else { void checkForUpdate(true); } }} onError={(message) => toast(message, "error")} onSuccess={(message) => toast(message, "success")} />}
+          {page === "library" && selectedRoot && detail && <WorkDetailPage onOpenBangumi={() => { void api.openBangumiSubject(detail.node.id).catch(error => toast(errorMessage(error), "error")); }} detail={detail} loading={contentLoading} rootLabel={selectedRoot.displayName} onRoot={goRoot} onBreadcrumb={(id) => void openBreadcrumb(id)} onBack={goBack} onBangumi={() => requestBangumi(detail.node)} onRetryCover={() => void retryCover(detail.node)} onRetryCoverNode={(node) => void retryCover(node)} onClearBangumi={() => void nodeAction("clear-bangumi", detail.node)} onReveal={() => void nodeAction("explorer", detail.node)} onPlay={(file) => void play(file)} onRevealMedia={(file) => void revealMedia(file)} onOpenResource={(file) => void openResource(file)} onRevealResource={(file) => void revealResource(file)} onOpenChild={(node) => void openNode(node)} onBangumiNode={requestBangumi} onMenu={(event, node) => setContext({ node, x: event.clientX, y: event.clientY })} coverRevision={coverRevision} />}
+          {page === "search" && <SearchPage initialQuery={searchQuery} rootId={searchRootId} roots={roots} onRootChange={setSearchRootId} onQueryChange={setSearchQuery} onOpen={(hit: SearchHit) => void openNode(hit.node)} onError={(message) => toast(message, "error")} onResultsReady={applyPendingScroll} coverRevision={coverRevision} />}
+          {page === "settings" && <SettingsPage onHiddenNodes={() => setHiddenNodesOpen(true)} roots={roots} bootstrap={bootstrap} onAddRoot={() => void addRoot()} onRemoveRoot={removeRoot} onScanRoot={(root) => void startScan(root.id)} onAppearanceChange={applySettingsAppearance} onPersistenceFailure={handleSettingsPersistenceFailure} updateDownloadStatus={updateDownloadStatus} onCheckForUpdate={() => { if (updateCheckResult?.update && updateDownloadStatus.phase !== "CHECKING" && updateDownloadStatus.phase !== "DOWNLOADING" && updateDownloadStatus.phase !== "APPLYING") { setUpdateDialogOpen(true); setUpdateInstallRequest(0); } else { void checkForUpdate(true); } }} onError={(message) => toast(message, "error")} onSuccess={(message) => toast(message, "success")} />}
         </div>
         <footer className="app-footer"><span>{bootstrap ? `${t("brand.name")} ${bootstrap.version}` : t("brand.name")}</span><span className="footer-separator" /><span><Icon name="shield" />{t("common.readOnly")}</span><span className="footer-separator" /><span>{t("app.projectCount", { count: number(projectCount) })}</span>{(page === "library" || (page === "search" && searchRootId != null)) && selectedRoot && <><span className="footer-separator" /><span title={selectedRoot.path}>{selectedRoot.displayName}</span></>}</footer>
       </main>
@@ -1784,6 +1834,7 @@ function App() {
       {batchContext && selectedNodeIds.size > 0 && <BatchContextMenu count={selectedNodeIds.size} x={batchContext.x} y={batchContext.y} onAction={batchAction} onClose={() => setBatchContext(null)} />}
       {rootContext && <LibraryRootContextMenu root={rootContext.root} x={rootContext.x} y={rootContext.y} onAction={(action, root) => void rootAction(action, root)} onClose={() => setRootContext(null)} />}
       <TagManagerDialog node={tagNode} onClose={() => setTagNode(null)} onChanged={async () => { const rootId = tagNode?.libraryRootId; await Promise.all([refreshCurrentAndAllResources(), loadRoots(rootId)]); }} />
+      {hiddenNodesOpen && <HiddenNodesDialog roots={roots} refreshKey={allResources} onClose={() => setHiddenNodesOpen(false)} onRestored={async () => { await Promise.all([refreshCurrentAndAllResources(), loadRoots(selectedRootId), loadRecentlyWatched()]); }} />}
       <BatchTagDialog nodeIds={batchTagsOpen ? [...selectedNodeIds] : []} onClose={() => setBatchTagsOpen(false)} onApplied={finishBatchMutation} />
       <FavoriteAssignmentDialog nodeIds={favoriteAssignmentNodeIds} onClose={() => setFavoriteAssignmentNodeIds([])} onApplied={handleFavoriteApplied} onFoldersChanged={loadFavoriteFolders} />
       <FavoriteFolderDialog folder={favoriteFolderDialog} busy={dialogBusy} onClose={() => setFavoriteFolderDialog(null)} onSave={(name) => void saveFavoriteFolder(name)} />

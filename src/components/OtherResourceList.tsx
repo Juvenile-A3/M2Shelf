@@ -1,10 +1,12 @@
 import type { IconName } from "./Icon";
+import { FileModifiedTime } from "./FileModifiedTime";
 import { Icon } from "./Icon";
-import type { MediaNode, ResourceFile } from "../types/media";
-import { compactPath, formatBytes, naturalCompare, resourceTypeLabel } from "../lib/format";
+import type { CollectionSort, MediaNode, ResourceFile } from "../types/media";
+import { compareFileModifiedTimes, compactPath, formatBytes, naturalCompare, resourceTypeLabel } from "../lib/format";
 import { useI18n } from "../lib/i18n";
 
 interface OtherResourceListProps {
+  modifiedSort?: CollectionSort;
   files: ResourceFile[];
   folders: MediaNode[];
   onOpenFile: (file: ResourceFile) => void;
@@ -24,10 +26,10 @@ const resourceIcons: Record<ResourceFile["resourceType"], IconName> = {
   OTHER: "file",
 };
 
-export function OtherResourceList({ files, folders, onOpenFile, onRevealFile, onOpenFolder, onFolderMenu }: OtherResourceListProps) {
+export function OtherResourceList({ modifiedSort, files, folders, onOpenFile, onRevealFile, onOpenFolder, onFolderMenu }: OtherResourceListProps) {
   const { t } = useI18n();
   const sortedFolders = [...folders].sort((a, b) => naturalCompare(a.folderName, b.folderName));
-  const sortedFiles = [...files].sort((a, b) => naturalCompare(a.fileName, b.fileName));
+  const sortedFiles = [...files].sort((a, b) => (modifiedSort ? compareFileModifiedTimes(a.modifiedAt, b.modifiedAt, modifiedSort) : 0) || naturalCompare(a.fileName, b.fileName));
 
   return (
     <div className="other-resource-list">
@@ -55,6 +57,7 @@ export function OtherResourceList({ files, folders, onOpenFile, onRevealFile, on
             <span className="resource-icon"><Icon name={resourceIcons[file.resourceType]} /></span>
             <span className="resource-copy">
               <strong>{file.fileName}</strong>
+              {modifiedSort && <FileModifiedTime value={file.modifiedAt} />}
               <small>{resourceTypeLabel(file.resourceType, file.extension)} · {formatBytes(file.fileSize)}</small>
               <em title={file.absolutePath}>{compactPath(file.absolutePath, 96)}</em>
             </span>

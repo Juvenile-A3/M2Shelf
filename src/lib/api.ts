@@ -61,6 +61,7 @@ const commandErrorKeys = {
   bind_bangumi: "error.bangumiFailed",
   clear_bangumi_binding: "error.bangumiFailed",
   retry_bangumi_cover: "error.coverFailed",
+  sync_pending_bangumi_aliases: "error.bangumiFailed",
   set_container_cover: "error.coverFailed",
   clear_node_cover: "error.coverFailed",
   get_cover_data_url: "error.coverFailed",
@@ -78,6 +79,7 @@ const commandErrorKeys = {
   get_cache_stats: "error.cacheFailed",
   open_cover_cache_directory: "error.cacheFailed",
   clear_cover_cache: "error.cacheFailed",
+  open_bangumi_subject: "error.externalLinkFailed",
   open_external_url: "error.externalLinkFailed",
   list_user_tags: "error.tagsFailed",
   create_or_assign_user_tag: "error.tagsFailed",
@@ -138,16 +140,23 @@ export const api = {
     call<BrowseResult>("browse_library", { rootId, parentNodeId }),
   allResources: () => call<AllResourcesResult>("get_all_resources"),
   listRecentlyWatched: () => call<RecentlyWatchedEntry[]>("list_recently_watched"),
-  nodeDetail: (nodeId: number) => call<NodeDetail>("get_node_detail", { nodeId }),
+  nodeDetail: async (nodeId: number, workView = false) => {
+    const detail = workView
+      ? await call<NodeDetail>("get_work_detail", { nodeId })
+      : await call<NodeDetail>("get_node_detail", { nodeId });
+    if (workView) detail.node.workView = true;
+    return detail;
+  },
   search: (query: string, rootId?: number) =>
     call<SearchHit[]>("search_library", { query, rootId: rootId ?? null }),
-  startScan: (rootId?: number, nodeId?: number) =>
-    call<ScanStarted>("start_scan", { rootId: rootId ?? null, nodeId: nodeId ?? null }),
+  startScan: (rootId?: number, nodeId?: number, background = false) =>
+    call<ScanStarted>("start_scan", { rootId: rootId ?? null, nodeId: nodeId ?? null, background }),
   cancelScan: (scanId: string) => call<boolean>("cancel_scan", { scanId }),
   scanStatus: () => call<ScanProgress | null>("get_scan_status"),
   setNodeType: (nodeId: number, nodeType: "WORK" | "CONTAINER" | "MIXED") =>
     call<MediaNode>("set_node_type", { nodeId, nodeType }),
   ignoreNode: (nodeId: number) => call<MediaNode>("set_node_type", { nodeId, nodeType: "IGNORED" }),
+  listHiddenNodes: () => call<MediaNode[]>("list_hidden_nodes"),
   resetNodeType: (nodeId: number) => call<MediaNode>("reset_node_type", { nodeId }),
   renameNode: (nodeId: number, displayName: string) =>
     call<MediaNode>("set_node_display_name", { nodeId, displayName }),
@@ -157,6 +166,7 @@ export const api = {
     call<BangumiSubject[]>("search_bangumi", { keyword, limit }),
   bindBangumi: (nodeId: number, subject: BangumiSubject) =>
     call<MetadataBinding>("bind_bangumi", { nodeId, subject }),
+  syncPendingBangumiAliases: () => call<boolean>("sync_pending_bangumi_aliases"),
   retryBangumiCover: (nodeId: number) =>
     call<MetadataBinding>("retry_bangumi_cover", { nodeId }),
   clearBangumi: (nodeId: number) => call<MediaNode>("clear_bangumi_binding", { nodeId }),
@@ -184,6 +194,7 @@ export const api = {
   rebuildIndex: () => call<RebuildResult>("rebuild_index"),
   matchExistingContent: (nodeIds: number[] | null = null, rematchExisting = false) =>
     call<ScanStarted>("match_existing_content", { nodeIds, rematchExisting }),
+  openBangumiSubject: (nodeId: number) => call<void>("open_bangumi_subject", { nodeId }),
   openExternalUrl: (url: string) => call<void>("open_external_url", { url }),
   listUserTags: (nodeId: number) =>
     call<UserTagMembership[]>("list_user_tags", { nodeId }),

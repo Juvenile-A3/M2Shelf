@@ -153,6 +153,15 @@ impl Database {
                 10_i64,
                 include_str!("../migrations/0010_confirmed_title_aliases.sql"),
             ),
+            (
+                11_i64,
+                include_str!("../migrations/0011_incremental_scan.sql"),
+            ),
+            (
+                12_i64,
+                include_str!("../migrations/0012_provider_aliases.sql"),
+            ),
+            (13_i64, include_str!("../migrations/0013_alias_sync.sql")),
         ];
         for (version, sql) in migrations {
             let applied = connection
@@ -353,6 +362,26 @@ impl Database {
         get_node_conn(&connection, node_id)
     }
 
+    /// Explicitly ignored entries at every depth, including independently ignored children.
+    /// Read the index even when the source drive is disconnected.
+    pub fn list_hidden_nodes(&self) -> AppResult<Vec<MediaNode>> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(&format!("{} WHERE n.node_type = 'IGNORED'", node_select()))
+            .map_err(db_error)?;
+        let mut nodes = statement
+            .query_map([], node_from_row)
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        hydrate_nodes_metadata_conn(&connection, &mut nodes)?;
+        nodes.sort_by(|left, right| {
+            natural_cmp(&left.display_name, &right.display_name)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(nodes)
+    }
+
     pub fn list_children(&self, parent_id: i64) -> AppResult<Vec<MediaNode>> {
         let connection = self.connect()?;
         list_nodes_conn(
@@ -432,7 +461,44 @@ impl Database {
         Ok(AllResourcesResult {
             total_count: nodes.len() as i64,
             nodes,
+            works: crate::works::group_works(self.list_work_sources()?),
         })
+    }
+
+    /// Flatten playable nodes at any depth, excluding ignored subtrees. The hidden root is
+    /// included only when it directly owns videos (loose videos at a folder-mode root).
+    pub fn list_work_sources(&self) -> AppResult<Vec<MediaNode>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(&format!(
+            "WITH RECURSIVE visible(id) AS (
+                SELECT id FROM nodes WHERE parent_node_id IS NULL AND node_type <> 'IGNORED'
+                UNION ALL SELECT child.id FROM nodes child JOIN visible ON child.parent_node_id=visible.id
+                WHERE child.node_type <> 'IGNORED'
+             ) {} WHERE n.id IN (SELECT id FROM visible)
+             AND (n.direct_video_count > 0 OR (n.node_type IN ('WORK','AUTO_WORK') AND n.total_video_count > 0))",
+            node_select()
+        )).map_err(db_error)?;
+        let mut nodes = statement
+            .query_map([], node_from_row)
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        hydrate_nodes_metadata_conn(&connection, &mut nodes)?;
+        let direct_counts: HashMap<i64, i64> = nodes
+            .iter()
+            .map(|node| (node.id, node.direct_video_count))
+            .collect();
+        nodes.retain(|node| {
+            node.binding.is_some()
+                || !crate::scanner::is_automatic_supplementary_child(
+                    &node.folder_name,
+                    node.manual_type_override,
+                    node.parent_node_id
+                        .and_then(|id| direct_counts.get(&id).copied())
+                        .unwrap_or(0),
+                )
+        });
+        Ok(nodes)
     }
 
     /// Records a successfully launched video against its owning Node. Repeated playback keeps
@@ -563,7 +629,8 @@ impl Database {
                                      OR b.provider_title_cn LIKE ?1 ESCAPE '\\'
                                      OR b.provider_title_en LIKE ?1 ESCAPE '\\'
                                      OR b.provider_title_ja LIKE ?1 ESCAPE '\\'
-                                     OR b.provider_title_ko LIKE ?1 ESCAPE '\\')
+                                     OR b.provider_title_ko LIKE ?1 ESCAPE '\\'
+                                     OR EXISTS (SELECT 1 FROM json_each(b.provider_aliases_json) alias WHERE alias.value LIKE ?1 ESCAPE '\\'))
                           ))
                      LIMIT 200",
                     node_select()
@@ -1331,9 +1398,57 @@ impl Database {
         get_binding_conn(&connection, node_id)
     }
 
-    /// Refreshes metadata only while the Node still has the same Subject binding. This is used
-    /// after optional detail requests so a late retry response cannot overwrite a newer user
-    /// choice or recreate a cleared binding.
+    pub fn pending_alias_subjects(&self) -> AppResult<Vec<crate::models::BangumiSubject>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare("SELECT MIN(b.node_id) FROM metadata_bindings b
+            WHERE b.provider='BANGUMI' AND b.provider_subject_type IN (2,6)
+            AND NOT EXISTS(SELECT 1 FROM provider_alias_sync s WHERE s.subject_id=b.provider_subject_id AND s.subject_type=b.provider_subject_type)
+            GROUP BY b.provider_subject_id,b.provider_subject_type ORDER BY MIN(b.node_id)").map_err(db_error)?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        ids.into_iter()
+            .filter_map(|id| get_binding_conn(&connection, id).transpose())
+            .map(|binding| {
+                let b = binding?;
+                Ok(crate::models::BangumiSubject {
+                    subject_id: b.provider_subject_id,
+                    subject_type: b.provider_subject_type,
+                    title: b.provider_title,
+                    title_cn: b.provider_title_cn,
+                    title_en: b.provider_title_en,
+                    title_ja: b.provider_title_ja,
+                    title_ko: b.provider_title_ko,
+                    match_aliases: Vec::new(),
+                    date: b.provider_date,
+                    image_url: b.provider_image_url,
+                    summary: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Persist completion with the aliases so empty results are not repeatedly fetched.
+    pub fn complete_provider_alias_sync(
+        &self,
+        subject: &crate::models::BangumiSubject,
+    ) -> AppResult<bool> {
+        let mut connection = self.connect()?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let changed = tx.execute(
+            "UPDATE metadata_bindings SET provider_aliases_json=?1 WHERE provider='BANGUMI' AND provider_subject_id=?2 AND provider_subject_type=?3 AND provider_aliases_json<>?1",
+            params![provider_aliases_json(subject),subject.subject_id,subject.subject_type],
+        ).map_err(db_error)?;
+        tx.execute("INSERT INTO provider_alias_sync(subject_id,subject_type,aliases_json) VALUES(?1,?2,?3) ON CONFLICT(subject_id,subject_type) DO UPDATE SET aliases_json=excluded.aliases_json", params![subject.subject_id,subject.subject_type,provider_aliases_json(subject)]).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(changed > 0)
+    }
+
+    /// A late detail response cannot overwrite a newer Subject choice or recreate a cleared binding.
     pub fn update_binding_if_subject(
         &self,
         node_id: i64,
@@ -1351,6 +1466,7 @@ impl Database {
                     provider_date=?6,
                     provider_image_url=?7,
                     provider_subject_type=?8,
+                    provider_aliases_json=?11,
                     updated_at=CURRENT_TIMESTAMP
                  WHERE node_id=?9 AND provider='BANGUMI' AND provider_subject_id=?10",
                 params![
@@ -1364,6 +1480,7 @@ impl Database {
                     subject.subject_type,
                     node_id,
                     subject.subject_id,
+                    provider_aliases_json(subject),
                 ],
             )
             .map_err(db_error)?;
@@ -1390,9 +1507,9 @@ impl Database {
                     node_id, provider, provider_subject_id, provider_subject_type,
                     provider_title, provider_title_cn,
                     provider_title_en, provider_title_ja, provider_title_ko, provider_date,
-                    provider_image_url, bound_at, updated_at, cover_download_error
+                    provider_image_url, bound_at, updated_at, cover_download_error, provider_aliases_json
                  ) VALUES (?1, 'BANGUMI', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, COALESCE((SELECT aliases_json FROM provider_alias_sync WHERE subject_id=?2 AND subject_type=?3),?11))
                  ON CONFLICT(node_id, provider) DO NOTHING",
                 params![
                     node_id,
@@ -1404,7 +1521,8 @@ impl Database {
                     subject.title_ja,
                     subject.title_ko,
                     subject.date,
-                    subject.image_url
+                    subject.image_url,
+                    provider_aliases_json(subject)
                 ],
             )
             .map_err(db_error)?;
@@ -1563,9 +1681,9 @@ impl Database {
                     node_id, provider, provider_subject_id, provider_subject_type,
                     provider_title, provider_title_cn,
                     provider_title_en, provider_title_ja, provider_title_ko, provider_date,
-                    provider_image_url, bound_at, updated_at, cover_download_error
+                    provider_image_url, bound_at, updated_at, cover_download_error, provider_aliases_json
                  ) VALUES (?1, 'BANGUMI', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, COALESCE((SELECT aliases_json FROM provider_alias_sync WHERE subject_id=?2 AND subject_type=?3),?11))
                  ON CONFLICT(node_id, provider) DO UPDATE SET
                     provider_subject_id=excluded.provider_subject_id,
                     provider_subject_type=excluded.provider_subject_type,
@@ -1576,6 +1694,7 @@ impl Database {
                     provider_title_ko=excluded.provider_title_ko,
                     provider_date=excluded.provider_date,
                     provider_image_url=excluded.provider_image_url,
+                    provider_aliases_json=excluded.provider_aliases_json,
                     cover_download_error=NULL,
                     updated_at=CURRENT_TIMESTAMP",
                 params![
@@ -1588,7 +1707,8 @@ impl Database {
                     subject.title_ja,
                     subject.title_ko,
                     subject.date,
-                    subject.image_url
+                    subject.image_url,
+                    provider_aliases_json(subject)
                 ],
             )
             .map_err(db_error)?;
@@ -1871,6 +1991,10 @@ impl Database {
                 .get("auto_check_updates")
                 .map(|value| value != "false")
                 .unwrap_or(true),
+            auto_scan_on_startup: values
+                .get("auto_scan_on_startup")
+                .map(|value| value != "false")
+                .unwrap_or(true),
         })
     }
 
@@ -2011,6 +2135,10 @@ impl Database {
                 "auto_check_updates",
                 settings.auto_check_updates.to_string(),
             ),
+            (
+                "auto_scan_on_startup",
+                settings.auto_scan_on_startup.to_string(),
+            ),
         ];
         for (key, value) in values {
             transaction
@@ -2126,6 +2254,7 @@ fn get_node_conn(connection: &Connection, node_id: i64) -> AppResult<MediaNode> 
         .ok_or_else(|| "目录节点不存在。".to_string())?;
     node.binding = get_binding_conn(connection, node.id)?;
     node.user_tags = list_node_tags_conn(connection, node.id)?;
+    hydrate_file_modified_times_conn(connection, std::slice::from_mut(&mut node))?;
     Ok(node)
 }
 
@@ -2206,6 +2335,8 @@ fn filter_missing_bound_cover_candidates(nodes: Vec<MediaNode>) -> Vec<MediaNode
 
 fn node_from_row(row: &Row<'_>) -> rusqlite::Result<MediaNode> {
     Ok(MediaNode {
+        latest_file_modified_at: None,
+        last_watched_at: None,
         id: row.get(0)?,
         library_root_id: row.get(1)?,
         parent_node_id: row.get(2)?,
@@ -2225,6 +2356,53 @@ fn node_from_row(row: &Row<'_>) -> rusqlite::Result<MediaNode> {
         binding: None,
         user_tags: Vec::new(),
     })
+}
+
+/// Use indexed source timestamps, never Node.updated_at (which also changes on metadata edits).
+/// Traverse relationships in bounded batches; hidden descendants do not affect visible parents.
+fn hydrate_file_modified_times_conn(
+    connection: &Connection,
+    nodes: &mut [MediaNode],
+) -> AppResult<()> {
+    for chunk in nodes.chunks_mut(NODE_METADATA_CHUNK_SIZE) {
+        let sql = format!(
+            "WITH RECURSIVE subtree(owner,id) AS (
+                SELECT id,id FROM nodes WHERE id IN ({})
+                UNION
+                SELECT s.owner,n.id FROM subtree s JOIN nodes n ON n.parent_node_id=s.id
+                WHERE n.node_type<>'IGNORED'
+             ), times(owner,modified,watched) AS (
+                SELECT s.owner,julianday(f.modified_at),NULL FROM subtree s JOIN media_files f ON f.node_id=s.id
+                UNION ALL
+                SELECT s.owner,julianday(f.modified_at),NULL FROM subtree s JOIN resource_files f ON f.node_id=s.id
+                UNION ALL
+                SELECT s.owner,NULL,julianday(w.last_watched_at) FROM subtree s JOIN watch_history w ON w.node_id=s.id
+             ) SELECT owner,strftime('%Y-%m-%dT%H:%M:%fZ',MAX(modified)),strftime('%Y-%m-%dT%H:%M:%fZ',MAX(watched)) FROM times GROUP BY owner",
+            sql_placeholders(chunk.len())
+        );
+        let mut statement = connection.prepare(&sql).map_err(db_error)?;
+        let times = statement
+            .query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|node| node.id)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        (
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ),
+                    ))
+                },
+            )
+            .map_err(db_error)?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(db_error)?;
+        for node in chunk {
+            node.last_watched_at = times.get(&node.id).and_then(|time| time.1.clone());
+            node.latest_file_modified_at = times.get(&node.id).and_then(|time| time.0.clone());
+        }
+    }
+    Ok(())
 }
 
 fn list_nodes_conn(
@@ -2275,6 +2453,7 @@ fn hydrate_nodes_metadata_conn(connection: &Connection, nodes: &mut [MediaNode])
     if nodes.is_empty() {
         return Ok(());
     }
+    hydrate_file_modified_times_conn(connection, nodes)?;
     for node in nodes.iter_mut() {
         node.binding = None;
         node.user_tags.clear();
@@ -2294,7 +2473,7 @@ fn hydrate_nodes_metadata_conn(connection: &Connection, nodes: &mut [MediaNode])
              b.provider_title_en,b.provider_title_ja,b.provider_title_ko,
              b.provider_date,b.provider_image_url,b.bound_at,b.updated_at,
              CASE WHEN n.cover_source='BANGUMI' THEN n.cover_cache_path ELSE NULL END,
-             b.cover_download_error
+             b.cover_download_error,b.provider_aliases_json
              FROM metadata_bindings b JOIN nodes n ON n.id=b.node_id
              WHERE b.provider='BANGUMI' AND b.node_id IN ({placeholders})"
         );
@@ -2588,7 +2767,7 @@ fn get_binding_conn(connection: &Connection, node_id: i64) -> AppResult<Option<M
              b.provider_title_en,b.provider_title_ja,b.provider_title_ko,
              b.provider_date,b.provider_image_url,b.bound_at,b.updated_at,
              CASE WHEN n.cover_source='BANGUMI' THEN n.cover_cache_path ELSE NULL END
-             ,b.cover_download_error
+             ,b.cover_download_error,b.provider_aliases_json
              FROM metadata_bindings b JOIN nodes n ON n.id=b.node_id
              WHERE b.node_id=?1 AND b.provider='BANGUMI'",
             [node_id],
@@ -2616,7 +2795,25 @@ fn binding_from_row(row: &Row<'_>) -> rusqlite::Result<MetadataBinding> {
         updated_at: row.get(13)?,
         cover_cache_path: row.get(14)?,
         cover_download_error: row.get(15)?,
+        provider_aliases: serde_json::from_str(&row.get::<_, String>(16)?).unwrap_or_default(),
     })
+}
+
+// Keep provider text bounded even when a Subject arrives through a manual IPC call.
+fn provider_aliases_json(subject: &crate::models::BangumiSubject) -> String {
+    let mut aliases = Vec::new();
+    for alias in subject.match_aliases.iter().take(32) {
+        let clean: String = alias
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(256)
+            .collect();
+        let clean = clean.trim().to_string();
+        if !clean.is_empty() && !aliases.contains(&clean) {
+            aliases.push(clean);
+        }
+    }
+    serde_json::to_string(&aliases).unwrap_or_else(|_| "[]".into())
 }
 
 fn escape_like(value: &str) -> String {
@@ -3089,7 +3286,12 @@ mod tests {
         drop(connection);
 
         for root_filter in [None, Some(first_root.id), Some(second_root.id)] {
-            let expected = legacy_search_reference(&database, query, root_filter);
+            let mut expected = legacy_search_reference(&database, query, root_filter);
+            // Every fixture Node owns a video with this timestamp. The legacy reader predates
+            // this additive DTO field; retain comparison of every old field and the new value.
+            for hit in &mut expected {
+                hit.node.latest_file_modified_at = Some("2026-08-24T00:00:00.000Z".into());
+            }
             let actual = database.search(query, root_filter).unwrap();
             assert_eq!(
                 serde_json::to_value(&actual).unwrap(),
@@ -3280,6 +3482,217 @@ mod tests {
     }
 
     #[test]
+    fn provider_aliases_persist_and_search_across_roots_without_rebinding() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::new(temp.path().join("aliases.db"));
+        database.migrate().unwrap();
+        let mut roots = Vec::new();
+        for name in ["Anime", "Watching"] {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            roots.push(database.add_root(&path, None).unwrap());
+        }
+        let connection = database.connect().unwrap();
+        for (id, root) in [(1, &roots[0]), (2, &roots[1]), (3, &roots[1])] {
+            connection.execute("INSERT INTO nodes(id,library_root_id,absolute_path,folder_name,display_name,node_type) VALUES(?1,?2,?3,'Folder','Folder','WORK')", params![id,root.id,format!("fixture-{id}")]).unwrap();
+        }
+        let mut subject = test_bangumi_subject(174584, 2, "フリップフラッパーズ");
+        subject.title_cn = Some("轻拍翻转小魔女".into());
+        subject.match_aliases = vec![
+            "Flip Flappers".into(),
+            "Flip Flappers".into(),
+            "  フリフラ  ".into(),
+            "100%_literal".into(),
+        ];
+        database.save_confirmed_binding(2, &subject).unwrap();
+        database.save_binding_if_absent(3, &subject).unwrap();
+        for query in ["轻拍", "flip", "フリフラ", "100%_"] {
+            let hits = database.search(query, None).unwrap();
+            assert_eq!(
+                hits.iter().map(|h| h.node.id).collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert!(database
+                .search(query, Some(roots[0].id))
+                .unwrap()
+                .is_empty());
+            assert_eq!(database.search(query, Some(roots[1].id)).unwrap().len(), 2);
+        }
+        assert!(database.search("100%X", None).unwrap().is_empty());
+        assert_eq!(
+            database
+                .get_node(2)
+                .unwrap()
+                .binding
+                .unwrap()
+                .provider_aliases
+                .len(),
+            3
+        );
+        // Sync updates every still-matching source, preserving a different binding chosen meanwhile.
+        database
+            .save_confirmed_binding(3, &test_bangumi_subject(99, 2, "Other"))
+            .unwrap();
+        subject.match_aliases = vec!["New official alias".into()];
+        database.complete_provider_alias_sync(&subject).unwrap();
+        assert_eq!(database.search("New official", None).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .get_binding(3)
+                .unwrap()
+                .unwrap()
+                .provider_subject_id,
+            99
+        );
+        assert!(database.search("flip", None).unwrap().is_empty());
+        subject.match_aliases = vec!["Updated detail alias".into()];
+        database.update_binding_if_subject(2, &subject).unwrap();
+        assert_eq!(database.search("Updated detail", None).unwrap().len(), 1);
+        database.migrate().unwrap();
+        assert_eq!(
+            database.get_binding(2).unwrap().unwrap().provider_aliases,
+            subject.match_aliases
+        );
+    }
+
+    #[test]
+    fn file_update_times_aggregate_visible_sources_and_ignore_index_edits() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("library");
+        fs::create_dir(&root_path).unwrap();
+        let database = Database::new(temp.path().join("times.db"));
+        database.migrate().unwrap();
+        let root = database.add_root(&root_path, None).unwrap();
+        let connection = database.connect().unwrap();
+        for (id, parent, name, kind) in [
+            (1, None, "root", "CONTAINER"),
+            (2, Some(1), "Show - 01.mkv", "WORK"),
+            (3, Some(1), "Show - 02.mkv", "WORK"),
+            (4, Some(2), "hidden", "IGNORED"),
+            (5, Some(1), "empty", "MIXED"),
+        ] {
+            connection.execute("INSERT INTO nodes(id,library_root_id,parent_node_id,absolute_path,folder_name,display_name,node_type) VALUES(?1,?2,?3,?4,?5,?5,?6)",
+                params![id,root.id,parent,root_path.join(name).to_string_lossy(),name.trim_end_matches(".mkv"),kind]).unwrap();
+        }
+        for (node_id, date) in [
+            (2, "2026-09-01T10:00:00+08:00"),
+            (3, "2026-09-02T01:00:00Z"),
+            (4, "2099-01-01T00:00:00Z"),
+        ] {
+            connection.execute("INSERT INTO media_files(node_id,absolute_path,file_name,extension,file_size,modified_at) VALUES(?1,?2,'episode.mkv','mkv',1,?3)",
+                params![node_id,format!("fixture-{node_id}.mkv"),date]).unwrap();
+        }
+        connection.execute("INSERT INTO resource_files(node_id,absolute_path,file_name,extension,file_size,modified_at) VALUES(2,'fixture.ass','subtitles.ass','ass',1,'2026-09-03T00:00:00Z')",[]).unwrap();
+        assert_eq!(
+            database
+                .get_node(1)
+                .unwrap()
+                .latest_file_modified_at
+                .as_deref(),
+            Some("2026-09-03T00:00:00.000Z")
+        );
+        assert_eq!(database.get_node(5).unwrap().latest_file_modified_at, None);
+        assert_eq!(database.get_node(5).unwrap().last_watched_at, None);
+        for (id, time) in [
+            (2, "2026-09-01T12:00:00+08:00"),
+            (3, "2026-09-01T05:00:00Z"),
+            (4, "2099-01-01T00:00:00Z"),
+        ] {
+            connection.execute("INSERT INTO watch_history(node_id,last_watched_at,watch_count) VALUES(?1,?2,1)", params![id,time]).unwrap();
+        }
+        assert_eq!(
+            database.get_node(1).unwrap().last_watched_at.as_deref(),
+            Some("2026-09-01T05:00:00.000Z")
+        );
+        let nodes = database.list_children(1).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|n| n.id == 2)
+                .unwrap()
+                .latest_file_modified_at
+                .as_deref(),
+            Some("2026-09-03T00:00:00.000Z")
+        );
+        let groups = crate::works::group_works(
+            nodes
+                .into_iter()
+                .filter(|n| n.node_type.is_work())
+                .collect(),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].node.last_watched_at.as_deref(),
+            Some("2026-09-01T05:00:00.000Z")
+        );
+        assert_eq!(
+            groups[0].node.latest_file_modified_at.as_deref(),
+            Some("2026-09-03T00:00:00.000Z")
+        );
+        connection
+            .execute(
+                "UPDATE nodes SET display_name='edited title',updated_at='2100-01-01' WHERE id=2",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .get_node(2)
+                .unwrap()
+                .latest_file_modified_at
+                .as_deref(),
+            Some("2026-09-03T00:00:00.000Z")
+        );
+        connection
+            .execute("DELETE FROM resource_files WHERE node_id=2", [])
+            .unwrap();
+        assert_eq!(
+            database
+                .get_node(2)
+                .unwrap()
+                .latest_file_modified_at
+                .as_deref(),
+            Some("2026-09-01T02:00:00.000Z")
+        );
+        assert_eq!(
+            database
+                .get_node(1)
+                .unwrap()
+                .latest_file_modified_at
+                .as_deref(),
+            Some("2026-09-02T01:00:00.000Z")
+        );
+        for (scope, sort) in [
+            (CollectionSortScope::All, CollectionSort::ModifiedDesc),
+            (CollectionSortScope::Browse, CollectionSort::ModifiedAsc),
+            (CollectionSortScope::Favorites, CollectionSort::ModifiedDesc),
+        ] {
+            database
+                .update_collection_sort_preference(scope, sort)
+                .unwrap();
+        }
+        let preferences = database.get_collection_sort_preferences().unwrap();
+        assert_eq!(preferences.all, CollectionSort::ModifiedDesc);
+        assert_eq!(preferences.browse, CollectionSort::ModifiedAsc);
+        assert_eq!(preferences.favorites, CollectionSort::ModifiedDesc);
+        database
+            .update_collection_sort_preference(
+                CollectionSortScope::All,
+                CollectionSort::WatchedDesc,
+            )
+            .unwrap();
+        database
+            .update_collection_sort_preference(
+                CollectionSortScope::Browse,
+                CollectionSort::WatchedAsc,
+            )
+            .unwrap();
+        let preferences = database.get_collection_sort_preferences().unwrap();
+        assert_eq!(preferences.all, CollectionSort::WatchedDesc);
+        assert_eq!(preferences.browse, CollectionSort::WatchedAsc);
+    }
+
+    #[test]
     fn library_roots_reject_equal_ancestor_and_descendant_paths() {
         let temp = TempDir::new().unwrap();
         let registered = temp.path().join("Library");
@@ -3422,7 +3835,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(versions, 10);
+        assert_eq!(versions, 13);
+        connection
+            .prepare("SELECT library_root_id,snapshot_json FROM library_scan_snapshots")
+            .unwrap();
         let recognition_mode: String = connection
             .query_row(
                 "SELECT recognition_mode FROM library_roots WHERE id=1",
@@ -4183,6 +4599,82 @@ mod tests {
             .iter()
             .all(|tag| tag.id != renamed.id));
         assert!(reopened.delete_user_tag(renamed.id).is_err());
+    }
+
+    #[test]
+    fn hidden_entries_include_nested_and_resource_only_nodes_and_restore_preserves_metadata() {
+        let temp = TempDir::new().unwrap();
+        let root_path = temp.path().join("library");
+        let work_path = root_path.join("作品");
+        fs::create_dir_all(&work_path).unwrap();
+        let sentinel = work_path.join("01.mkv");
+        fs::write(&sentinel, b"source remains read only").unwrap();
+        let database = Database::new(temp.path().join("hidden.db"));
+        database.migrate().unwrap();
+        let root = database.add_root(&root_path, None).unwrap();
+        let connection = database.connect().unwrap();
+        let insert = |parent: Option<i64>, path: &Path, name: &str| {
+            connection.execute(
+                "INSERT INTO nodes(library_root_id,parent_node_id,absolute_path,folder_name,display_name,node_type)
+                 VALUES(?1,?2,?3,?4,?4,'CONTAINER')",
+                params![root.id, parent, path.to_string_lossy(), name],
+            ).unwrap();
+            connection.last_insert_rowid()
+        };
+        let root_id = insert(None, &root_path, "library");
+        let work_id = insert(Some(root_id), &work_path, "自定义名称");
+        let child_id = insert(Some(work_id), &work_path.join("Extras"), "Hidden resources");
+        let visible_id = insert(Some(work_id), &work_path.join("Other"), "Visible child");
+        connection.execute(
+            "INSERT INTO media_files(node_id,absolute_path,file_name,extension,file_size,modified_at)
+             VALUES(?1,?2,'01.mkv','mkv',24,'2026-01-01')",
+            params![work_id, sentinel.to_string_lossy()],
+        ).unwrap();
+        drop(connection);
+        database.reset_node_type(work_id).unwrap();
+        database
+            .save_confirmed_binding(work_id, &test_bangumi_subject(42, 2, "Bound Work"))
+            .unwrap();
+        let tag = database
+            .create_or_assign_user_tag(work_id, "Keep tag")
+            .unwrap();
+        let favorite = database.create_favorite_folder("Keep favorite").unwrap();
+        database
+            .batch_add_nodes_to_favorite(favorite.id, &[work_id])
+            .unwrap();
+        database.set_node_type(work_id, NodeType::Ignored).unwrap();
+        database.set_node_type(child_id, NodeType::Ignored).unwrap();
+        let hidden = database.list_hidden_nodes().unwrap();
+        assert_eq!(hidden.len(), 2);
+        assert!(hidden
+            .iter()
+            .any(|node| node.id == child_id && node.total_video_count == 0));
+        assert!(!hidden
+            .iter()
+            .any(|node| node.id == root_id || node.id == visible_id));
+        let before = hidden.iter().find(|node| node.id == work_id).unwrap();
+        assert_eq!(before.binding.as_ref().unwrap().provider_subject_id, 42);
+        assert_eq!(before.user_tags[0].id, tag.id);
+        let restored = database.reset_node_type(work_id).unwrap();
+        assert_eq!(restored.node_type, NodeType::AutoWork);
+        assert!(!restored.manual_type_override);
+        assert_eq!(restored.display_name, before.display_name);
+        assert_eq!(restored.cover_cache_path, before.cover_cache_path);
+        assert_eq!(restored.binding.as_ref().unwrap().provider_subject_id, 42);
+        assert_eq!(restored.user_tags[0].id, tag.id);
+        assert_eq!(
+            database.list_favorite_folder_nodes(favorite.id).unwrap()[0].id,
+            work_id
+        );
+        assert_eq!(database.list_children(root_id).unwrap()[0].id, work_id);
+        assert_eq!(database.list_hidden_nodes().unwrap()[0].id, child_id);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"source remains read only");
+
+        // The application index remains usable when a drive disappears.
+        fs::rename(&root_path, temp.path().join("offline-library")).unwrap();
+        assert_eq!(database.list_hidden_nodes().unwrap()[0].id, child_id);
+        database.reset_node_type(child_id).unwrap();
+        assert!(database.list_hidden_nodes().unwrap().is_empty());
     }
 
     #[test]
@@ -4990,6 +5482,7 @@ mod tests {
         let defaults = database.get_settings(&default_cache).unwrap();
         assert_eq!(defaults.language, "zh-CN");
         assert_eq!(defaults.theme, "system");
+        assert!(defaults.auto_scan_on_startup);
         assert_eq!(
             defaults.cover_cache_directory,
             default_cache.to_string_lossy()
@@ -5004,6 +5497,7 @@ mod tests {
             language: "ja-JP".into(),
             theme: "dark".into(),
             auto_check_updates: false,
+            auto_scan_on_startup: false,
         };
         database.update_settings(&updated, &default_cache).unwrap();
         let reopened = Database::new(database_path)
@@ -5012,6 +5506,7 @@ mod tests {
         assert_eq!(reopened.language, "ja-JP");
         assert_eq!(reopened.theme, "dark");
         assert!(!reopened.auto_check_updates);
+        assert!(!reopened.auto_scan_on_startup);
         assert_eq!(
             reopened.cover_cache_directory,
             custom_cache.to_string_lossy()

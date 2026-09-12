@@ -1,6 +1,7 @@
 param(
   [ValidateSet("none", "nsis")]
-  [string]$Bundles = "nsis"
+  [string]$Bundles = "nsis",
+  [string]$TargetDirectory
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,6 +110,17 @@ function Assert-PlainDestinationOrMissing {
 }
 
 $previousEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$previousTargetDirectory = $env:CARGO_TARGET_DIR
+$buildTargetDirectory = if (-not [string]::IsNullOrWhiteSpace($TargetDirectory)) {
+  if ([System.IO.Path]::IsPathRooted($TargetDirectory)) { [System.IO.Path]::GetFullPath($TargetDirectory) }
+  else { [System.IO.Path]::GetFullPath((Join-Path $repoRoot $TargetDirectory)) }
+} elseif (-not [string]::IsNullOrWhiteSpace($previousTargetDirectory)) {
+  if ([System.IO.Path]::IsPathRooted($previousTargetDirectory)) { [System.IO.Path]::GetFullPath($previousTargetDirectory) }
+  else { [System.IO.Path]::GetFullPath((Join-Path $repoRoot $previousTargetDirectory)) }
+} else {
+  Join-Path $repoRoot "src-tauri\target"
+}
+$env:CARGO_TARGET_DIR = $buildTargetDirectory
 $encodedRemaps = $remapArguments -join $separator
 $env:CARGO_ENCODED_RUSTFLAGS = if ([string]::IsNullOrWhiteSpace($previousEncodedFlags)) {
   $encodedRemaps
@@ -133,8 +145,8 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "M2ShelfUpdater release build failed with exit code $LASTEXITCODE"
   }
-  $releaseExecutable = Join-Path $repoRoot "src-tauri\target\release\m2shelf.exe"
-  $releaseUpdater = Join-Path $repoRoot "src-tauri\target\release\M2ShelfUpdater.exe"
+  $releaseExecutable = Join-Path $buildTargetDirectory "release\m2shelf.exe"
+  $releaseUpdater = Join-Path $buildTargetDirectory "release\M2ShelfUpdater.exe"
   Assert-PlainFile -Path $releaseExecutable -Label "M2Shelf release executable" | Out-Null
   Assert-PlainFile -Path $releaseUpdater -Label "M2ShelfUpdater release executable" | Out-Null
   Assert-X64Pe -Path $releaseExecutable
@@ -143,7 +155,7 @@ try {
   Assert-NoPrivateBuildPath -Path $releaseUpdater
   if ($Bundles -eq "nsis") {
     $installerName = "${productName}_${version}_x64-setup.exe"
-    $installerPath = Join-Path $repoRoot "src-tauri\target\release\bundle\nsis\$installerName"
+    $installerPath = Join-Path $buildTargetDirectory "release\bundle\nsis\$installerName"
     $installer = Assert-PlainFile -Path $installerPath -Label "x64 NSIS installer"
     if ($installer.VersionInfo.ProductName -cne $productName -or
         $installer.VersionInfo.ProductVersion -cne $version) {
@@ -194,4 +206,5 @@ try {
   } else {
     $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedFlags
   }
+  $env:CARGO_TARGET_DIR = $previousTargetDirectory
 }

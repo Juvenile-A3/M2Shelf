@@ -7,7 +7,7 @@ export type NodeType =
 
 export type CoverSource = "BANGUMI" | "MANUAL" | "PLACEHOLDER";
 export type ViewMode = "grid" | "list";
-export type CollectionSort = "title-asc" | "title-desc" | "added-desc" | "added-asc";
+export type CollectionSort = "title-asc" | "title-desc" | "added-desc" | "added-asc" | "modified-desc" | "modified-asc" | "watched-asc" | "watched-desc";
 export type CollectionSortScope = "all" | "browse" | "favorites";
 export type LibraryRecognitionMode = "FOLDER" | "VIDEO_FILE";
 export interface CollectionSortPreferences {
@@ -43,6 +43,7 @@ export interface LibraryRoot {
 }
 
 export interface MetadataBinding {
+  providerAliases?: string[];
   id?: number;
   nodeId: number;
   provider: "BANGUMI";
@@ -84,6 +85,8 @@ export interface FavoriteFolder {
 }
 
 export interface MediaNode {
+  lastWatchedAt?: string | null;
+  latestFileModifiedAt?: string | null;
   id: number;
   libraryRootId: number;
   parentNodeId: number | null;
@@ -104,6 +107,8 @@ export interface MediaNode {
   userTags: UserTag[];
   /** Frontend-only cache-busting token; never persisted or sent to the media source. */
   clientCoverRevision?: number;
+  /** Presentation-only marker: open a fresh aggregate detail instead of one source node. */
+  workView?: boolean;
 }
 
 export interface MediaFile {
@@ -150,6 +155,7 @@ export interface BrowseResult {
 export interface AllResourcesResult {
   nodes: MediaNode[];
   totalCount: number;
+  works: { node: MediaNode; sources: MediaNode[] }[];
 }
 
 /** A locally recorded playback, ordered newest first by the native API. */
@@ -179,6 +185,8 @@ export interface BangumiSubject {
 }
 
 export interface ScanProgress {
+  background?: boolean;
+  libraryChanged?: boolean | null;
   scanId: string;
   rootId: number;
   currentPath: string;
@@ -209,6 +217,7 @@ export interface AppSettings {
   videoExtensions: string[];
   bangumiSearchEnabled: boolean;
   autoCheckUpdates: boolean;
+  autoScanOnStartup: boolean;
   language: AppLanguage;
   theme: AppTheme;
   coverCacheDirectory: string;
@@ -277,6 +286,7 @@ export interface NodeDetail {
   resourceFiles: ResourceFile[];
   breadcrumbs: BreadcrumbItem[];
   binding: MetadataBinding | null;
+  workSources?: MediaNode[] | null;
 }
 
 export interface PlayerTestResult {

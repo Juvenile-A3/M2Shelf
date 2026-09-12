@@ -71,6 +71,8 @@ M²Shelf 当前不提供内置播放器、在线视频、转码、媒体服务�
 
 ## 开发
 
+本 fork 增加了默认作品视图与“启动时自动更新资源库”设置。作品视图会汇总相同 Bangumi 条目的来源和集数，并可切回文件夹展示；侧栏“已隐藏条目”支持搜索和逐条恢复。源文件仍只读。前端交互测试通过 `npm test` 运行，环境配置和日常命令见 [Windows 本地开发](docs/WINDOWS_DEVELOPMENT.md)。
+
 技术栈：Tauri 2、Rust、React 19、TypeScript、Vite 和 SQLite。
 
 ```powershell
