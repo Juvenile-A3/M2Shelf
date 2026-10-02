@@ -102,4 +102,3 @@ Windows용 공식 결과물은 `scripts/build_windows_release.ps1`로 빌드합�
 ## 제작자
 
 - [森下Undermori · Bilibili](https://space.bilibili.com/2903441)
-- [Undermori · X](https://x.com/f_undermori)

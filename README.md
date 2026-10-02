@@ -102,4 +102,3 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 ## 作者
 
 - [森下Undermori · Bilibili](https://space.bilibili.com/2903441)
-- [Undermori · X](https://x.com/f_undermori)
