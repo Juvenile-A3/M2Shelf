@@ -24,6 +24,8 @@ migration 0014 增加 library_scan_health；逐库结算成功基线与错误，
 
 `.github/workflows/windows-pr.yml` 使用既有固定 Action 版本及 Node22/Python3.12/Rust1.88，在 PR 中执行 npm ci/check、rustfmt、locked tests 和严格 Clippy，不签名或发布。迁移验证摘要从迁移文件清单生成。
 
+Vite 的开发 watcher 排除原生源码、Portable 打包、临时测试、工具及 Playwright 产物，避免 Windows 在创建或删除 EXE 时的文件锁使开发预览退出。前端源码继续正常热更新。
+
 本次验证：35 项前端测试、230 项 Rust 测试和120项项目检查通过；5项既有外部网络测试按原配置忽略。TypeScript、生产前端构建、rustfmt 和 all-targets 严格 Clippy 通过。虚构资源完成四语言、深浅主题及1280×800/900×640共16组详情和关于页面布局检查；扫描健康与来源选择界面另行核对。真实生成的 Unicode/特殊字符测试视频通过原生播放器启动及精确 Explorer 选择，后者补齐线程 COM 初始化，并用回归测试验证初始化引用平衡。
 
 ## 当前状态
