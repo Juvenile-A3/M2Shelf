@@ -102,7 +102,6 @@ Windows 向けの正式な成果物は `scripts/build_windows_release.ps1` で�
 ## 作者
 
 - [森下Undermori · Bilibili](https://space.bilibili.com/2903441)
-- [Undermori · X](https://x.com/f_undermori)
 
 ## 作品ライブラリと起動時更新
 

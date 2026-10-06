@@ -102,7 +102,6 @@ Official Windows artifacts are built with `scripts/build_windows_release.ps1`.
 ## Author
 
 - [森下Undermori · Bilibili](https://space.bilibili.com/2903441)
-- [Undermori · X](https://x.com/f_undermori)
 
 ## Work catalogue and startup refresh
 
