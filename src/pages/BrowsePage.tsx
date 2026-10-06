@@ -30,7 +30,7 @@ interface BrowsePageProps {
   onOpenNode: (node: MediaNode) => void;
   onMenu: (event: React.MouseEvent, node: MediaNode) => void;
   onBangumi: (node: MediaNode) => void;
-  onRetryCover: (node: MediaNode) => void;
+  onRetryCover: (node: MediaNode, imageDecodeFailed?: boolean) => void;
   onPlay: (file: MediaFile) => void;
   onRevealMedia: (file: MediaFile) => void;
   onOpenResource: (file: ResourceFile) => void;

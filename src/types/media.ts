@@ -31,7 +31,17 @@ export type ResourceType =
   | "PLAYLIST"
   | "OTHER";
 
+export interface ScanHealth {
+  lastAutoAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  outcome: "SUCCESS" | "PARTIAL" | "FAILED" | "CANCELLED";
+  errorCount: number;
+  detail: string | null;
+}
+export interface WorkTarget { sourceNodeIds: number[]; snapshot: string; }
+export interface NestedMediaFile { file: MediaFile; sourceNodeId: number; sourceName: string; relativeDirectory: string; }
 export interface LibraryRoot {
+  scanHealth?: ScanHealth | null;
   id: number;
   path: string;
   displayName: string;
@@ -85,6 +95,7 @@ export interface FavoriteFolder {
 }
 
 export interface MediaNode {
+  workTarget?: WorkTarget;
   lastWatchedAt?: string | null;
   latestFileModifiedAt?: string | null;
   id: number;
@@ -155,7 +166,8 @@ export interface BrowseResult {
 export interface AllResourcesResult {
   nodes: MediaNode[];
   totalCount: number;
-  works: { node: MediaNode; sources: MediaNode[] }[];
+  works: { node: MediaNode; sources: MediaNode[]; target?: WorkTarget }[];
+  recognitionWarnings?: MediaNode[];
 }
 
 /** A locally recorded playback, ordered newest first by the native API. */
@@ -280,6 +292,10 @@ export interface ScanStarted {
 }
 
 export interface NodeDetail {
+  workTarget?: WorkTarget | null;
+  nestedMediaFiles?: NestedMediaFile[];
+  expandedFolderIds?: number[];
+  recognitionWarnings?: MediaNode[];
   node: MediaNode;
   children: MediaNode[];
   mediaFiles: MediaFile[];

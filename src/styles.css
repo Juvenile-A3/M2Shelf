@@ -1554,6 +1554,19 @@ button.favorites-location:hover { color: var(--text-strong); }
 
 .binding-subject-link { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 0; border: 0; background: transparent; color: var(--text-normal); text-align: start; cursor: pointer; }
 .binding-subject-link strong { min-width: 0; overflow-wrap: anywhere; }
-.binding-subject-link > svg { flex-shrink: 0; width: 14px; height: 14px; color: var(--accent); }
+.binding-subject-link > svg { flex-shrink: 0; width: 14px; height: 14px; color: var(--accent-strong); }
 .binding-subject-link:hover strong { text-decoration: underline; text-underline-offset: 3px; }
-.binding-subject-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 3px; }
+.binding-subject-link:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 4px; border-radius: 3px; }
+
+.root-entry { display: flex; align-items: center; min-width: 0; }
+.root-entry .root-item { flex: 1; min-width: 0; }
+.root-scan-warning { flex: 0 0 28px; border: 0; background: transparent; color: var(--accent-strong); padding: 4px; cursor: pointer; }
+.library-scan-health { display: grid; gap: 4px; margin-top: 7px; }
+.library-scan-health.has-warning { color: var(--accent-strong); }
+.source-choice-list { display: grid; gap: 8px; max-height: 50vh; overflow-y: auto; margin: 16px 0; }
+.source-choice-row { justify-content: flex-start; text-align: left; width: 100%; }
+.source-choice-row span { min-width: 0; overflow-wrap: anywhere; }
+.source-choice-row small { display: block; font-weight: normal; }
+.file-origin { color: var(--accent-strong); }
+
+.library-scan-health details p { overflow-wrap: anywhere; max-width: 100%; font-size: 11px; }

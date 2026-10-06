@@ -19,7 +19,7 @@ use crate::{
         MediaFile, MediaNode, MetadataBinding, NodeDetail, NodeType, PlayerTestResult,
         RebuildResult, RecentlyWatchedEntry, ScanPhase, ScanProgress, ScanStarted, ScanStatus,
         SearchHit, UpdateCheckResult, UpdateDistribution, UpdateDownloadStatus, UserTag,
-        UserTagMembership,
+        UserTagMembership, WorkTarget,
     },
     player,
     scanner::{self, ScanControl, ScanTarget},
@@ -470,13 +470,7 @@ pub fn browse_library(
 ) -> AppResult<BrowseResult> {
     let root = state.database.get_root(root_id)?;
     let parent_id = match parent_node_id {
-        Some(id) => {
-            let node = state.database.get_node(id)?;
-            if node.library_root_id != root_id {
-                return Err("目录节点不属于该资源库。".into());
-            }
-            id
-        }
+        Some(id) => id,
         None => match state.database.hidden_root_node_id(&root)? {
             Some(id) => id,
             None => {
@@ -490,28 +484,24 @@ pub fn browse_library(
             }
         },
     };
-    Ok(BrowseResult {
-        root,
-        breadcrumbs: state.database.breadcrumbs(parent_id, true)?,
-        nodes: state.database.list_children(parent_id)?,
-        media_files: state.database.list_media(parent_id)?,
-        resource_files: state.database.list_resources(parent_id)?,
+    state.database.read_snapshot(|connection| {
+        crate::db::ensure_node_visible_conn(connection, parent_id)?;
+        if crate::db::get_node_conn(connection, parent_id)?.library_root_id != root_id {
+            return Err("目录节点不属于该资源库。".into());
+        }
+        Ok(BrowseResult {
+            root,
+            breadcrumbs: crate::db::breadcrumbs_conn(connection, parent_id, true)?,
+            nodes: crate::db::list_children_conn(connection, parent_id)?,
+            media_files: crate::db::list_media_conn(connection, parent_id)?,
+            resource_files: crate::db::list_resources_conn(connection, parent_id)?,
+        })
     })
 }
 
 #[tauri::command]
 pub fn get_node_detail(node_id: i64, state: State<'_, AppState>) -> AppResult<NodeDetail> {
-    let node = state.database.get_node(node_id)?;
-    let binding = state.database.get_binding(node_id)?;
-    Ok(NodeDetail {
-        node,
-        children: state.database.list_children(node_id)?,
-        media_files: state.database.list_media(node_id)?,
-        resource_files: state.database.list_resources(node_id)?,
-        breadcrumbs: state.database.breadcrumbs(node_id, true)?,
-        binding,
-        work_sources: None,
-    })
+    crate::works::node_detail(&state.database, node_id)
 }
 
 #[tauri::command]
@@ -884,6 +874,181 @@ pub async fn bind_bangumi(
     })
     .await
     .map_err(|error| format!("封面下载任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn bind_work_bangumi(
+    target: WorkTarget,
+    subject: BangumiSubject,
+    state: State<'_, AppState>,
+) -> AppResult<MetadataBinding> {
+    validate_bindable_bangumi_subject(&subject)?;
+    state.database.validate_work_target(&target)?;
+    let fallback = subject.clone();
+    let enriched = tauri::async_runtime::spawn_blocking(move || bangumi::enrich_subject(&subject))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let subject = enriched.clone().unwrap_or(fallback);
+    let changed = state
+        .database
+        .change_work_binding(&target, Some(&subject))?;
+    if let Some(detail) = enriched {
+        state.database.complete_provider_alias_sync(&detail)?;
+    }
+    let database = state.database.clone();
+    let cache_root = active_cover_cache_directory(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        refresh_work_cover(
+            &database,
+            cache_root,
+            changed.cover_target,
+            &subject,
+            changed.previous_paths,
+            false,
+            Vec::new(),
+        )
+    })
+    .await
+    .map_err(|error| format!("封面下载任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn retry_work_bangumi_cover(
+    target: WorkTarget,
+    failed_source_node_ids: Option<Vec<i64>>,
+    state: State<'_, AppState>,
+) -> AppResult<MetadataBinding> {
+    let sources = state.database.validate_work_target(&target)?;
+    let binding = sources[0]
+        .binding
+        .clone()
+        .ok_or_else(|| "作品尚未绑定 Bangumi。".to_string())?;
+    let failed = failed_source_node_ids.unwrap_or_default();
+    if failed.iter().any(|id| !target.source_node_ids.contains(id)) {
+        return Err("WORK_TARGET_STALE".into());
+    }
+    // Capture the repair set before a download can replace the shared cache file.
+    let repair_ids = sources
+        .iter()
+        .filter(|node| {
+            node.cover_source != CoverSource::Manual
+                && (failed.contains(&node.id)
+                    || node
+                        .cover_cache_path
+                        .as_ref()
+                        .is_none_or(|path| !cache::cached_cover_is_valid(Path::new(path)))
+                    || node
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.cover_download_error.is_some()))
+        })
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    if repair_ids.is_empty() {
+        return Ok(binding);
+    }
+    let subject = BangumiSubject {
+        subject_id: binding.provider_subject_id,
+        subject_type: binding.provider_subject_type,
+        title: binding.provider_title,
+        title_cn: binding.provider_title_cn,
+        title_en: binding.provider_title_en,
+        title_ja: binding.provider_title_ja,
+        title_ko: binding.provider_title_ko,
+        match_aliases: binding.provider_aliases,
+        date: binding.provider_date,
+        image_url: binding.provider_image_url,
+        summary: None,
+    };
+    let fallback = subject.clone();
+    let subject = tauri::async_runtime::spawn_blocking(move || bangumi::enrich_subject(&subject))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(fallback);
+    state.database.validate_work_target(&target)?;
+    let database = state.database.clone();
+    let cache_root = active_cover_cache_directory(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        refresh_work_cover(
+            &database,
+            cache_root,
+            target,
+            &subject,
+            Vec::new(),
+            true,
+            repair_ids,
+        )
+    })
+    .await
+    .map_err(|error| format!("封面下载任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub fn clear_work_bangumi_binding(target: WorkTarget, state: State<'_, AppState>) -> AppResult<()> {
+    let operation = cache::begin_cover_cache_operation();
+    let paths = state
+        .database
+        .change_work_binding(&target, None)?
+        .previous_paths;
+    if let Ok(cache_root) = active_cover_cache_directory(&state) {
+        for path in paths {
+            remove_cached_file_if_unreferenced(&operation, &state.database, &path, &cache_root);
+        }
+    }
+    Ok(())
+}
+
+fn refresh_work_cover(
+    database: &Database,
+    cache_root: AppResult<PathBuf>,
+    target: WorkTarget,
+    subject: &BangumiSubject,
+    previous_paths: Vec<PathBuf>,
+    retry_only: bool,
+    repair_ids: Vec<i64>,
+) -> AppResult<MetadataBinding> {
+    let operation = cache::begin_cover_cache_operation();
+    let download = match &cache_root {
+        Ok(root) => bangumi::download_cover(&operation, root, subject),
+        Err(error) => Err(error.clone()),
+    };
+    let (path, error) = match download {
+        Ok(Some(path)) => (Some(path), None),
+        Ok(None) => (None, Some("该 Bangumi 条目没有可用封面。".to_string())),
+        Err(error) => (None, Some(error)),
+    };
+    let result = database.apply_work_cover_with_failures(
+        &target,
+        subject,
+        path.as_deref(),
+        error.as_deref(),
+        retry_only,
+        &repair_ids,
+    );
+    if let Ok(root) = &cache_root {
+        if result.is_err() {
+            if let Some(path) = &path {
+                remove_cached_file_if_unreferenced(&operation, database, path, root);
+            }
+        }
+        for old in previous_paths
+            .into_iter()
+            .chain(result.as_ref().ok().into_iter().flatten().cloned())
+        {
+            remove_cached_file_if_unreferenced(&operation, database, &old, root);
+        }
+    }
+    result?;
+    let mut binding = database
+        .get_binding(target.source_node_ids[0])?
+        .ok_or_else(|| "WORK_TARGET_STALE".to_string())?;
+    // Report a failure from any automatic-cover source, even if the representative has manual art.
+    if let Some(error) = error {
+        binding.cover_download_error = Some(error);
+    }
+    Ok(binding)
 }
 
 #[tauri::command]
@@ -1321,7 +1486,7 @@ fn start_scan_internal(
     // An unplugged disk must not prevent other libraries from refreshing, nor may it enter
     // stale-row cleanup. Explicit single-root scans still return the original validation error.
     let root_count = roots.len();
-    if root_id.is_none() {
+    if !background && root_id.is_none() {
         roots.retain(|root| Path::new(&root.path).is_dir());
     }
     let unavailable_roots = (root_count - roots.len()) as u64;
@@ -1330,8 +1495,10 @@ fn start_scan_internal(
     }
     // Fail synchronously for stale, forged, or legacy-overlapping roots. The scanner repeats this
     // immediately before filesystem traversal to close the command-to-worker timing gap.
-    for root in &roots {
-        state.database.validate_scan_root(root)?;
+    if !background {
+        for root in &roots {
+            state.database.validate_scan_root(root)?;
+        }
     }
     let mut targets = Vec::new();
     for root in roots {

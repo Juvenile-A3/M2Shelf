@@ -5,9 +5,12 @@ mod cache;
 mod commands;
 mod db;
 mod incremental;
+mod logical_works;
 pub mod models;
 mod player;
 pub mod portable_update;
+#[cfg(test)]
+mod review_tests;
 mod scanner;
 mod single_instance;
 mod title_extractor;
@@ -204,6 +207,9 @@ pub fn run() {
             commands::get_bangumi_search_prefill,
             commands::search_bangumi,
             commands::bind_bangumi,
+            commands::bind_work_bangumi,
+            commands::retry_work_bangumi_cover,
+            commands::clear_work_bangumi_binding,
             commands::retry_bangumi_cover,
             commands::sync_pending_bangumi_aliases,
             commands::clear_bangumi_binding,

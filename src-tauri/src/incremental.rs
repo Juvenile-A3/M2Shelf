@@ -26,6 +26,28 @@ pub(crate) struct Plan {
     pub targets: Vec<ScanTarget>,
     pub unchanged: HashSet<PathBuf>,
     snapshots: Vec<(i64, String)>,
+    pub failed_roots: BTreeMap<i64, (bool, String)>,
+}
+
+// Fault injection is thread-local and compiled only into the synthetic regression harness.
+#[cfg(test)]
+thread_local! {
+    static FAILED_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct DirectoryReadFailure(Option<PathBuf>);
+
+#[cfg(test)]
+impl Drop for DirectoryReadFailure {
+    fn drop(&mut self) {
+        FAILED_DIRECTORY.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_directory_read(path: PathBuf) -> DirectoryReadFailure {
+    DirectoryReadFailure(FAILED_DIRECTORY.with(|slot| slot.replace(Some(path))))
 }
 
 fn cancelled(control: &ScanControl) -> AppResult<()> {
@@ -66,6 +88,10 @@ fn inventory(
             return Err("目录超出资源库范围。".into());
         }
         let mut entries = Vec::new();
+        #[cfg(test)]
+        if FAILED_DIRECTORY.with(|slot| slot.borrow().as_ref() == Some(&path)) {
+            return Err("Synthetic deep-directory read failure".into());
+        }
         for entry in fs::read_dir(&canonical).map_err(|e| e.to_string())? {
             cancelled(control)?;
             let entry = entry.map_err(|e| e.to_string())?;
@@ -253,6 +279,8 @@ pub(crate) fn prepare(
                 let mut progress = control.progress.lock().unwrap_or_else(|e| e.into_inner());
                 progress.errors += 1;
                 progress.message = Some(format!("增量检查失败，保留已有索引：{error}"));
+                let partial = fs::read_dir(&target.root.path).is_ok();
+                result.failed_roots.insert(target.root.id, (partial, error));
             }
         }
     }
@@ -260,6 +288,9 @@ pub(crate) fn prepare(
 }
 
 impl Plan {
+    pub fn discard_failed_snapshots(&mut self, failed: &HashSet<i64>) {
+        self.snapshots.retain(|(id, _)| !failed.contains(id));
+    }
     pub fn save(&self, database: &Database) -> AppResult<()> {
         if self.snapshots.is_empty() {
             return Ok(());

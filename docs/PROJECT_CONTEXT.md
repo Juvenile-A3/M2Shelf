@@ -8,7 +8,23 @@ Bangumi 绑定标题可点击，在系统默认浏览器中打开对应官方条
 
 WorkDetailPage 的资源来源折叠区位于 detail-content 最后；来源数量只显示在该折叠区，不再占用顶部标题区域。
 
-绑定跳转修订通过 21 项前端测试、203 项 Rust 测试（5 项外部环境测试按原配置跳过）、120 项项目检查和严格 Clippy；16 组四语言/主题/窗口尺寸的虚构数据 UI 检查通过。最终主程序、辅助程序经 x64 与构建路径检查后更新到用户指定 Portable 安装目录，校验复制后的 SHA-256，并确认原生主窗口正常启动。本轮一次性测试脚本、截图、日志及旧独立试用构建可清理；正式回归测试和标准编译缓存保留。
+本次 PR 规则和可靠性修订已于 2026-10-06 完成 Windows x64 本地构建及 Portable 打包，并更新现有安装。主程序、辅助程序通过版本、身份、私有构建路径和复制后 SHA-256 检查，原生窗口启动正常；更新前保留程序和 SQLite 一致备份，升级后 quick_check 正常，10 类原始身份与用户数据摘要一致。旧库没有启动扫描设置时按规则保存 false，数据库迁移至 14。此构建保留 0.5.11，不更新公开 Release、tag、公钥或正式签名。当前验证结果见下文。
+
+## PR 规则统一实现
+
+本轮可靠性修订：WorkTarget 摘要排除观看记录、标签和无关时间戳，增加所属文件、独立边界和当前分组成员；成员索引预计算以避免大组重复计算。作品事务单独验证完整有序来源集，不使用普通批量编辑的 500 项上限。`change_work_binding` 在事务内返回 `WorkBindingChange`（旧缓存路径与封面快照），封面阶段不再提交后采集状态；`retry_work_bangumi_cover` 接受可选 `failedSourceNodeIds`，处理损坏缓存及浏览器解码失败，范围受当前 WorkTarget 约束。列表、目录浏览和普通/聚合详情共用 deferred 读取快照；单条分类和祖先刷新使用 immediate 事务。详情与浏览检查隐藏祖先，过期详情刷新后返回资源库；隐藏管理继续保留恢复所需数据。
+
+设置“关于”显示原作者与 Juvenile_A 的维护角色。构建脚本设置实际 `M2SHELF_BUILD_DATE` 并恢复调用者环境；直接开发构建未提供日期时使用 `unknown`，界面显示不可用。新增回归涵盖千来源事务回滚、失效目标、损坏封面、读取并发和弹窗焦点。当前 PR 改动尚未作为正式 Release 发布；公开 v0.5.11 的状态见文末，不能把本地构建与已公开资产混为一谈。
+
+`logical_works.rs` 从批量读取的 SQLite Node/文件/绑定计算逻辑归属，扫描、恢复分类、升级迁移、作品库及普通自动匹配共用。作品候选仅限拥有视频的 WORK/AUTO_WORK，系列仅保留手动绑定。保守编号分卷在 FOLDER 模式归属父作品，保留人工/绑定/隐藏边界，不新增作品实体或改变源身份。
+
+`works.rs` 查询所属内容并生成 WorkTarget（有序来源 ID 与快照摘要）。普通/聚合 NodeDetail 共用 nestedMediaFiles、expandedFolderIds、recognitionWarnings；前端 P2 平铺视频，保留附件/目录入口、相对目录和来源，来源区在底部。Bangumi 整组命令事务核验来源及快照，复用 Subject 与封面下载，保护手工封面；其他聚合菜单进入 SourceChoiceDialog。
+
+migration 0014 增加 library_scan_health；逐库结算成功基线与错误，listRoots 返回健康。无变化后台完成仅刷新 Root 状态。数据库初始化区分新库 true / 旧库无设置 false，并保留既有选择。alias_sync.rs 维护进程级32 Subject 预算与 provider 熔断，settings 游标轮换，前端启动空闲触发一次。
+
+`.github/workflows/windows-pr.yml` 使用既有固定 Action 版本及 Node22/Python3.12/Rust1.88，在 PR 中执行 npm ci/check、rustfmt、locked tests 和严格 Clippy，不签名或发布。迁移验证摘要从迁移文件清单生成。
+
+本次验证：35 项前端测试、230 项 Rust 测试和120项项目检查通过；5项既有外部网络测试按原配置忽略。TypeScript、生产前端构建、rustfmt 和 all-targets 严格 Clippy 通过。虚构资源完成四语言、深浅主题及1280×800/900×640共16组详情和关于页面布局检查；扫描健康与来源选择界面另行核对。真实生成的 Unicode/特殊字符测试视频通过原生播放器启动及精确 Explorer 选择，后者补齐线程 COM 初始化，并用回归测试验证初始化引用平衡。
 
 ## 当前状态
 
@@ -22,9 +38,9 @@ WorkDetailPage 的资源来源折叠区位于 detail-content 最后；来源数�
 
 仓库没有独立服务器。所有数据库访问在 Rust 中完成，前端通过类型化 Tauri 命令通信。
 
-当前 fork 的本地改动增加启动资源库扫描与作品聚合视图，已完成 Windows x64 本地构建，尚未签名或发布新的分发版本。`scripts/build_windows_release.ps1 -Bundles none` 成功生成主程序和更新辅助程序，并通过其架构与构建路径检查；NSIS/Portable 打包和主程序图形界面的原生运行验证不包含在本轮环境配置结果中。`works.rs` 在现有 Node 索引上生成只读分组，`AllResourcesResult.works` 与 `get_work_detail` 提供聚合卡片和来源详情；原目录查询与 Node 身份继续保留。`AppSettings.auto_scan_on_startup` 使用已有 settings 键值表持久化，缺省为 true，该开关本身不需要 schema 迁移；增量快照另以 migration 0011 保存。前端等待初始化及扫描监听就绪后仅尝试一次静默启动扫描，使用 `ScanProgress.background` 区分手动任务，仅在终态 `libraryChanged` 为 true 时重载索引；未变化时保留现有显示。绑定修改后重新计算作品分组，沿用请求代次保护。
+启动资源库扫描与作品聚合视图此前已完成 Windows x64 本地构建，尚未签名或发布新的分发版本。`scripts/build_windows_release.ps1 -Bundles none` 成功生成主程序和更新辅助程序，并通过其架构与构建路径检查；该次环境配置检查未执行 NSIS/Portable 打包。`works.rs` 在现有 Node 索引上生成只读分组，`AllResourcesResult.works` 与 `get_work_detail` 提供聚合卡片和来源详情；原目录查询与 Node 身份继续保留。`AppSettings.auto_scan_on_startup` 使用已有 settings 键值表持久化，新库缺省为 true、旧库无设置缺省为 false，明确值保留，该开关继续使用 settings；增量快照另以 migration 0011 保存。前端等待初始化及扫描监听就绪后仅尝试一次静默启动扫描，使用 `ScanProgress.background` 区分手动任务，仅在终态 `libraryChanged` 为 true 时重载索引；未变化时保留现有显示。绑定修改后重新计算作品分组，沿用请求代次保护。
 
-前端回归测试入口为 `npm test`（Vitest、jsdom、Testing Library），测试使用虚构资源和 IPC mock；Rust 扫描测试补充了新增集数、季区分、深层目录归并、改绑拆分和元数据保留场景。Windows 原生环境已补齐 Rust/Cargo 1.98.1、rustfmt、Clippy 和 Visual Studio Build Tools 2022，Tauri 环境自检通过。首次原生验证修复了隐藏条目测试的分类准备，以及作品视图中显式 ` - 01` 集号和 `S02E01` 季集号的处理，保留裸数字续作标题。当前验证为 199 项 Rust 测试、15 项前端测试及 120 项项目校验通过，5 项外部网络测试默认忽略；格式检查和严格 Clippy 通过。回归覆盖深层增量变更、文件夹/文件模式的未变化子树复用、BDMV、离线/取消基线保留及隐藏恢复。开发与构建命令见 [Windows 本地开发](WINDOWS_DEVELOPMENT.md)。本地构建不代表正式签名发布。
+前端回归测试入口为 `npm test`（Vitest、jsdom、Testing Library），测试使用虚构资源和 IPC mock；Rust 扫描测试补充了新增集数、季区分、深层目录归并、改绑拆分和元数据保留场景。Windows 原生环境已补齐 Rust/Cargo 1.98.1、rustfmt、Clippy 和 Visual Studio Build Tools 2022，Tauri 环境自检通过。首次原生验证修复了隐藏条目测试的分类准备，以及作品视图中显式 ` - 01` 集号和 `S02E01` 季集号的处理，保留裸数字续作标题。该次原生环境准备验证为199项 Rust 测试、15项前端测试及120项项目校验通过；本次 PR 修改的最新结果见上文。回归覆盖深层增量变更、文件夹/文件模式的未变化子树复用、BDMV、离线/取消基线保留及隐藏恢复。开发与构建命令见 [Windows 本地开发](WINDOWS_DEVELOPMENT.md)。本地构建不代表正式签名发布。
 
 本轮增加 `modified-desc` / `modified-asc` 排序。`db.rs` 的 `hydrate_file_modified_times_conn` 用分批递归 SQL 查询视频与附件修改时间，排除隐藏后代，并随 Node DTO 返回 `latestFileModifiedAt`；`works.rs` 合并来源时取最大值。`format.ts` 使用真实时间戳比较、缺失置后，`FileModifiedTime` 统一显示；作品、目录及收藏夹可用，目录直属文件列表也支持。隐藏条目入口已从 Sidebar 移到 SettingsPage 的资源库区，对话框仍由 App 管理，恢复后的索引刷新和焦点返回继续保留。 本轮使用虚构 IPC/媒体数据完成四语言、深浅主题和 1280×800 / 900×640 窗口检查，并验证系统主题切换、列表时间显示及切换其他排序后隐藏。浏览器验证不访问真实媒体或应用数据库。
 
@@ -57,7 +73,7 @@ WorkDetailPage 的资源来源折叠区位于 detail-content 最后；来源数�
 - `auto_match.rs`：有界多查询、候选合并、评分和置信度门禁；
 - `bangumi.rs`：官方搜索、Subject 获取和封面请求；
 - `cache.rs`：应用封面缓存校验、同目录原子提交、读写/清理屏障与拥有文件清理；
-- `player.rs`：播放器测试和字面参数启动；
+- `player.rs`：播放器测试、字面参数启动及带线程 COM 生命周期保护的精确 Shell 文件定位；
 - `window_state.rs`：窗口尺寸校验、恢复和保存；
 - `update.rs`：固定 GitHub 清单、规范稳定 SemVer、下载状态、有界网络、SHA-256 与 Ed25519 验证；
 - `portable_update.rs`：Portable 事务准备、helper-ready、受限解包、替换、健康回执、SQLite/文件回滚和恢复提示；
@@ -102,6 +118,7 @@ WorkDetailPage 的资源来源折叠区位于 detail-content 最后；来源数�
 11. `0011_incremental_scan.sql`：每个 Root 的目录项快照 JSON，删除 Root 时级联清理；旧索引与绑定不变。
 12. `0012_provider_aliases.sql`：向 metadata_bindings 增加 provider_aliases_json，旧绑定默认空数组。
 13. `0013_alias_sync.sql`：保存按 Subject ID/type 去重的官方别称缓存与完成状态。
+14. `0014_scan_health.sql`：逐库扫描健康及最后尝试/成功时间；应用迁移事务同时从已有索引重算自动分类，保留用户元数据。
 
 关键关系：
 
@@ -131,7 +148,7 @@ Rust 先取得 Windows 单实例锁，再以隐藏状态创建主窗口，创建
 
 `title_extractor.rs` 生成结构化证据，并仅对具有年份/技术段的多点发行名把点号视为分隔符。影视发行名中的全角方括号、嵌套 HDR/字幕等技术组使用平衡括号清洗；相邻 CJK 与拉丁标题会保留组合证据并拆成独立候选，电影、影视、Movies 等通用父目录不占查询名额。显示名与真实名不同的情况下，真实文件夹或文件标题仍紧随主标题进入三查询计划。`auto_match.rs` 公平合并最多三个官方搜索的候选，依据多语言标题、季度、年份、版本和类型评分。高置信结果只补全胜出项以自动保存官方别称，其余结果最多补全五项，详情以两路小批并发执行。单次匹配运行最多新发起 256 个 Subject 详情请求，同一 Subject 复用本轮缓存；预算允许时为每个后续 Node 预留一次未缓存详情机会，避免前部 Node 独占预算。详情服务出现提供方级故障后本轮停止新详情请求并继续以搜索元数据评分。
 
-最终排序后的最高候选只要达到 `direct_threshold`（当前默认 60）、没有强季度/年份/版本/类型冲突，且系列 Node 的主标题精确匹配，就直接写入绑定；不再要求与次高候选保持分差，也没有用户可见的 Pending 结果。主关键词的 Bangumi 第一项在本地证据足够具体时可提升到该直接门槛，但全部硬冲突与系列精确规则仍在提升后执行。`automatic_threshold`（当前默认 82）继续用于识别可跳过更多详情补全的高置信快路径，不是唯一写入门槛。候选同分时以提供方排名稳定决胜。`bangumi.rs` 只接受动画 type 2 与真人影视 type 6，其他 Subject 类型保持强冲突；`provider_subject_type` 随绑定持久化，使真人影视可在重启后重新读取详情和重试封面。普通路径不替换绑定或手工封面，显式批量重匹配仍经过相同直接门槛和硬冲突保护。
+最终排序后的最高候选只要达到 `direct_threshold`（当前默认 60）、没有强季度/年份/版本/类型冲突，就直接写入绑定；不再要求与次高候选保持分差，也没有用户可见的 Pending 结果。主关键词的 Bangumi 第一项在本地证据足够具体时可提升到该直接门槛，但全部硬冲突仍在提升后执行；普通匹配候选仅为逻辑作品，系列可手动绑定。`automatic_threshold`（当前默认 82）继续用于识别可跳过更多详情补全的高置信快路径，不是唯一写入门槛。候选同分时以提供方排名稳定决胜。`bangumi.rs` 只接受动画 type 2 与真人影视 type 6，其他 Subject 类型保持强冲突；`provider_subject_type` 随绑定持久化，使真人影视可在重启后重新读取详情和重试封面。普通路径不替换绑定或手工封面，显式批量重匹配仍经过相同直接门槛和硬冲突保护。
 
 `commands.rs` 在用户明确选择并绑定 Bangumi 条目时，从当前 Node 自身的显示名、真实文件夹或文件名和代表性视频标题生成有界清洗别名，与绑定一起事务写入 `confirmed_title_aliases`；父目录上下文、路径和自动绑定结果不会进入表，入库不会再次剥离已提取出的季数或年份。`auto_match.rs` 按证据顺序查询这些本地观察：采用第一个有记录且其全部来源一致指向一个受支持 Subject 的别名；若该高优先级别名自身有歧义就回退普通官方搜索。唯一 Subject 获得官方详情补全优先级，同时仍执行普通有界官方查询，因此别名过期、详情失败或硬冲突时可继续选择搜索候选。确认别名只提供标题精确信号，不能反向伪造官方季数、年份或版本证据；复用结果仍需通过当前 Node 的硬冲突和系列精确标题保护。清除或替换来源绑定及删除来源 Node 会移除对应观察。该机制不引入新的第三方标题 API，也不把用户本地标题上传到 Bangumi 之外的服务。
 
@@ -197,7 +214,7 @@ NSIS 分发启动已验证的固定版本安装器。Portable 分发先确认当
 
 `CollectionSortControl` 将四种字段和方向分开，继续使用兼容的 `field-direction` settings 值，增加 `watched-asc/desc`。Node 批量时间聚合查询同时读取 watch_history，并返回 `lastWatchedAt`；聚合作品取所有来源最大时间。`FileModifiedTime` 使用 Intl.RelativeTimeFormat 和一个共享分钟计时器，title 保留完整时间。
 
-侧栏 navigate/search 清除隐式 root 限制，保留关键词；目录内 openSearch 仍明确传 root，SearchPage 提供始终可见的范围选择。后台查询保留请求代次保护。`MetadataBinding.providerAliases` 通过 migration 0012 持久化，写入限制 32 条、每条 256 字符并清理空白/控制字符。搜索 SQL 使用 json_each 和已有 LIKE 字面转义；顶栏使用 nodeMatchesQuery 匹配各语言标题、别称和标签，聚合视图同时检查所有来源。`sync_pending_bangumi_aliases` 和 `alias_sync.rs` 在启动以及识别后静默补全未完成 Subject；不提供手动入口。migration 0013 的 provider_alias_sync 同时保存完成状态和别称缓存，成功空数组也完成，新绑定复用缓存。每轮对唯一 Subject 快照顺序读取官方详情；单项 404 继续其他项，提供方整体故障中止本轮，已成功记录保留。只在别称变化时重载索引显示，并通过最新刷新回调保护导航。
+侧栏 navigate/search 清除隐式 root 限制，保留关键词；目录内 openSearch 仍明确传 root，SearchPage 提供始终可见的范围选择。后台查询保留请求代次保护。`MetadataBinding.providerAliases` 通过 migration 0012 持久化，写入限制 32 条、每条 256 字符并清理空白/控制字符。搜索 SQL 使用 json_each 和已有 LIKE 字面转义；顶栏使用 nodeMatchesQuery 匹配各语言标题、别称和标签，聚合视图同时检查所有来源。`sync_pending_bangumi_aliases` 和 `alias_sync.rs` 在启动扫描空闲后静默补全未完成 Subject（每进程最多32个不同条目）；不提供手动入口。migration 0013 的 provider_alias_sync 同时保存完成状态和别称缓存，成功空数组也完成，新绑定复用缓存。每次应用进程最多尝试32个唯一 Subject，使用持久游标轮换读取官方详情；单项 404 继续其他项，提供方整体故障中止本轮，已成功记录保留。只在别称变化时重载索引显示，并通过最新刷新回调保护导航。
 
 新增回归覆盖跨 Root 查询、侧栏重入范围、LIKE 通配符字面值、别称持久化/同步并发保护、观看时间聚合和双向缺失置后。四语言、深浅主题及 1280×800 / 900×640 使用虚构 IPC 数据检查控件等高和相对时间。仅生成本地未签名的 exe，不代表正式发布或真实媒体环境中的原生 UI 验证。
 
@@ -227,7 +244,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 
 ## 当前发布状态
 
-- 本 fork 新增 `list_hidden_nodes` Rust/IPC 查询及 `HiddenNodesDialog`；侧栏打开跨库隐藏列表，复用 `reset_node_type` 恢复自动分类，并刷新当前页面、全部资源、最近观看和 Root 统计。加载使用请求序号防止旧响应覆盖恢复结果，包含键盘焦点管理及四语言文案。本功能源码尚未发布；前端回归覆盖路径筛选、恢复、错误重试、过期响应，Rust 数据层的嵌套隐藏、无视频条目、离线读取和元数据保留用例已通过本机原生验证。
+- M²Shelf 新增 `list_hidden_nodes` Rust/IPC 查询及 `HiddenNodesDialog`；设置页打开跨库隐藏列表，复用 `reset_node_type` 恢复自动分类，并刷新当前页面、全部资源、最近观看和 Root 统计。加载使用请求序号防止旧响应覆盖恢复结果，包含键盘焦点管理及四语言文案。本功能源码尚未发布；前端回归覆盖路径筛选、恢复、错误重试、过期响应，Rust 数据层的嵌套隐藏、无视频条目、离线读取和元数据保留用例已通过本机原生验证。
 
 - `v0.5.11` 已完成正式签名并作为公开稳定 Release 发布；正式集合仍严格为 Portable/NSIS 各自资产、SHA-256、Ed25519 签名边车，加 `latest.json` 和 `candidate-provenance.json` 共八项。README 已指向该公开版本；
 - `0.5.11` 是首个携带当前 updater 信任根和 Portable helper 的引导版本。`0.5.7` 及更早用户和任何旧公钥测试包必须手动安装它一次；后续版本才能沿用内置更新链；

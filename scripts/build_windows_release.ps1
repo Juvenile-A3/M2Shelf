@@ -111,6 +111,18 @@ function Assert-PlainDestinationOrMissing {
 
 $previousEncodedFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $previousTargetDirectory = $env:CARGO_TARGET_DIR
+$previousBuildDate = $env:M2SHELF_BUILD_DATE
+$buildDate = if ([string]::IsNullOrWhiteSpace($previousBuildDate)) {
+  [DateTime]::Now.ToString("yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+  $previousBuildDate
+}
+$parsedBuildDate = [DateTime]::MinValue
+if (-not [DateTime]::TryParseExact($buildDate, "yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture,
+    [Globalization.DateTimeStyles]::None, [ref]$parsedBuildDate)) {
+  throw "M2SHELF_BUILD_DATE must be a valid yyyy-MM-dd calendar date."
+}
+$env:M2SHELF_BUILD_DATE = $buildDate
 $buildTargetDirectory = if (-not [string]::IsNullOrWhiteSpace($TargetDirectory)) {
   if ([System.IO.Path]::IsPathRooted($TargetDirectory)) { [System.IO.Path]::GetFullPath($TargetDirectory) }
   else { [System.IO.Path]::GetFullPath((Join-Path $repoRoot $TargetDirectory)) }
@@ -207,4 +219,9 @@ try {
     $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedFlags
   }
   $env:CARGO_TARGET_DIR = $previousTargetDirectory
+  if ($null -eq $previousBuildDate) {
+    Remove-Item Env:M2SHELF_BUILD_DATE -ErrorAction SilentlyContinue
+  } else {
+    $env:M2SHELF_BUILD_DATE = $previousBuildDate
+  }
 }

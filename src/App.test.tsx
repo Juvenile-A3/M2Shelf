@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
     getCollectionSortPreferences: vi.fn(), updateCollectionSortPreference: vi.fn(), scanStatus: vi.fn(), allResources: vi.fn(),
     listRecentlyWatched: vi.fn(), listFavoriteFolders: vi.fn(), showMainWindow: vi.fn(),
     startScan: vi.fn(), nodeDetail: vi.fn(), cacheStats: vi.fn(), updateSettings: vi.fn(),
+    bindWorkBangumi: vi.fn(), bindBangumi: vi.fn(), clearWorkBangumi: vi.fn(), retryWorkBangumiCover: vi.fn(), bangumiPrefill: vi.fn(), searchBangumi: vi.fn(), renameNode: vi.fn(), playMedia: vi.fn(), openMediaInExplorer: vi.fn(),
     listHiddenNodes: vi.fn(), resetNodeType: vi.fn(), search: vi.fn(), browse: vi.fn(), syncPendingBangumiAliases: vi.fn(), openBangumiSubject: vi.fn(),
   },
   progress: new Set<(value: ScanProgress) => void>(),
@@ -45,9 +46,10 @@ function node(id: number, title: string): MediaNode {
 }
 const sources = [node(1, "Release A"), node(2, "Release B")];
 const work = { ...sources[0], displayName: "Example Work", totalVideoCount: 2 };
+const workTarget = { sourceNodeIds: sources.map(source => source.id), snapshot: "fixture-snapshot" };
 const catalogue = {
   nodes: [{ ...node(100, "Archive"), nodeType: "CONTAINER" as const }],
-  totalCount: 1, works: [{ node: work, sources }],
+  totalCount: 1, works: [{ node: work, sources, target: workTarget }],
 };
 const root = { id: 1, path: "X:/Fixtures", displayName: "Test Library", createdAt: "2026-01-01", lastScanAt: null, recognitionMode: "FOLDER" };
 let settings: AppSettings;
@@ -77,6 +79,9 @@ beforeEach(() => {
   mocks.api.bootstrap.mockResolvedValue({ name: "M²Shelf", version: "0.5.11", updateRecoveryNotice: null });
   mocks.api.listRoots.mockResolvedValue([root]);
   mocks.api.search.mockResolvedValue([]);
+  mocks.api.bangumiPrefill.mockResolvedValue({ originalName: "Example Work", extractedName: "Example Work", candidates: [] });
+  mocks.api.playMedia.mockResolvedValue(undefined);
+  mocks.api.openMediaInExplorer.mockResolvedValue(undefined);
   mocks.api.syncPendingBangumiAliases.mockResolvedValue(false);
   mocks.api.browse.mockResolvedValue({ root, currentNode: null, nodes: sources, breadcrumbs: [], mediaFiles: [], resourceFiles: [] });
   mocks.api.getCollectionSortPreferences.mockResolvedValue({ all: "title-asc", browse: "title-asc", favorites: "title-asc" });
@@ -91,7 +96,7 @@ beforeEach(() => {
   mocks.api.startScan.mockResolvedValue({ scanId: "startup-test" });
   mocks.api.cacheStats.mockResolvedValue({ fileCount: 0, totalBytes: 0, cacheDirectory: "X:/AppCache" });
   mocks.api.nodeDetail.mockImplementation(async (_id: number, workView: boolean) => ({
-    node: { ...work, workView }, binding: null, children: [], resourceFiles: [], breadcrumbs: [],
+    node: { ...work, workView, workTarget: workView ? workTarget : undefined }, workTarget: workView ? workTarget : null, binding: null, children: [], resourceFiles: [], breadcrumbs: [],
     workSources: workView ? sources : null,
     mediaFiles: sources.map((source, index) => ({ id: index + 1, nodeId: source.id,
       fileName: `Episode 0${index + 1}.mkv`, absolutePath: `${source.absolutePath}/01.mkv`,
@@ -102,6 +107,38 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("startup refresh and work browsing", () => {
+  it.each([
+    ["zh-CN", "原作者", "功能改进与维护"],
+    ["en-US", "Original author", "Feature improvements and maintenance"],
+    ["ja-JP", "原作者", "機能改善・メンテナンス"],
+    ["ko-KR", "원작자", "기능 개선 및 유지보수"],
+  ] as const)("shows both author roles in %s", async (language, original, contributor) => {
+    settings.autoScanOnStartup = false;
+    mount();
+    await screen.findByText("Example Work");
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByText("关于");
+    const languageSelect = screen.getByRole("combobox", { name: "界面语言" }) as HTMLSelectElement;
+    await waitFor(() => expect(languageSelect.disabled).toBe(false));
+    fireEvent.change(languageSelect, { target: { value: language } });
+    const about = within(document.querySelector(".about-grid") as HTMLElement);
+    expect(await about.findByText(original)).toBeTruthy();
+    expect(about.getByText(contributor)).toBeTruthy();
+    expect(about.getByText("森下Undermori")).toBeTruthy();
+    expect(about.getByText("Juvenile_A")).toBeTruthy();
+  });
+
+  it("lets the backend select damaged sources when no poster decode failure was reported", async () => {
+    settings.autoScanOnStartup = false;
+    const binding = { id: 1, nodeId: work.id, provider: "BANGUMI", providerSubjectId: 42, providerSubjectType: 2, providerTitle: "Bound", providerAliases: [], coverCachePath: null, coverDownloadError: "fixture" };
+    mocks.api.allResources.mockResolvedValue({ ...catalogue, works: [{ node: { ...work, binding }, sources, target: workTarget }] });
+    mocks.api.retryWorkBangumiCover.mockResolvedValue({ ...binding, coverDownloadError: null });
+    mount();
+    await screen.findByText("Bound");
+    fireEvent.click(document.querySelector(".media-card .quick-bind.is-retry")!);
+    await waitFor(() => expect(mocks.api.retryWorkBangumiCover).toHaveBeenCalledWith(workTarget, []));
+  });
+
   it("opens the current binding in the browser through its original node ID", async () => {
     settings.autoScanOnStartup = false;
     const binding = { id:1,nodeId:work.id,provider:"BANGUMI",providerSubjectId:174584,providerSubjectType:2,providerTitle:"Bound Work",providerAliases:[],coverCachePath:null };
@@ -110,7 +147,7 @@ describe("startup refresh and work browsing", () => {
     mount();
     await screen.findByText("Example Work");
     fireEvent.click(document.querySelector(".media-card-open")!);
-    fireEvent.click(await screen.findByRole("button", {name:"打开对应的 Bangumi 页面"}));
+    fireEvent.click(await screen.findByRole("button", {name:"在 Bangumi 打开 ↗"}));
     expect(mocks.api.openBangumiSubject).toHaveBeenCalledWith(work.id);
   });
 
@@ -304,7 +341,7 @@ describe("startup refresh and work browsing", () => {
     expect(document.querySelector(".scan-banner")).toBeNull();
     await act(async () => { mocks.finished.forEach((callback) => callback({ ...progress, status, libraryChanged: false })); });
     expect(mocks.api.allResources).not.toHaveBeenCalled();
-    expect(mocks.api.listRoots).not.toHaveBeenCalled();
+    expect(mocks.api.listRoots).toHaveBeenCalledTimes(1);
     expect(mocks.api.listRecentlyWatched).not.toHaveBeenCalled();
     expect(document.querySelector(".media-card")).toBe(card);
     expect(document.querySelector(".toast")).toBeNull();
@@ -379,4 +416,62 @@ describe("startup refresh and work browsing", () => {
     expect(document.querySelectorAll(".media-card")).toHaveLength(2);
     expect(screen.getByText("Release B")).toBeTruthy();
   });
+  it("flattens nested same-name videos and sends their original IDs to playback and reveal", async () => {
+    settings.autoScanOnStartup=false;
+    const file={id:901,nodeId:51,fileName:"01.mkv",absolutePath:"X:/Fixtures/Release B/SPs/01.mkv",extension:".mkv",fileSize:100,modifiedAt:"2026-01-01",lastSeenAt:"2026-01-01",durationMs:null,width:null,height:null,codec:null};
+    mocks.api.nodeDetail.mockResolvedValue({node:{...work,workView:true,workTarget},workTarget,binding:null,children:[],resourceFiles:[],breadcrumbs:[],workSources:sources,mediaFiles:[],nestedMediaFiles:[{file,sourceNodeId:2,sourceName:"Release B",relativeDirectory:"SPs"}]});
+    mount();await screen.findByText("Example Work");fireEvent.click(document.querySelector(".media-card-open")!);
+    const title=await screen.findByText("01.mkv");expect(screen.getByText(/Release B \/ SPs/)).toBeTruthy();
+    fireEvent.doubleClick(title.closest(".media-file-row")!);await waitFor(()=>expect(mocks.api.playMedia).toHaveBeenCalledWith(901));
+    fireEvent.click(screen.getByRole("button",{name:/在资源管理器中显示 .*01.mkv/}));await waitFor(()=>expect(mocks.api.openMediaInExplorer).toHaveBeenCalledWith(901));
+  });
+
+  it("binds all aggregated sources with the current snapshot",async()=>{
+    settings.autoScanOnStartup=false;
+    const subject={subjectId:42,subjectType:2,title:"Example Subject",titleCn:null,titleEn:null,titleJa:null,titleKo:null,matchAliases:[],date:null,imageUrl:null,summary:null};
+    mocks.api.searchBangumi.mockResolvedValue([subject]);
+    mocks.api.bindWorkBangumi.mockResolvedValue({id:1,nodeId:1,provider:"BANGUMI",providerSubjectId:42,providerSubjectType:2,providerTitle:"Example Subject",providerAliases:[],coverCachePath:null});
+    mount();await screen.findByText("Example Work");fireEvent.contextMenu(document.querySelector(".media-card")!);
+    fireEvent.click(screen.getByRole("button",{name:"从 Bangumi 搜索并添加"}));
+    const dialog=within(await screen.findByRole("dialog"));fireEvent.click(dialog.getByRole("button",{name:"搜索"}));
+    fireEvent.click(await dialog.findByRole("button",{name:"选择"}));
+    await waitFor(()=>expect(mocks.api.bindWorkBangumi).toHaveBeenCalledWith(workTarget,subject));
+    expect(mocks.api.bindBangumi).not.toHaveBeenCalled();
+  });
+
+  it("requires source selection before renaming an aggregated card",async()=>{
+    settings.autoScanOnStartup=false;mocks.api.renameNode.mockResolvedValue(sources[1]);
+    mount();await screen.findByText("Example Work");fireEvent.contextMenu(document.querySelector(".media-card")!);
+    fireEvent.click(screen.getByRole("button",{name:"修改显示名称"}));
+    const chooser=within(await screen.findByRole("dialog",{name:"选择资源来源"}));
+    fireEvent.click(chooser.getByRole("button",{name:/Release B/}));
+    fireEvent.change(screen.getByRole("textbox",{name:"显示名称"}),{target:{value:"My release"}});
+    fireEvent.click(screen.getByRole("button",{name:"保存名称"}));
+    await waitFor(()=>expect(mocks.api.renameNode).toHaveBeenCalledWith(2,"My release"));
+  });
+
+  it("shows durable scan failure details without replacing the unchanged work card",async()=>{
+    mount();await screen.findByText("Example Work");await waitFor(()=>expect(mocks.api.startScan).toHaveBeenCalledTimes(1));
+    const card=document.querySelector(".media-card");
+    mocks.api.listRoots.mockResolvedValue([{...root,scanHealth:{lastAutoAttemptAt:"2026-01-01",lastSuccessAt:null,outcome:"PARTIAL",errorCount:1,detail:"Synthetic subdirectory permission failure"}}]);
+    await act(async()=>{mocks.finished.forEach(callback=>callback({...progress,libraryChanged:false}));});
+    await waitFor(()=>expect(document.querySelector(".root-scan-warning")).not.toBeNull());expect(document.querySelector(".media-card")).toBe(card);
+    fireEvent.click(document.querySelector(".root-scan-warning")!);
+    expect(await screen.findByText("Synthetic subdirectory permission failure")).toBeTruthy();
+  });
+
+  it("returns to the library when the open work disappears during a refresh", async () => {
+    mount();
+    await screen.findByText("Example Work");
+    fireEvent.click(document.querySelector(".media-card-open")!);
+    await screen.findByText("Episode 01.mkv");
+    mocks.api.nodeDetail.mockRejectedValue(new Error("NODE_NOT_VISIBLE: hidden"));
+    await act(async () => {
+      mocks.finished.forEach(callback => callback({ ...progress, scanId: "after-hide" }));
+    });
+    await waitFor(() => expect(mocks.api.browse).toHaveBeenCalledWith(1, null));
+    await waitFor(() => expect(document.querySelector(".work-detail-page")).toBeNull());
+    expect(screen.queryByText("Episode 01.mkv")).toBeNull();
+  });
+
 });

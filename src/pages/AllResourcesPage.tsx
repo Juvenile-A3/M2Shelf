@@ -26,7 +26,7 @@ interface AllResourcesPageProps {
   onOpenNode: (node: MediaNode) => void;
   onMenu: (event: React.MouseEvent, node: MediaNode) => void;
   onBangumi: (node: MediaNode) => void;
-  onRetryCover: (node: MediaNode) => void;
+  onRetryCover: (node: MediaNode, imageDecodeFailed?: boolean) => void;
   onScan: () => void;
   onAddRoot: () => void;
   onSearch: (query: string) => void;
@@ -48,10 +48,8 @@ export function AllResourcesPage({ grouping, onGrouping, data, loading, viewMode
   const { language, number, t } = useI18n();
   const sourceNodes = useMemo(() => grouping === "works"
     ? editMode ? (data?.works ?? []).flatMap((work) => work.sources)
-      : (data?.works ?? []).map((work) => ({ ...work.node, workView: true }))
+      : (data?.works ?? []).map((work) => ({ ...work.node, workView: true, workTarget: work.target }))
     : data?.nodes ?? [], [data, editMode, grouping]);
-  const sourceFor = (node: MediaNode) => node.workView
-    ? data?.works.find((work) => work.node.id === node.id)?.sources[0] ?? node : node;
   const effectiveTagFilterId = tagFilterId != null && sourceNodes.some((node) => node.userTags.some((tag) => tag.id === tagFilterId))
     ? tagFilterId
     : null;
@@ -70,6 +68,7 @@ export function AllResourcesPage({ grouping, onGrouping, data, loading, viewMode
 
   return (
     <section className="browse-page all-resources-page">
+      {(data.recognitionWarnings?.length ?? 0) > 0 && <div className="preview-banner"><Icon name="warning" /><span>{t("works.recognitionWarning")} {data.recognitionWarnings?.map(node => <button type="button" className="button ghost" key={node.id} onClick={() => onOpenNode(node)}>{node.folderName}</button>)}</span></div>}
       <header className="page-toolbar">
         <div className="toolbar-topline">
           <span className="all-resources-location"><Icon name="archive" />{t("all.crossLibrary")}</span>
@@ -93,7 +92,7 @@ export function AllResourcesPage({ grouping, onGrouping, data, loading, viewMode
       <div className="page-content">
         {editMode && <SelectionToolbar selectedCount={selectedNodeIds.size} visibleCount={nodes.length} busy={matchBusy} onSelectAll={() => onSelectAll(nodes.map((node) => node.id))} onClear={onClearSelection} onTags={onBatchTags} onFavorites={onBatchFavorites} onMore={onBatchMenu} onRematch={() => onMatch([...selectedNodeIds], true)} onExit={() => onEditMode(false)} />}
         <div className="all-resources-summary"><strong>{t("app.projectCount", { count: number(nodes.length) })}</strong>{hasActiveFilter && <span>{t("all.totalCount", { count: number(sourceNodes.length) })}</span>}</div>
-        {nodes.length > 0 && <PosterGrid showModifiedTime={sort.startsWith("modified-")} nodes={nodes} viewMode={viewMode} onOpen={onOpenNode} onMenu={(event, node) => onMenu(event, sourceFor(node))} onBangumi={(node) => onBangumi(sourceFor(node))} onRetryCover={(node) => onRetryCover(sourceFor(node))} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} onSelect={onToggleSelection} />}
+        {nodes.length > 0 && <PosterGrid showModifiedTime={sort.startsWith("modified-")} nodes={nodes} viewMode={viewMode} onOpen={onOpenNode} onMenu={onMenu} onBangumi={onBangumi} onRetryCover={onRetryCover} coverRevision={coverRevision} editMode={editMode} selectedNodeIds={selectedNodeIds} onSelect={onToggleSelection} />}
         {nodes.length === 0 && <EmptyState compact icon={hasActiveFilter ? "search" : "folder"} title={hasActiveFilter ? t("all.noMatch") : t("all.temporarilyEmpty")} description={hasActiveFilter ? t("all.noMatchDescription") : t("all.emptyScanDescription")} />}
       </div>
     </section>

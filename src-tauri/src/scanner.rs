@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -105,7 +105,8 @@ pub fn run_scan_with_auto_match(
     let background = control.progress().background;
     let mut plan = None;
     let mut scan_targets = targets.clone();
-    let mut errors_before_indexing = control.progress().errors;
+    let mut root_results: HashMap<i64, (String, u64, Option<String>)> = HashMap::new();
+    let mut completed_roots = HashSet::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !background {
             // A manual/rebuild scan can repair or partially replace the index. Its next startup
@@ -132,17 +133,68 @@ pub fn run_scan_with_auto_match(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .library_changed = Some(!scan_targets.is_empty());
+            for (id, (partial, error)) in &next.failed_roots {
+                root_results.insert(
+                    *id,
+                    (
+                        if *partial { "PARTIAL" } else { "FAILED" }.into(),
+                        1,
+                        Some(error.clone()),
+                    ),
+                );
+            }
             plan = Some(next);
-            errors_before_indexing = control.progress().errors;
         }
-        run_scan_inner(
-            app,
-            database,
-            &scan_targets,
-            control,
-            &extension_set,
-            &token,
-        )
+        let mut root_ids = targets
+            .iter()
+            .map(|target| target.root.id)
+            .collect::<Vec<_>>();
+        root_ids.sort_unstable();
+        root_ids.dedup();
+        for root_id in root_ids {
+            if root_results.contains_key(&root_id) {
+                completed_roots.insert(root_id);
+                continue;
+            }
+            check_cancel(control)?;
+            let scoped = scan_targets
+                .iter()
+                .filter(|target| target.root.id == root_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let before = control.progress().errors;
+            match run_scan_inner(app, database, &scoped, control, &extension_set, &token) {
+                Ok(()) => {
+                    let progress = control.progress();
+                    let errors = progress.errors - before;
+                    root_results.insert(
+                        root_id,
+                        (
+                            if errors > 0 { "PARTIAL" } else { "SUCCESS" }.into(),
+                            errors,
+                            if errors > 0 { progress.message } else { None },
+                        ),
+                    );
+                }
+                Err(ScanAbort::Cancelled) => return Err(ScanAbort::Cancelled),
+                Err(ScanAbort::Failed(error)) => {
+                    let mut progress = control.progress.lock().unwrap_or_else(|e| e.into_inner());
+                    progress.errors += 1;
+                    progress.message = Some(error.clone());
+                    root_results.insert(
+                        root_id,
+                        ("FAILED".into(), progress.errors - before, Some(error)),
+                    );
+                }
+            }
+            completed_roots.insert(root_id);
+        }
+        scan_targets.retain(|target| {
+            root_results
+                .get(&target.root.id)
+                .is_some_and(|result| result.0 == "SUCCESS")
+        });
+        Ok(())
     }))
     .unwrap_or_else(|_| Err(ScanAbort::Failed("扫描线程发生内部错误。".into())));
 
@@ -176,15 +228,28 @@ pub fn run_scan_with_auto_match(
             None
         };
 
-    if result.is_ok()
-        && !control.cancel.load(Ordering::Relaxed)
-        && control.progress().errors == errors_before_indexing
     {
-        if let Some(plan) = plan {
+        if let Some(mut plan) = plan {
+            let failed = targets
+                .iter()
+                .filter_map(|target| {
+                    root_results
+                        .get(&target.root.id)
+                        .is_none_or(|result| result.0 != "SUCCESS")
+                        .then_some(target.root.id)
+                })
+                .collect();
+            plan.discard_failed_snapshots(&failed);
             if let Err(error) = plan.save(database) {
                 let mut progress = control.progress.lock().unwrap_or_else(|e| e.into_inner());
                 progress.errors += 1;
-                progress.message = Some(error);
+                progress.message = Some(error.clone());
+                for result in root_results
+                    .values_mut()
+                    .filter(|result| result.0 == "SUCCESS")
+                {
+                    *result = ("FAILED".into(), 1, Some(error.clone()));
+                }
             }
         }
     }
@@ -207,14 +272,24 @@ pub fn run_scan_with_auto_match(
             progress.message = Some("扫描已停止；已完成的索引结果已保留。".into());
         }
         Ok(()) => {
-            progress.status = ScanStatus::Completed;
-            progress.message = Some(match auto_match_report {
-                Some(report) if report.examined > 0 || report.errors > 0 => format!(
-                    "扫描完成；自动匹配 {} 项，未匹配 {} 项，{} 项稍后重试。",
-                    report.matched, report.unmatched, report.errors
-                ),
-                _ => "扫描完成。".into(),
-            });
+            progress.status = if !root_results.is_empty()
+                && root_results.values().all(|result| result.0 == "FAILED")
+            {
+                ScanStatus::Failed
+            } else {
+                ScanStatus::Completed
+            };
+            progress.message = if matches!(progress.status, ScanStatus::Failed) {
+                root_results.values().find_map(|result| result.2.clone())
+            } else {
+                Some(match auto_match_report {
+                    Some(report) if report.examined > 0 || report.errors > 0 => format!(
+                        "扫描完成；自动匹配 {} 项，未匹配 {} 项，{} 项稍后重试。",
+                        report.matched, report.unmatched, report.errors
+                    ),
+                    _ => "扫描完成。".into(),
+                })
+            };
         }
         Err(ScanAbort::Cancelled) => {
             progress.status = ScanStatus::Cancelled;
@@ -234,7 +309,33 @@ pub fn run_scan_with_auto_match(
     for target in &targets {
         let mut root_progress = final_progress.clone();
         root_progress.root_id = target.root.id;
+        let result = root_results.get(&target.root.id);
+        root_progress.errors = result.map_or(0, |result| result.1);
+        if !completed_roots.contains(&target.root.id) {
+            root_progress.status = final_progress.status;
+        } else if result.is_some_and(|result| result.0 == "FAILED") {
+            root_progress.status = ScanStatus::Failed;
+        }
         let _ = database.finish_scan_run(&root_progress);
+        if background
+            || (target.parent_node_id.is_none() && target.path == Path::new(&target.root.path))
+        {
+            let cancelled = matches!(final_progress.status, ScanStatus::Cancelled)
+                && !completed_roots.contains(&target.root.id);
+            let outcome = if cancelled {
+                "CANCELLED"
+            } else {
+                result.map_or("FAILED", |result| result.0.as_str())
+            };
+            let detail = result.and_then(|result| result.2.as_deref());
+            let _ = database.record_scan_health(
+                target.root.id,
+                outcome,
+                root_progress.errors,
+                detail,
+                background,
+            );
+        }
     }
     if let Some(app) = app {
         let _ = app.emit("scan-progress", &final_progress);
@@ -428,6 +529,7 @@ fn run_scan_inner(
                 &mut visited,
             )?;
         }
+        crate::logical_works::LogicalWorkIndex::reclassify(&connection, Some(target.root.id))?;
         if target.parent_node_id.is_some()
             && matches!(target.root.recognition_mode, LibraryRecognitionMode::Folder)
         {
@@ -439,6 +541,7 @@ fn run_scan_inner(
                 )
                 .map_err(|error| error.to_string())?;
             refresh_ancestors(&connection, Some(scanned_node_id), &canonical_root)?;
+            crate::logical_works::LogicalWorkIndex::reclassify(&connection, Some(target.root.id))?;
         }
     }
     Ok(())
@@ -1839,6 +1942,7 @@ pub fn is_supplementary_directory_name(folder_name: &str) -> bool {
 /// parent work that already stores its main episodes directly. Matching candidate selection uses
 /// this scanner-owned name rule so SP/OVA/Extras allow-lists cannot drift between scanning and
 /// Bangumi matching. An explicit child classification always wins.
+#[cfg(test)]
 pub(crate) fn is_automatic_supplementary_child(
     folder_name: &str,
     manually_classified: bool,
@@ -2641,7 +2745,7 @@ mod tests {
             &database,
             vec![
                 ScanTarget {
-                    root: offline,
+                    root: offline.clone(),
                     path: offline_path,
                     parent_node_id: None,
                 },
@@ -2654,6 +2758,12 @@ mod tests {
             &control,
             &crate::db::default_video_extensions(),
         );
+        let online_health = database.get_root(root.id).unwrap().scan_health.unwrap();
+        let offline_health = database.get_root(offline.id).unwrap().scan_health.unwrap();
+        assert_eq!(online_health.outcome, "SUCCESS");
+        assert!(online_health.last_success_at.is_some());
+        assert_eq!(offline_health.outcome, "FAILED");
+        assert!(offline_health.last_success_at.is_none());
         assert_eq!(control.progress().errors, 1);
         assert_eq!(control.progress().library_changed, Some(true));
         let unchanged = incremental_scan(&database, &root, "online-unchanged", false);

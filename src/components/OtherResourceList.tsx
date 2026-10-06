@@ -7,6 +7,7 @@ import { useI18n } from "../lib/i18n";
 
 interface OtherResourceListProps {
   modifiedSort?: CollectionSort;
+  expandedFolderIds?: number[];
   files: ResourceFile[];
   folders: MediaNode[];
   onOpenFile: (file: ResourceFile) => void;
@@ -26,7 +27,7 @@ const resourceIcons: Record<ResourceFile["resourceType"], IconName> = {
   OTHER: "file",
 };
 
-export function OtherResourceList({ modifiedSort, files, folders, onOpenFile, onRevealFile, onOpenFolder, onFolderMenu }: OtherResourceListProps) {
+export function OtherResourceList({ expandedFolderIds, modifiedSort, files, folders, onOpenFile, onRevealFile, onOpenFolder, onFolderMenu }: OtherResourceListProps) {
   const { t } = useI18n();
   const sortedFolders = [...folders].sort((a, b) => naturalCompare(a.folderName, b.folderName));
   const sortedFiles = [...files].sort((a, b) => (modifiedSort ? compareFileModifiedTimes(a.modifiedAt, b.modifiedAt, modifiedSort) : 0) || naturalCompare(a.fileName, b.fileName));
@@ -44,6 +45,7 @@ export function OtherResourceList({ modifiedSort, files, folders, onOpenFile, on
             <span className="resource-copy">
               <strong>{folder.folderName}</strong>
               <small>{t("resources.folder")} · {(folder.totalVideoCount ?? 0) > 0 ? t("resources.videoCount", { count: folder.totalVideoCount ?? 0 }) : t("resources.attachmentDirectory")}</small>
+              {expandedFolderIds?.includes(folder.id) && <small>{t("resources.expandedVideos")}</small>}
               <em title={folder.absolutePath}>{compactPath(folder.absolutePath, 96)}</em>
             </span>
             <Icon className="resource-chevron" name="chevron" />

@@ -129,6 +129,7 @@ enum ConfirmedAliasExactness {
 
 #[derive(Default)]
 struct MatchRunCache {
+    owned_file_names: Option<HashMap<i64, Vec<String>>>,
     searches: HashMap<String, Result<Vec<BangumiSubject>, String>>,
     details: HashMap<i64, Result<BangumiSubject, String>>,
     cover_requests_disabled: bool,
@@ -370,11 +371,26 @@ where
         }
     }
 
-    let media_file_names = database
-        .list_media(node.id)?
-        .into_iter()
-        .map(|file| file.file_name)
-        .collect::<Vec<_>>();
+    if run_cache.owned_file_names.is_none() {
+        let connection = database.connect()?;
+        let index = crate::logical_works::LogicalWorkIndex::load(&connection)?;
+        let mut names: HashMap<i64, Vec<String>> = HashMap::new();
+        for (id, files) in &index.videos {
+            if let Some(owner) = index.owners.get(id) {
+                names
+                    .entry(*owner)
+                    .or_default()
+                    .extend(files.iter().map(|file| file.file_name.clone()));
+            }
+        }
+        run_cache.owned_file_names = Some(names);
+    }
+    let media_file_names = run_cache
+        .owned_file_names
+        .as_ref()
+        .and_then(|names| names.get(&node.id))
+        .cloned()
+        .unwrap_or_default();
     let parent_name = node
         .parent_node_id
         .and_then(|parent_id| database.get_node(parent_id).ok())

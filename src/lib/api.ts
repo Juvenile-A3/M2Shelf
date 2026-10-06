@@ -17,6 +17,7 @@ import type {
   LibraryRoot,
   LibraryRecognitionMode,
   MediaNode,
+  WorkTarget,
   MetadataBinding,
   NodeDetail,
   PlayerTestResult,
@@ -47,6 +48,14 @@ export class M2ShelfError extends Error {
   }
 }
 
+export function isStaleWorkError(error: unknown): boolean {
+  return error instanceof M2ShelfError && String(error.causeValue).includes("WORK_TARGET_STALE");
+}
+
+export function isUnavailableNodeError(error: unknown): boolean {
+  return String(error instanceof M2ShelfError ? error.causeValue : error).includes("NODE_NOT_VISIBLE");
+}
+
 const commandErrorKeys = {
   get_app_bootstrap: "error.initializationFailed",
   search_library: "error.localSearchFailed",
@@ -59,6 +68,9 @@ const commandErrorKeys = {
   get_bangumi_search_prefill: "error.bangumiFailed",
   search_bangumi: "error.bangumiFailed",
   bind_bangumi: "error.bangumiFailed",
+  bind_work_bangumi: "error.bangumiFailed",
+  clear_work_bangumi_binding: "error.bangumiFailed",
+  retry_work_bangumi_cover: "error.coverFailed",
   clear_bangumi_binding: "error.bangumiFailed",
   retry_bangumi_cover: "error.coverFailed",
   sync_pending_bangumi_aliases: "error.bangumiFailed",
@@ -117,13 +129,16 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   } catch (error) {
     // Rust keeps precise diagnostics for logs/tests. UI receives stable localized copy instead
     // of leaking a Chinese backend string into English, Japanese, or Korean interfaces.
-    throw new M2ShelfError(commandErrorMessage(command), error, command);
+    throw new M2ShelfError(String(error).includes("WORK_TARGET_STALE") ? translateActive("works.changed") : commandErrorMessage(command), error, command);
   }
 }
 
 export const desktopAvailable = isTauri();
 
 export const api = {
+  bindWorkBangumi: (target: WorkTarget, subject: BangumiSubject) => call<MetadataBinding>("bind_work_bangumi", { target, subject }),
+  retryWorkBangumiCover: (target: WorkTarget, failedSourceNodeIds: number[] = []) => call<MetadataBinding>("retry_work_bangumi_cover", { target, failedSourceNodeIds }),
+  clearWorkBangumi: (target: WorkTarget) => call<void>("clear_work_bangumi_binding", { target }),
   bootstrap: () => call<AppBootstrap>("get_app_bootstrap"),
   acknowledgeUpdateRecoveryNotice: (notice: UpdateRecoveryNotice) =>
     call<void>("acknowledge_update_recovery_notice", { notice }),
@@ -144,7 +159,7 @@ export const api = {
     const detail = workView
       ? await call<NodeDetail>("get_work_detail", { nodeId })
       : await call<NodeDetail>("get_node_detail", { nodeId });
-    if (workView) detail.node.workView = true;
+    if (workView) { detail.node.workView = true; detail.node.workTarget = detail.workTarget ?? undefined; }
     return detail;
   },
   search: (query: string, rootId?: number) =>

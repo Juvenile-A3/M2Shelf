@@ -172,6 +172,7 @@ impl LibraryRecognitionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryRoot {
+    pub scan_health: Option<ScanHealth>,
     pub id: i64,
     pub path: String,
     pub display_name: String,
@@ -182,6 +183,16 @@ pub struct LibraryRoot {
     pub node_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanHealth {
+    pub last_auto_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub outcome: String,
+    pub error_count: u64,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +397,7 @@ pub struct BrowseResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AllResourcesResult {
+    pub recognition_warnings: Vec<MediaNode>,
     pub nodes: Vec<MediaNode>,
     pub total_count: i64,
     pub works: Vec<WorkGroup>,
@@ -394,8 +406,25 @@ pub struct AllResourcesResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkGroup {
+    pub target: WorkTarget,
     pub node: MediaNode,
     pub sources: Vec<MediaNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkTarget {
+    pub source_node_ids: Vec<i64>,
+    pub snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedMediaFile {
+    pub file: MediaFile,
+    pub source_node_id: i64,
+    pub source_name: String,
+    pub relative_directory: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,6 +444,10 @@ pub struct NodeDetail {
     pub breadcrumbs: Vec<BreadcrumbItem>,
     pub binding: Option<MetadataBinding>,
     pub work_sources: Option<Vec<MediaNode>>,
+    pub work_target: Option<WorkTarget>,
+    pub nested_media_files: Vec<NestedMediaFile>,
+    pub expanded_folder_ids: Vec<i64>,
+    pub recognition_warnings: Vec<MediaNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

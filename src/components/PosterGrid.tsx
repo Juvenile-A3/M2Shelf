@@ -8,7 +8,7 @@ interface PosterGridProps {
   onOpen: (node: MediaNode) => void;
   onMenu: (event: React.MouseEvent, node: MediaNode) => void;
   onBangumi: (node: MediaNode) => void;
-  onRetryCover: (node: MediaNode) => void;
+  onRetryCover: (node: MediaNode, imageDecodeFailed?: boolean) => void;
   coverRevision: number;
   watchedAtByNodeId?: ReadonlyMap<number, string>;
   editMode?: boolean;

@@ -2,7 +2,7 @@
 
 ## 环境
 
-本 fork 的 Windows x64 开发环境使用 Rust MSVC 工具链、Microsoft Visual Studio Build Tools 的 C++ 桌面构建组件、Windows SDK、WebView2 和 Node.js。依赖版本使用项目的 `Cargo.lock` 和 `package-lock.json`，无需先升级依赖。
+M²Shelf 的 Windows x64 开发环境使用 Rust MSVC 工具链、Microsoft Visual Studio Build Tools 的 C++ 桌面构建组件、Windows SDK、WebView2 和 Node.js。依赖版本使用项目的 `Cargo.lock` 和 `package-lock.json`，无需先升级依赖。
 
 本轮环境配置版本：Rust/Cargo 1.98.1、rustup 1.29.1、Visual Studio Build Tools 2022 17.14.40（MSVC 14.44）、Windows SDK 10.0.26100、Node.js 24.16.0。Rust 包含 `rustfmt` 和 `clippy`，默认目标为 `x86_64-pc-windows-msvc`。
 

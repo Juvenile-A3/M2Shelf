@@ -14,7 +14,7 @@ interface MediaCardProps {
   onOpen: (node: MediaNode) => void;
   onMenu: (event: React.MouseEvent, node: MediaNode) => void;
   onBangumi: (node: MediaNode) => void;
-  onRetryCover: (node: MediaNode) => void;
+  onRetryCover: (node: MediaNode, imageDecodeFailed?: boolean) => void;
   coverRevision: number;
   watchedAt?: string;
   showModifiedTime?: boolean;
@@ -83,7 +83,7 @@ function MediaCardComponent({ node, viewMode, onOpen, onMenu, onBangumi, onRetry
         <button className="quick-bind" onClick={() => onBangumi(node)} title={t("card.searchCover")} type="button"><Icon name="plus" /><span>{t("provider.bangumi")}</span></button>
       )}
       {!editMode && bindable && node.binding && coverError && (
-        <button className="quick-bind is-retry" onClick={() => onRetryCover(node)} title={t("card.retryCover")} type="button"><Icon name="refresh" /><span>{t("card.retryShort")}</span></button>
+        <button className="quick-bind is-retry" onClick={() => onRetryCover(node, imageFailed)} title={t("card.retryCover")} type="button"><Icon name="refresh" /><span>{t("card.retryShort")}</span></button>
       )}
       {!editMode && <button className="card-menu" aria-label={t("card.moreActions", { title })} onClick={(event) => onMenu(event, node)} type="button"><Icon name="more" /></button>}
     </article>

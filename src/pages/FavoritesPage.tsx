@@ -28,7 +28,7 @@ interface FavoritesPageProps {
   onOpenNode: (node: MediaNode) => void;
   onMenu: (event: React.MouseEvent, node: MediaNode) => void;
   onBangumi: (node: MediaNode) => void;
-  onRetryCover: (node: MediaNode) => void;
+  onRetryCover: (node: MediaNode, imageDecodeFailed?: boolean) => void;
   coverRevision: number;
   editMode: boolean;
   selectedNodeIds: ReadonlySet<number>;

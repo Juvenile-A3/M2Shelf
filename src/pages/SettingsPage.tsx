@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { AppBootstrap, AppLanguage, AppSettings, AppTheme, CacheStats, LibraryRoot, UpdateDownloadStatus } from "../types/media";
+import { LibraryScanHealth } from "../components/LibraryScanHealth";
 import { EmptyState } from "../components/EmptyState";
 import { Icon } from "../components/Icon";
 import { LoadingState } from "../components/LoadingState";
@@ -191,7 +192,7 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onHiddenNodes, onRem
         <section className="settings-section">
           <div className="settings-section-heading"><span className="settings-symbol coral"><Icon name="folder" /></span><div><h2>{t("settings.rootsTitle")}</h2><p>{t("settings.rootsDescription")}</p></div><button className="button secondary" disabled={!desktopAvailable} onClick={onAddRoot} type="button"><Icon name="plus" />{t("settings.addDirectory")}</button></div>
           {roots.length === 0 ? <EmptyState compact icon="folder" title={t("settings.noDirectory")} description={t("settings.noDirectoryDescription")} /> : <div className="settings-root-list">{roots.map((root) => (
-            <article className="settings-root" key={root.id}><span><Icon name="folder-open" /></span><div><strong>{root.displayName}</strong><p title={root.path}>{compactPath(root.path, 74)}</p><small>{t("settings.lastScan", { date: formatDate(root.lastScanAt) })}</small></div><button aria-label={t("settings.scanNamed", { name: root.displayName })} onClick={() => onScanRoot(root)} title={t("settings.scanLibrary")} type="button"><Icon name="refresh" /></button><button className="danger-icon" aria-label={t("settings.removeNamed", { name: root.displayName })} onClick={() => onRemoveRoot(root)} title={t("settings.removeIndexOnly")} type="button"><Icon name="trash" /></button></article>
+            <article className="settings-root" key={root.id}><span><Icon name="folder-open" /></span><div><strong>{root.displayName}</strong><p title={root.path}>{compactPath(root.path, 74)}</p><small>{t("settings.lastScan", { date: formatDate(root.lastScanAt) })}</small><LibraryScanHealth health={root.scanHealth} /></div><button aria-label={t("settings.scanNamed", { name: root.displayName })} onClick={() => onScanRoot(root)} title={t("settings.scanLibrary")} type="button"><Icon name="refresh" /></button><button className="danger-icon" aria-label={t("settings.removeNamed", { name: root.displayName })} onClick={() => onRemoveRoot(root)} title={t("settings.removeIndexOnly")} type="button"><Icon name="trash" /></button></article>
           ))}</div>}
           <div className="settings-hidden-entry"><div><strong>{t("hidden.title")}</strong><p>{t("settings.hiddenDescription")}</p></div><button className="button secondary" disabled={!desktopAvailable} onClick={onHiddenNodes} type="button" aria-haspopup="dialog"><Icon name="eye-off" />{t("hidden.title")}</button></div>
           <p className="safety-copy"><Icon name="shield" />{t("settings.removeSafety")}</p>
@@ -232,8 +233,10 @@ export function SettingsPage({ roots, bootstrap, onAddRoot, onHiddenNodes, onRem
           </div>
           <dl className="about-grid">
             <div><dt>{t("settings.currentVersion")}</dt><dd>{bootstrap?.version ?? t("common.notAvailable")}</dd></div>
-            <div><dt>{t("settings.updateDate")}</dt><dd>{bootstrap?.buildDate ?? t("common.notAvailable")}</dd></div>
+            <div><dt>{t("settings.updateDate")}</dt><dd>{bootstrap?.buildDate && bootstrap.buildDate !== "unknown" ? bootstrap.buildDate : t("common.notAvailable")}</dd></div>
             <div><dt>{t("settings.architecture")}</dt><dd>{bootstrap?.architecture ?? t("common.notAvailable")}</dd></div>
+            <div><dt>{t("settings.originalAuthor")}</dt><dd>{t("brand.author")}</dd></div>
+            <div><dt>{t("settings.contributor")}</dt><dd>Juvenile_A</dd></div>
             <div><dt>{t("settings.website")}</dt><dd className="about-author-links"><button disabled={!bootstrap?.websiteUrl || !desktopAvailable} onClick={() => void openAuthorLink(bootstrap?.websiteUrl)} type="button">{t("settings.websiteLabel")} <Icon name="external" /></button><button disabled={!bootstrap?.xUrl || !desktopAvailable} onClick={() => void openAuthorLink(bootstrap?.xUrl)} type="button">{t("settings.xLabel")} <Icon name="external" /></button></dd></div>
           </dl>
           <p className="created-by">{t("settings.createdBy")} <button disabled={!bootstrap?.websiteUrl || !desktopAvailable} onClick={() => void openAuthorLink(bootstrap?.websiteUrl)} type="button">{t("brand.author")}</button></p>
