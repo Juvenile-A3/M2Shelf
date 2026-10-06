@@ -13,7 +13,7 @@ use std::{
 use tempfile::TempDir;
 
 fn fixture(files: &[&str], mode: LibraryRecognitionMode) -> (TempDir, Database, i64) {
-    let temp = TempDir::new().unwrap();
+    let temp = crate::db::test_temp_dir();
     let root_path = temp.path().join("library");
     fs::create_dir(&root_path).unwrap();
     for file in files {

@@ -2424,7 +2424,7 @@ mod tests {
 
     #[test]
     fn incremental_scan_reuses_unchanged_subtrees_and_updates_deep_changes() {
-        let temp = TempDir::new().unwrap();
+        let temp = crate::db::test_temp_dir();
         let root_path = temp.path().join("媒体库");
         let show = root_path.join("2026").join("连载");
         let stable = root_path.join("归档").join("旧作品");
@@ -2521,7 +2521,7 @@ mod tests {
 
     #[test]
     fn incremental_scan_preserves_baseline_when_cancelled_or_offline_and_restores_hidden() {
-        let temp = TempDir::new().unwrap();
+        let temp = crate::db::test_temp_dir();
         let root_path = temp.path().join("library");
         let show = root_path.join("show");
         fs::create_dir_all(&show).unwrap();
@@ -2580,7 +2580,7 @@ mod tests {
 
     #[test]
     fn incremental_file_mode_detects_modified_files_and_manual_scan_invalidates_baseline() {
-        let temp = TempDir::new().unwrap();
+        let temp = crate::db::test_temp_dir();
         let root_path = temp.path().join("library");
         fs::create_dir_all(&root_path).unwrap();
         let file = root_path.join("Show - 01.mkv");
@@ -2684,7 +2684,7 @@ mod tests {
 
     #[test]
     fn incremental_scan_handles_bdmv_and_extension_configuration_changes() {
-        let temp = TempDir::new().unwrap();
+        let temp = crate::db::test_temp_dir();
         let root_path = temp.path().join("library");
         let stream = root_path.join("Disc").join("BDMV").join("STREAM");
         fs::create_dir_all(&stream).unwrap();
@@ -2910,7 +2910,7 @@ mod tests {
 
     #[test]
     fn video_file_mode_flattens_each_video_into_an_independent_work() {
-        let temp = TempDir::new().unwrap();
+        let temp = crate::db::test_temp_dir();
         let root_path = temp.path().join("逐文件媒体库");
         let nested = root_path.join("子目录 [字幕组]");
         let bdmv_stream = root_path.join("蓝光电影").join("BDMV").join("STREAM");

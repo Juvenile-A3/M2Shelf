@@ -3234,6 +3234,14 @@ fn display_path(path: &Path) -> String {
     value.into_owned()
 }
 
+// Windows CI may expose TEMP through an 8.3 alias. Synthetic scan fixtures must use
+// the same long, non-verbatim path spelling as registered Library Roots.
+#[cfg(test)]
+pub(crate) fn test_temp_dir() -> tempfile::TempDir {
+    let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    tempfile::TempDir::new_in(display_path(&parent)).unwrap()
+}
+
 pub fn natural_cmp(left: &str, right: &str) -> Ordering {
     let left = left.to_lowercase();
     let right = right.to_lowercase();
@@ -6009,7 +6017,7 @@ mod tests {
 
     #[test]
     fn cover_read_context_returns_only_cover_and_root_paths() {
-        let temp = TempDir::new().unwrap();
+        let temp = test_temp_dir();
         let root_path = temp.path().join("library");
         let cache_path = temp.path().join("cache/manual/node.png");
         std::fs::create_dir_all(&root_path).unwrap();
